@@ -1,0 +1,22 @@
+# PR 1b issue
+
+- [ ] 新增 `virtualization/axvm/src/irq/sender.rs`：`VmInterruptSender { vm: Weak<AxVM> }` — `new()`, `send()`
+- [ ] `virtualization/axvm/src/irq/mod.rs` 添加 `pub(crate) mod sender;`
+- [ ] `vm/mod.rs` 新增 `use crate::irq::model::PendingVcpuInterrupt;`
+- [ ] `VmRuntimeHandle` 新增字段 `irq_dispatcher: VcpuIrqDispatcher`
+- [ ] `VmRuntimeHandle::new()` 初始化 `irq_dispatcher`
+- [ ] `VmRuntimeHandle::add_vcpu_task()` 先调用 `self.irq_dispatcher.register_vcpu_task(vcpu_id, vcpu_task.clone())`，再注册旧字段（防止 enqueue 在注册完成前到达新 dispatcher 返回 NotFound）
+- [ ] 新增 `VmRuntimeHandle::dispatch_vcpu_interrupt()` — enqueue → notify_all → send_ipi（send_ipi 在 `machine.lock` 持有期间调用，安全：SpinNoIrq 环境中 send_ipi 是快速 MMIO/MSR 写，不睡眠、不获取其他锁）
+- [ ] 新增 `VmRuntimeHandle::irq_dispatcher()` getter — 返回 `&VcpuIrqDispatcher`（供 PR 1c drain 使用）
+- [ ] `dispatch_vcpu_interrupt()` 先入队再 notify/IPI
+- [ ] `AxVM::prepare()` 和 `AxVM::prepare_with_factories()` 签名从 `&self` 改为 `&Arc<Self>`（`prepare.rs:36` 和 `:41`；调用者 `start()`/`reset()` 已使用 `&Arc<Self>`，无需适配）
+- [ ] `VmInterruptSender::send()` 正确处理：Weak::upgrade 失败（NotFound）、状态非 Running/Paused（BadState）、vCPU 未注册（NotFound）
+- [ ] VM reset 后 sender 只发现新 runtime（每次 send 都通过 Weak::upgrade + with_runtime 查找，不缓存旧 dispatcher）
+- [ ] 移除 PR 1a 中的 `#[allow(dead_code)]`：`model.rs` 的 `VirtualInterruptId` + `PendingVcpuInterrupt`；`dispatcher.rs` 的 struct/`new`/`register_vcpu_task`/`enqueue`
+- [ ] 保留 `dispatcher.rs` 中 `drain()` 的 `#[allow(dead_code)]`（PR 1c 才被 vCPU run loop 调用）
+- [ ] 新增 `#[allow(dead_code)]`：`sender.rs` 的 struct/`new()`/`send()`；`dispatch_vcpu_interrupt()`；`irq_dispatcher()` getter
+- [ ] 单元测试：VM 销毁时 sender 返回错误、VM 状态错误、enqueue→drain 往返、reset 后不引用旧 runtime
+- [ ] 四种架构编译通过
+- [ ] 编译通过时必须无 dead_code 警告（仅允许带注解的项）
+- [ ] `cargo fmt --all --check` 通过
+- [ ] `cargo xtask clippy --package axvm` 通过
