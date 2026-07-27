@@ -10,7 +10,10 @@
 4. LoongArch 的外部中断和 MMIO 后处理仍通过架构特定队列变体及设备管理器特判完成。
 5. 当前资源模型不能声明和校验设备占用的 IRQ line。
 
-本次重构只整理设备线中断到虚拟中断控制器、以及虚拟中断控制器到目标 vCPU 的递送边界，不扩展新的中断控制器功能。
+本次重构整理设备线中断到虚拟中断控制器、以及虚拟中断控制器到目标
+vCPU 的递送边界。各架构为使该链路语义完整而必须补齐的底层状态、错误和
+生命周期属于重构范围；guest-programmable 新路由模式、完整寄存器模型和
+新的中断类型仍不在范围内。
 
 ## 2. 设计目标
 
@@ -32,7 +35,10 @@
    任一架构迁移期间，尚未迁移的架构继续使用旧路径；共享层变更不得要求所有 Router 同时完成。
 
 6. **保持现有中断控制器能力范围。**
-   当前不支持的 IOAPIC logical destination、x2APIC destination、共享 IRQ 等能力不在本次重构中新增。
+   当前不支持的 IOAPIC logical destination、x2APIC destination、AArch64
+   guest-programmable `GICD_IROUTER`、共享 IRQ 等能力不在本次重构中新增。
+   但 AArch64 emulated SPI 完整投递所必需的 level deactivate 重投、LR refill
+   和 per-vCPU ICH state 必须在模块 3 内完成，不能作为后续优化推迟。
 
 ### 2.2 非目标
 
@@ -45,7 +51,9 @@
 - 新增共享 IRQ 注册能力；
 - 重构 host IRQ framework、任务调度器或等待队列；
 - 优化同 vCPU 注入的快速路径；
-- 统一不同架构的 EOI 协议。
+- 统一不同架构的 EOI 协议；
+- 为 AArch64 补全 guest `GICD_IROUTER`、pending/active/config MMIO；
+- 为 AArch64 增加 GICv2、SGI/PPI、ITS/LPI 或重构 GPPT/passthrough。
 
 PIT 在本次重构后仍由现有 vCPU exit/timer hook 调用 `tick()`。本次只把“到期后的 IRQ 传播”改成事件路径，不解决 guest 长时间无 VM exit 时的定时器饥饿问题。
 
@@ -58,7 +66,7 @@ Device Core
   │ raise / lower / pulse
   ▼
 IrqLine → InterruptFabric → Architecture Router
-                                  │ routed interrupt
+                                  │ routed interrupt / architecture kick
                                   ▼
                          VmInterruptSender
                                   │
@@ -137,7 +145,14 @@ impl VmInterruptSender {
 
 `VirtualInterruptId` 使用 `u32`，避免把 x86 的 `u8` vector 限制扩散到 GIC、PLIC 和 LoongArch。
 
-`VmInterruptSender` 不缓存 `Weak<VcpuIrqDispatcher>`。它每次通过 `Weak<AxVM>` 查找当前 `VmRuntimeHandle`，因此 VM stop/start/reset 后不会引用旧 runtime。
+`PendingVcpuInterrupt` 对大多数架构表示待注入事件；架构 controller 仍可把它
+解释为“目标 vCPU 有状态需要处理”的 kick。AArch64 emulated SPI 使用后一种
+语义：VGIC 保存 pending/active 真相，dispatcher event 只负责唤醒和诊断，
+目标端必须重新检查 controller 后再 refill LR。
+
+`VmInterruptSender` 不缓存 `Weak<VcpuIrqDispatcher>`。它每次通过
+`Weak<AxVM>` 查找当前 `VmRuntimeHandle`，因此 VM stop/start/reset 后不会
+引用旧 runtime。
 
 VM 已销毁、runtime 尚未创建、VM 状态不接受中断、目标 vCPU task 未注册时，`send()` 必须返回明确错误，不得返回成功并静默丢弃中断。
 
@@ -206,7 +221,16 @@ trait ArchOps {
 }
 ```
 
-共享实现调用 `vcpu.inject_interrupt_with_trigger(id, trigger)`，不得在默认路径丢弃 trigger。x86 adapter 把 edge/level 映射到 vLAPIC 注入参数，以维护 TMR/EOI 语义；AArch64、RISC-V 和 LoongArch adapter 也必须显式说明 trigger 在对应 Router/controller 中消费后，vCPU 注入操作为何不再区分模式。AArch64 的 GIC List Register、RISC-V CSR 和其他只能在当前 pCPU 安全访问的寄存器，都在目标 vCPU run loop 中更新。
+共享实现调用 `vcpu.inject_interrupt_with_trigger(id, trigger)`，不得在默认路径
+丢弃 trigger。x86 adapter 把 edge/level 映射到 vLAPIC 注入参数，以维护
+TMR/EOI 语义；RISC-V 和 LoongArch adapter 也必须显式说明 trigger 在对应
+Router/controller 中消费后，vCPU 注入操作为何不再区分模式。
+
+AArch64 emulated SPI 必须覆盖默认逐事件注入：event 只作为 kick，目标
+vCPU 的 delivery port 先 fold 当前 LR，再从 VGIC 状态 refill 空 LR。
+trigger、line asserted、pending 和 active 均由 VGIC 消费和保存。AArch64
+的 ICH LR、RISC-V CSR 和其他只能在当前 pCPU 安全访问的寄存器，都在目标
+vCPU run loop 中更新。
 
 同 vCPU 直接注入只是性能优化，不是第一阶段要求。第一阶段所有 Router 输出统一排队，先保证所有权和并发语义一致。
 
@@ -242,6 +266,8 @@ impl AxVM {
 ```
 
 不新增返回 `&InterruptFabric` 或克隆 Fabric 的公共访问器，避免泄漏 `Machine` 锁内引用或让调用者跨 reset 持有旧 Router。
+内部 wrapper 必须在 machine lock 内只快照投递 capability，释放锁后再调用
+Router；不得持锁进入可能通过 `VmInterruptSender` 回查同一 VM runtime 的路径。
 
 ## 6. IRQ line 资源声明
 
@@ -289,7 +315,9 @@ impl AxVM {
 }
 ```
 
-架构 `init_vm` 获取 `&AxVMRef` 的调整随实际 Router 一起完成：AArch64、LoongArch 和 x86 分别在模块 3、4、5 修改；RISC-V 仅在后续确实需要创建 sender/Router 时修改。模块 1 不提前迁移尚无消费者的架构初始化接口。
+架构 `init_vm` 获取 `&AxVMRef` 的调整随实际 Router 一起完成：AArch64、
+LoongArch 和 x86 分别在模块 3、4、5 修改；RISC-V 仅在后续确实需要创建
+sender/Router 时修改。模块 1 不提前迁移尚无消费者的架构初始化接口。
 
 ### 7.2 两阶段设备初始化
 
@@ -298,13 +326,15 @@ Router 通常需要和 MMIO 总线共享同一个中断控制器 core。初始�
 ```text
 1. 创建 vCPU 元数据和 placement 信息
 2. 创建架构虚拟中断控制器 core
-3. 创建 VmInterruptSender
-4. 创建具体 Router
-5. 用 Router 创建 InterruptFabric
-6. 将同一个控制器 core 包装成 MMIO/PIO Device 并注册
-7. 构造其余设备；设备通过 Fabric 解析 IrqLine
-8. 安装架构所需 hooks
-9. 完成 vCPU setup 和地址空间映射
+3. 创建 `VmInterruptSender`
+4. 创建需要共享 controller 的 per-vCPU delivery state
+5. 创建具体 Router
+6. 用 Router 创建 InterruptFabric
+7. 将同一个控制器 core 包装成 MMIO/PIO Device 并注册
+8. 构造其余设备；设备通过 Fabric 解析 IrqLine
+9. 校验并绑定架构 route/trigger 资源
+10. 安装架构所需 hooks
+11. 完成 vCPU setup 和地址空间映射
 ```
 
 中断控制器不能再由通用设备构建流程内部临时创建后只留下 `dyn Device`。各架构初始化代码先创建 controller core，再把 wrapper 交给 DeviceManager。
@@ -321,6 +351,10 @@ VmRuntimeHandle ── owns ──> VcpuIrqDispatcher
 ```
 
 Router 到 AxVM 只有弱引用，不形成强引用环。Router 不持有 runtime 或 vCPU task。
+
+AArch64 的 vCPU delivery port 还会持有同一个 VGIC controller core 和
+弱生命周期 sender，但不持有 Router、runtime 或 task；详细引用关系见
+[`design_3.md`](./design_3.md)。
 
 ## 8. 各架构设计
 
@@ -344,25 +378,32 @@ device IrqLine
 
 ### 8.2 AArch64
 
-`ArmInterruptRouter` 负责：
+模块 3 的完整设计见 [`design_3.md`](./design_3.md)，执行清单见
+[`issue_3.md`](./issue_3.md)。
 
-1. 校验输入 line/INTID；
-2. 根据当前已支持的 VGIC 路由状态确定目标 vCPU；
-3. 将 `PendingVcpuInterrupt` 交给 `VmInterruptSender`；
-4. 保存 level line 必需的 asserted 状态，或委托给 VGIC core。
+范围限定为 host/guest GICv3、wired SPI INTID 32–1019 和 host 配置的
+固定显式路由。`ArmInterruptRouter` 只负责把 line 操作输入 VGIC，并在
+controller 状态需要目标运行时通过 sender 发 kick。VGIC controller 是
+line、pending、active 和 target 的 durable 状态源；目标 vCPU 的
+live/saved LR 只是硬件执行副本。
 
 ```text
 device IrqLine
   → ArmInterruptRouter
-  → VGIC route decision
-  → VmInterruptSender
+  → ArmVgicController
+  → VmInterruptSender kick
   → target vCPU run loop
-  → write GIC LR on target pCPU
+  → fold/refill GIC LR on target pCPU
 ```
 
-当前 `VGicD` 没有可直接使用的 `set_pending/clear_pending` 公共 API，因此实现前必须在 `arm_vgic` 中提供最小能力边界，例如“更新 SPI line 状态并返回目标 vCPU/待递送 INTID”。不得在 Router 中假设不存在的 API，也不得从远程 pCPU 直接写目标 vCPU 的 banked List Register。
+模块 3 同时补齐无损 INTID、per-vCPU ICH context、maintenance、
+TDIR completion、deactivate 后的 level 重投和 LR refill，并区分
+`EOImode=0/1`。dispatcher 中的 AArch64 event 不是 pending 状态真相；
+stale kick 必须在目标 controller 复查后成为 no-op。
 
-本次不新增 GIC 路由模式，只遵循当前 VGIC 已支持的路由语义。
+固定 route 作为 controller target 的初始化值。以后增加
+`GICD_IROUTER` 时只增加 route 状态输入，不改变
+`IrqLine → Router → sender kick → target refill` 主链路。
 
 ### 8.3 LoongArch
 
@@ -474,14 +515,20 @@ host IRQ 的 edge/level 属性由 x86 host IRQ glue 保存。是否解除 host m
 
 该模块不新增空操作 Router 方法。
 
-### 模块 3：AArch64 Router
+### 模块 3：AArch64 emulated SPI
 
-1. 为 VGIC 增加 Router 所需的最小 line/route capability。
-2. 创建 `ArmInterruptRouter`。
-3. 通过 Fabric 向设备提供 `IrqLine`。
-4. Router 输出经 sender/dispatcher，在目标 vCPU run loop 写 LR。
-5. 保留现有 IPI 入口，只把其 runtime 递送收敛到 sender（若需要）。
-6. 在构造 `ArmInterruptRouter` 时把架构 `init_vm` 调整为获取 `AxVMRef`。
+模块 3 按 [`design_3.md`](./design_3.md) 和
+[`issue_3.md`](./issue_3.md) 拆分：
+
+- **3A：无损 INTID、ICH/TDIR register fields 和可恢复 LR error**；
+- **3B：VGIC SPI 状态机与固定显式 route**；
+- **3C：per-vCPU ICH context、TDIR/maintenance completion 和 LR refill**；
+- **3D：route 配置、controller 共享所有权和两阶段初始化**；
+- **3E：`ArmInterruptRouter`、sender kick 和目标 vCPU refill**；
+- **3F：synthetic SPI device 与 emulated GICv3 SMP2 QEMU**。
+
+模块 3 不迁移 SGI/PPI/IPI，不实现 guest `GICD_IROUTER` 或完整
+pending/active MMIO，不改变 GPPT/passthrough。
 
 ### 模块 4：LoongArch Router
 
@@ -490,7 +537,8 @@ host IRQ 的 edge/level 属性由 x86 host IRQ glue 保存。是否解除 host m
 3. 保留 LoongArch `after_mmio_write`，但其输出改走 sender。
 4. 确认 `physical_irq` 的实际功能后再移除旧 External 队列变体。
 5. 不硬编码目标 vCPU，除非当前硬件模型的路由结果就是 BSP。
-6. 在构造 `LoongArchInterruptRouter` 时把架构 `init_vm` 调整为获取 `AxVMRef`。
+6. 在构造 `LoongArchInterruptRouter` 时把架构 `init_vm` 调整为获取
+   `AxVMRef`。
 
 ### 模块 5：x86_64 Router
 
@@ -504,7 +552,8 @@ host IRQ 的 edge/level 属性由 x86 host IRQ glue 保存。是否解除 host m
 - **5f：统一唯一 EOI hook 并移除旧运行时查询接口**。
 
 每一步必须保持 VMX 和 SVM 可编译；涉及其中一方特有注入语义时分别验证。
-在 5a 创建 `X86InterruptRouter` 时，把 x86 架构 `init_vm` 调整为获取 `AxVMRef`。
+在 5a 创建 `X86InterruptRouter` 时，把 x86 架构 `init_vm` 调整为获取
+`AxVMRef`。
 
 ### 最终清理
 
@@ -542,7 +591,9 @@ host IRQ 的 edge/level 属性由 x86 host IRQ glue 保存。是否解除 host m
 ### 11.2 架构 Router
 
 - RISC-V：现有 vPLIC pending/claim/complete 回归；
-- AArch64：INTID 不被截断，远程注入只在目标 vCPU 上写 LR；
+- AArch64：固定 route 校验、INTID 256 不截断、edge、两种 EOImode 下
+  level deactivate 重投、LR refill、per-vCPU ICH 隔离、跨 CPU wake，
+  且 LR 只在目标 vCPU 上更新；
 - LoongArch：平台 route 的 guest vector 和目标 vCPU 得到保留，MMIO 输出不丢失；
 - x86：destination 解析、edge pulse、level raise/lower、EOI 重注入、unsupported destination；
 - x86 host IRQ：host trigger 与 guest redirection trigger 分开处理；
@@ -559,7 +610,10 @@ cargo xtask clippy --package axdevice
 cargo xtask clippy --package axvm
 ```
 
-并按受影响架构执行对应的 `cargo xtask axvisor build`。不要求在每个模块运行物理板测试，但最终合并前应完成可用的 QEMU 架构验证。
+模块 3 还必须检查 `arm_vgic` 和 `arm_vcpu`。并按受影响架构执行对应的
+`cargo xtask axvisor build`。不要求在每个模块运行物理板测试，但最终合并前
+应完成可用的 QEMU 架构验证；模块 3 必须有 emulated GICv3 SMP2 QEMU
+端到端证据。
 
 ## 12. 完成判定
 
@@ -573,4 +627,7 @@ cargo xtask clippy --package axvm
 6. x86 运行时不再轮询 PIT/串口 IRQ pending 状态；
 7. 旧的 VM pending interrupt 队列生产者全部移除；
 8. 架构特有的 EOI/MMIO hook 没有进入共享 Fabric trait；
-9. 新增资源、队列和 Router 行为都有确定性回归测试。
+9. AArch64 emulated SPI 的 pending/active durable truth 属于 VGIC，
+   dispatcher 只做 kick，两种 EOImode 下的 level deactivate 重投和
+   LR refill 不丢失；
+10. 新增资源、队列和 Router 行为都有确定性回归测试。
