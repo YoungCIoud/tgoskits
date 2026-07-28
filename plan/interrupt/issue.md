@@ -127,15 +127,20 @@ RISC-V 已有可用的 `RiscvPlicIrqSink`，本模块只验证共享层没有造
 详细范围、拆分和验收见 [`issue_3.md`](./M3/issue_3.md)，完整设计见
 [`design_3.md`](./M3/design_3.md)。
 
-- [ ] **3A：**修正 INTID 截断、ICH/TDIR register fields 和 LR 可恢复错误。
-- [ ] **3B：**实现 VGIC SPI line/pending/active 状态与固定显式 route。
-- [ ] **3C：**实现 per-vCPU ICH context、TDIR/maintenance completion 和
-  LR refill。
-- [ ] **3D：**增加 `fixed_irq_routes` 配置、共享 controller 和两阶段初始化。
-- [ ] **3E：**接通 `ArmInterruptRouter → sender kick → target refill`，并
-  修正 `AxVM::pulse_interrupt()` 持 machine lock 进入 sender 回查 runtime
-  的重入风险。
-- [ ] **3F：**增加 synthetic SPI device 和 emulated GICv3 SMP2 QEMU。
+- [ ] **PR 3.1：**修正无损 INTID、ICH register fields 和 LR 可恢复错误；
+  详见 [`design_3_1.md`](./M3/design_3_1.md)。
+- [ ] **PR 3.2：**实现 per-vCPU ICH context、capability registry 和同 CPU
+  bind/run/unbind；详见 [`design_3_2.md`](./M3/design_3_2.md)。
+- [ ] **PR 3.3：**实现 VGIC SPI 状态机、TDIR/maintenance completion 和
+  LR refill；详见 [`design_3_3.md`](./M3/design_3_3.md)。
+- [ ] **PR 3.4：**增加固定 route、共享 controller、两阶段初始化、Router、
+  sender kick 和 target consumer；详见
+  [`design_3_4.md`](./M3/design_3_4.md)。
+- [ ] **PR 3.5：**增加 synthetic SPI device、专用 EL1 guest 和 emulated
+  GICv3 SMP2 QEMU；详见 [`design_3_5.md`](./M3/design_3_5.md)。
+- [x] `AxVM::pulse_interrupt()` 的 machine-lock 重入已由 PR #1679 /
+  commit `5155111ef` 修复，并有 lock-release regression；模块 3 只保留
+  回归并让新增 level wrapper 遵循同一 snapshot 模式。
 - [ ] 验证 edge、两种 EOImode 下的 level deactivate 重投、LR 满载、
   跨 CPU wake 和 INTID 256。
 - [ ] 保持 GICv2、SGI/PPI/IPI、ITS/LPI 和 GPPT/passthrough 在模块范围外。

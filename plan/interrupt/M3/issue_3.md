@@ -113,17 +113,34 @@ fixed_irq_routes = [
 - 不允许缺省到 vCPU 0；
 - passthrough/no-irq VM 保持现有配置行为，不要求该表。
 
-## 实施拆分
+## 功能工作包与 5 个 PR 映射
+
+下面的 3A–3F 是功能工作包，不再等同于 PR。实际按五个可独立审查、逐步启用
+的 PR 合入：
+
+| PR | 功能工作包 | 详细设计 | producer 状态 |
+|----|------------|----------|---------------|
+| 3.1 | 3A：无损 INTID、ICH 字段和可恢复 LR error | [`design_3_1.md`](./design_3_1.md) | 不切换 |
+| 3.2 | 3C 前半：per-vCPU ICH context、capability 和 CPU pin | [`design_3_2.md`](./design_3_2.md) | 不切换 |
+| 3.3 | 3B + 3C 后半：VGIC state、TDIR/maintenance、fold/refill | [`design_3_3.md`](./design_3_3.md) | 仅直接构造测试 |
+| 3.4 | 3D + 3E：配置、初始化、Router、sender 和 target consumer | [`design_3_4.md`](./design_3_4.md) | 在此切换 |
+| 3.5 | 3F：synthetic device、EL1 guest 和 SMP2 QEMU | [`design_3_5.md`](./design_3_5.md) | 增加端到端证据 |
+
+依赖顺序为 `3.1 → 3.2 → 3.3 → 3.4 → 3.5`。3.1–3.3 不允许把真实设备
+接入半成品路径；3.4 是唯一 production 接线 PR；3.5 不应承担底层语义修复。
 
 ### 3A：INTID 与 ICH 寄存器边界
 
 - [ ] 将 AArch64 virtual interrupt host boundary 从 `u8` 扩宽为无损
   `u32`/typed INTID。
-- [ ] 在进入 ICH LR 编码前校验 SPI INTID 32–1019。
-- [ ] 补充当前 register wrapper 缺少的 ICH LR EOI 字段及所需
-  UIE/LRENPIE/TDIR、MISR/EISR、VTR.TDS 等字段。
+- [ ] 在进入 ICH LR 编码前使用无损、checked virtual INTID；direct
+  SGI/PPI 继续接受 0–31，SPI 专用 `ArmSpiIntId` 在 PR 3.3 校验 32–1019。
+- [ ] 修正 `arm-gic-driver` ICH wrapper：增加 LR 软件 EOI overlay，把当前
+  与 PREBITS 重叠的 VTR.IDBITS 修正为 1 bit；复用并测试已有
+  UIE/LRENPIE/TDIR、MISR/EISR、VTR.TDS 字段，不重复定义。
 - [ ] 将“无空闲 LR”从 panic 改成内部可恢复结果。
-- [ ] 测试 INTID 255、256、1019 和非法 31、1020，确认没有截断。
+- [ ] 测试 virtual INTID 31、255、256、1019 和非法 1020，确认没有截断；
+  SPI boundary 另测试 31 非法、32 合法。
 - [ ] 消除现有 `Vgicd` 512 项数组/未校验 `ISENABLER` 索引对合法
   INTID 512–1019 的越界风险；非法或未绑定 SPI 访问返回确定结果。
 - [ ] 本阶段不把现有 producer 切换到未完成的新路径。
@@ -160,6 +177,9 @@ fixed_irq_routes = [
   `ICH_VTR_EL2` 完全相同。
 - [ ] `ArmPerCpu::hardware_enable()` 在本地采集/publish profile；VM prepare
   查询 registry，不跨 CPU 直接读 ICH sysreg，缺少 profile 时显式失败。
+- [ ] emulated SPI prepare 要求共同 LR capacity 至少为 2；UIE 在零个或
+  一个 valid LR 时断言，单 LR profile 在本模块不使用 NPIE 的 policy 下
+  明确 Unsupported，而不是进入 maintenance storm。
 - [ ] bind/guest entry 前恢复当前 vCPU ICH state，退出/unbind 时 fold 并
   保存，离开后不得把该 vCPU 的 LR 留给其他 vCPU。
 - [ ] 将 bind→guest run→unbind 收敛到同一个 CPU pin/current-vCPU
@@ -185,8 +205,10 @@ fixed_irq_routes = [
 - [ ] AArch64 覆盖默认 `after_external_interrupt()`，只保留 timer event
   check，不再第二次 `dispatch_host_irq(vector)`；其他架构默认行为不变。
 - [ ] IRQ framework/GIC dispatch 是 host PPI transaction 的唯一 owner；
-  maintenance action 只记录 per-pCPU observation。target vCPU `unbind`
-  在清 ICH 前 fold MISR/EISR/LR，下一次 bind/entry refill。
+  maintenance action 只记录带 `(vm_id, vcpu_id, bind_generation)` 的
+  per-pCPU observation，不能用泄漏给下一 vCPU 的裸 bool。target vCPU
+  `unbind` 重验 owner并在清 ICH 前 fold MISR/EISR/LR，下一次 bind/entry
+  refill。
 - [ ] level 在 Pending LR 中 lower 时撤销 resident Pending；软件 level
   active 期间不主动构造 Active+Pending。
 - [ ] edge 在 Active 期间再次 pulse 时将 resident LR 收敛为
@@ -221,8 +243,9 @@ fixed_irq_routes = [
   Router/Fabric → VGIC MMIO wrapper → 其他设备。
 - [ ] `AxvmArmVcpu` 使用 AxVM-private create config 组合
   `ArmVcpuCreateConfig` 与可选 delivery port；delivery port 持共享
-  controller 和 sender，用于 cross-vCPU DIR 的 owner kick，
-  `arm_vcpu` 不依赖 `arm_vgic`。
+  controller，`VmInterruptSender` 作为同一 AxVM-private vCPU 组合中的兄弟
+  字段，只在 delivery 返回 target service hint 后调用；二者都不进入
+  `arm_vcpu`，`arm_vcpu` 也不依赖 `arm_vgic`。
 - [ ] MMIO wrapper、Router 和 vCPU delivery port 共享同一 controller core。
 - [ ] AArch64 emulated prepare 认领 `InterruptController` 配置，从 common
   legacy fallback 中排除该项，用预创建 controller 构造并注册 wrapper；
@@ -247,22 +270,28 @@ fixed_irq_routes = [
   pending/active 的状态真源。
 - [ ] AArch64 `ArchOps::inject_vcpu_interrupt` 不直接按 event 写一个 LR，
   而是要求当前 vCPU delivery port fold/refill controller 当前状态。
-- [ ] 每次 guest entry 前即使没有新 kick 也执行一次轻量 refill，保证
+- [ ] 通用 `ArchOps` 增加默认 no-op 的 `before_vcpu_entry`，两个 queue
+  drain 后、guest run 前只调用一次；AArch64 在该 hook 即使没有新 kick 也
+  执行一次轻量 fold/refill，保证
   暂时 sender 失败或合并 kick 不会永久饿死当前 controller pending；
   reset 后旧 controller pending 不迁移。
 - [ ] stale kick 在 controller 中没有可递送中断时成为成功 no-op。
 - [ ] Router 不直接访问远程 vCPU、task、wait queue 或 ICH 寄存器。
-- [ ] 修正 `AxVM::pulse_interrupt()` 的 machine-lock 重入：锁内只快照内部
-  Fabric/sink capability，释放后再进入 Router/sender；AxVM 不公开 Fabric。
-- [ ] 增加 pulse wrapper→Router→sender 的确定性测试，证明 sender 回查
-  runtime 时 machine lock 已释放。
+- [x] `AxVM::pulse_interrupt()` 的 machine-lock 重入已在 PR #1679
+  （commit `5155111ef`）修复：锁内只快照内部 Fabric capability，释放后再
+  调用 sink；AxVM 不公开 Fabric。
+- [x] 已有
+  `interrupt_pulse_runs_after_snapshot_lock_is_released` 确定性测试，并在
+  当前 plan 基线验证通过。PR 3.4 只需保留该回归；新增 level wrapper 必须
+  复用相同 snapshot 模式。
 
 ### 3F：synthetic device 与端到端验证
 
 - [ ] 增加仅测试配置可用的 synthetic SPI MMIO device，不进入默认产品配置。
-- [ ] 为 synthetic device 分配 feature-gated 的 test-only
-  `EmulatedDeviceType`；未启用 feature 时配置解析/构造必须明确失败，不能复用
-  `Dummy` 或占用生产设备语义。
+- [ ] 为 synthetic device 分配数值稳定的 test-only
+  `EmulatedDeviceType::SyntheticIrq = 0xDF`；variant identity无条件保留，
+  factory实现由 `test-synthetic-irq` feature逐层传播。未启用时构造明确
+  Unsupported，不能复用 `Dummy`、fallback或占用生产设备语义。
 - [ ] device factory 通过正常 `DeviceBuildContext::resolve_irq()` 获取
   `IrqLine`。
 - [ ] 严格校验 synthetic config：`irq_id` 是唯一 line，`cfg_list` 只编码
@@ -274,10 +303,12 @@ fixed_irq_routes = [
   guest UART，也不把报告 register 作为中断注入后门。
 - [ ] 增加 emulated GICv3 SMP2 guest/VM 配置，SPI 固定路由到 vCPU 1。
 - [ ] 新增
-  `test-suit/axvisor/normal/qemu/emulated-gicv3-spi-smp2/qemu-aarch64.toml`，
+  `test-suit/axvisor/normal/emulated-gicv3-spi-smp2/qemu-aarch64.toml`，
   以及同目录专用 `build-aarch64-unknown-none-softfloat.toml`；后者沿用普通
   AArch64 wrapper 的 host target/features，但使用本用例自己的 VM config
-  和 guest build 描述，避免影响 smoke build group。
+  和 guest build 描述，避免影响 smoke build group；该目录与
+  `normal/qemu/` 平级，以符合当前不发现嵌套 build wrapper 的 discovery
+  规则。
 - [ ] 增加
   `test-suit/axvisor/guests/emulated-gicv3-spi-smp2/` 下的专用 `no_std`
   AArch64 EL1 guest；manifest 用独立 `[workspace]` 退出根 workspace，
@@ -346,14 +377,16 @@ cargo xtask axvisor test qemu --arch aarch64 --test-group normal \
 
 ## 代码量与难度
 
-预计生产 Rust 约 1,200–2,100 行，单元/集成测试、测试 guest、runner
-支持和配置约 1,300–2,400 行，总变更约 2,500–4,500 行。整体难度为高：
+预计生产 Rust 约 1,680–2,870 行，单元/集成测试、测试 guest、runner
+支持和配置约 1,940–3,270 行，总变更约 3,620–6,140 行。该区间是五个 PR
+分项估算之和，并包含为了
+可审查性补齐的 capability、host IRQ 和 typed guest-build 边界，整体难度为高：
 
-- 3A、3E 为中到中高；
-- 3B、3D 为中高，决定状态所有权和初始化是否稳定；
-- 3C 为最高风险，集中处理 ICH capability、per-vCPU owner、EOImode、
-  maintenance/deactivation 和 refill；
-- 3F 实现难度中高，主要成本是可重复的 SMP2 与 LR pressure 证据。
+- PR 3.1 中高：INTID/寄存器字段正确性；
+- PR 3.2 高：ICH save/restore 与 CPU pin；
+- PR 3.3 最高：状态机、epoch、EOImode、maintenance 和 refill；
+- PR 3.4 中高：构造原子性、Router/runtime 接线；
+- PR 3.5 中高：可重复的 EL1 SMP2 与 LR pressure 证据。
 
 详细分项估算见 [`design_3.md`](./design_3.md#19-代码量与难度预估)。
 

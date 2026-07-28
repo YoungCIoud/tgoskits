@@ -118,6 +118,11 @@ pCPU 时，三个阶段之间存在迁移窗口；ICH restore、guest run 和 sa
 maintenance，也没有 fold EISR/LR state 的入口。guest 实际 deactivate 后
 line 仍 asserted 时无法重新 pending。
 
+`drivers/intc/arm-gic-driver/src/sys_reg/ich.rs` 已有 HCR
+UIE/LRENPIE/NPIE/TDIR、MISR/EISR 和 VTR.TDS 字段，但 LR 尚未定义软件
+EOI overlay，`ICH_VTR_EL2.IDBITS` 当前以 4 bit 定义并与 PREBITS 重叠。
+PR 3.1 必须修正这两个 register boundary，而不是复制一套 AxVM 私有位号。
+
 ## 4. 规范与 prior art
 
 ### 4.1 Arm GIC 语义
@@ -162,7 +167,9 @@ line 仍 asserted 时无法重新 pending。
 - 软件 edge 在 active 期间再次 pending 时用 LR Active+Pending 表达；
 - LR 不足时保留软件 pending，后续 refill。
 - ICH HCR 的 UIE 只在“LR 外仍有 pending 且当前无空槽”时启用，以 underflow
-  maintenance 驱动 refill；本模块不需要 NPIE。LRENPIE 只与
+  maintenance 驱动 refill；UIE 的架构条件是零个或一个 LR仍 valid，并非
+  任意空槽 watermark，因此 emulated mode要求共同 LR 数至少为 2。本模块
+  不需要 NPIE。LRENPIE 只与
   active-outside-LR 相关，而本模块禁止该状态并保持其关闭。
 - KVM 对 `EOImode=1` 使用 TDIR 捕获 DIR，既处理 active-outside-LR，
   也处理 SPI 在另一 vCPU 上被 deactivate；
@@ -291,18 +298,43 @@ trigger 不放在 route 表中。它由设备资源声明，避免 route 和 lin
 ### 6.3 未来 `GICD_IROUTER`
 
 本模块不公开 speculative route trait。controller 内部的 `InterruptRecord`
-已经拥有 `target: VgicVcpuId`，固定配置只是在 prepare 阶段设置初值。
+已经区分 `route_target: VgicVcpuId` 和 `inflight.{owner, epoch}`，固定配置
+只是在 prepare 阶段设置 route初值。
 
 未来实现 `GICD_IROUTER` 时：
 
 1. MMIO adapter 解码 affinity；
 2. 架构层把 affinity 解析到 `VgicVcpuId`；
 3. 调用 controller 内部 route 状态转换；
-4. 如 pending SPI 的 target 改变，旧 target 的 stale kick 成为 no-op，
-   新 target 获得 kick；
+4. 如 pending SPI 的 route改变，尚未 resident的 instance转向新 target；
+   已 resident/Active的旧 instance仍由 `inflight.owner` 完成，旧 target的
+   其他 stale kick成为 no-op；
 5. Router、Fabric、sender、delivery port 和 LR refill 接口保持不变。
 
 这里不提前暴露未使用公共方法；只要求当前状态归属不阻塞上述演进。
+
+### 6.4 未来完整 enable/pending/active MMIO
+
+现有 `enabled`、trigger-independent `pending_latch`、`active`、
+`route_target` 和 `{owner, delivery epoch}` 都由 controller record唯一
+拥有，因此未来寄存器 adapter只增加新的状态输入：
+
+- ISENABLER/ICENABLER 更新 `enabled`；
+- ISPENDR/ICPENDR 更新 trigger-independent pending latch；
+- ISACTIVER/ICACTIVER 请求 active transition/deactivation；
+- ICFGR 更新 trigger并执行架构规定的状态校验。
+
+`ICPENDR` 若命中已经 resident的 Pending LR，需要在 controller内生成带
+owner/epoch的 resident-cancel command，由现有 reconcile边界在 owner本地
+清 LR；这与当前 lower/disable触发的 Pending撤销同类，不需要让 MMIO adapter
+直接碰 LR。`ISACTIVER/ICACTIVER` 同理不能从 MMIO线程写远程 banked ICH。
+
+本模块不提前公开这些尚无 caller 的方法。将来实现 guest active写时，若要求
+active instance不占 LR，需要在 ICH adapter内增加 active-outside-LR、
+EOIcount/LRENPIE支持；也可在有空 LR时物化 active LR。该扩展会增加
+controller transition和 delivery策略，但不改变 device/Router/sender、
+fixed/guest route输入汇合点或 target vCPU本地 LR访问边界，因而不需要
+大面积重构主链路。
 
 ## 7. VGIC controller 设计
 
@@ -315,9 +347,8 @@ Arc<ArmVgicController>
 ```
 
 controller 在 prepare 时只为验证后的固定 route 创建
-`ArmSpiIntId → InterruptRecord` 索引；lookup 在 line/LR 路径不分配。
-实现可选适合 `no_std` 的有序 map 或验证后定长表，但不能沿用 512 上限，也
-不能在 IRQ 路径按 INTID 扩容。
+`BTreeMap<ArmSpiIntId, InterruptRecord>` 索引；builder阶段插入，sealed后
+line/LR 路径只查询/更新既有节点，不分配、不按 INTID扩容，也不沿用512上限。
 
 共享者：
 
@@ -335,18 +366,20 @@ controller 在 prepare 时只为验证后的固定 route 创建
 
 具体组合边界为：
 
-- `arm_vcpu` 保存原始 `IchVcpuContext`，提供 capability-safe 的本地
+- `arm_vcpu` 保存 typed HCR policy 与 raw VMCR/APR/LR 组成的
+  `IchVcpuContext`，提供 capability-safe 的本地
   sysreg save/restore/access，不依赖 `arm_vgic`；
 - `arm_vgic` 保存纯 controller 状态，不依赖 AxVM、ICH 或 runtime；
 - AxVM 私有 `AxvmArmVcpu` 组合 `ArmVcpu` 与可选
-  `ArmVgicDeliveryPort`，delivery port 持有共享 controller 和
-  `VmInterruptSender`，完成 target-side fold/reconcile/refill，并在
-  cross-vCPU DIR 时于 controller lock 外 kick LR owner；
+  `ArmVgicDeliveryPort`；delivery port 只持共享 controller 并完成
+  target-side fold/reconcile/refill，AxVM-private runtime composition 在
+  cross-vCPU DIR 时接收 service hint，并于 controller lock 外使用
+  `VmInterruptSender` kick LR owner；
 - passthrough vCPU 没有 emulated VGIC delivery port。
 
 delivery port 不持有 Router、runtime、task 或 wait queue。它与 Router 复用
-同一条规则：controller transition 返回 typed service hint，释放 controller
-lock 后才调用 sender。
+同一条规则：controller transition 返回 typed service hint，AxVM adapter
+释放 controller lock 后才调用 sender。
 
 AxVM wrapper 使用私有 create config 组合两层，不把 `arm_vgic` 类型加入
 `arm_vcpu` 公共 API：
@@ -376,16 +409,21 @@ arm_vgic state
 每个已绑定 SPI 至少保存：
 
 ```rust
+struct ResidentInstance {
+    owner: VgicVcpuId,
+    epoch: DeliveryEpoch,
+}
+
 struct InterruptRecord {
     intid: ArmSpiIntId,
-    trigger: TriggerMode,
+    trigger: axdevice_base::InterruptTriggerMode,
     enabled: bool,
     line_asserted: bool,
     pending_latch: bool,
     active: bool,
-    inflight_epoch: Option<DeliveryEpoch>,
-    deactivation_epoch: Option<DeliveryEpoch>,
-    target: VgicVcpuId,
+    inflight: Option<ResidentInstance>, // { owner, epoch }
+    deactivation: Option<ResidentInstance>,
+    route_target: VgicVcpuId,
 }
 ```
 
@@ -393,21 +431,28 @@ struct InterruptRecord {
 
 - `line_asserted`：设备 level input 当前状态；edge line 始终为 false；
 - `pending_latch`：已经捕获但尚未消费的 edge，或以后 guest ISPENDR
-  产生的软件 latch；
+  产生的软件 latch；它独立于 trigger，level 电气 line 本身不置该 latch；
 - `active`：最近一次 fold 已确认 guest acknowledge、尚未 deactivate 的实例；
-- `inflight_epoch`：该记录当前驻留在目标 vCPU live/saved LR 集合中的
-  instance；`None` 表示不驻留；
-- `deactivation_epoch`：TDIR 捕获、尚未由 LR owner 应用的 instance；
+- `inflight`：该记录当前驻留在 owner vCPU live/saved LR 集合中的
+  `{ owner, epoch }`；`None` 表示不驻留；
+- `deactivation`：TDIR 捕获、尚未由 LR owner 应用的同一个
+  `{ owner, epoch }` instance；
 - `enabled`：现有最小 enable 状态；
-- `target`：controller 唯一的路由状态。
+- `route_target`：controller 唯一的路由状态。
+
+固定路由下 `inflight.owner == route_target`，但两者必须从第一版分开：
+未来 `GICD_IROUTER` 改写 `route_target` 时，已 Active 的旧 LR仍由原
+`inflight.owner` 完成，新的 pending instance才使用新 route。这使未来路由
+可编程化只增加 route mutation/reconcile，不重写 fold、TDIR 或 slot map。
 
 controller 使用 checked `u64` counter 分配 `DeliveryEpoch`，在同一 VM
 生命周期内不复用，耗尽时返回明确错误。delivery commit 将 epoch 同时写入
-record 和该 vCPU 的 LR slot map；TDIR request 只引用当时的
-`inflight_epoch`。
+record 的 `inflight` 和该 vCPU 的 LR slot map；TDIR request复制当时的
+完整 `{ owner, epoch }`。
 
-是否使用一个 `InterruptState` enum 表达 pending/active 四态由实现选择，但
-不得让 MMIO wrapper、Router 和 delivery port 各自保存一份持久状态。guest
+首版直接使用上面的正交字段，不再叠加一个 `InterruptState` enum，避免把
+line、latch、active和 residency的独立维度压成易遗漏的组合。不得让 MMIO
+wrapper、Router 和 delivery port各自保存一份持久状态。guest
 运行期间 LR 是硬件执行副本，controller 在 fold 后保存 durable truth；
 controller record 与该 vCPU 的 LR slot→INTID 驻留映射共同维持一致性。
 
@@ -417,29 +462,31 @@ controller record 与该 vCPU 的 LR slot→INTID 驻留映射共同维持一致
 
 ```text
 source_pending =
-  level ? line_asserted : pending_latch
+  pending_latch || (level && line_asserted)
 
 deliverable =
   enabled
-  && inflight_epoch.is_none()
+  && inflight.is_none()
   && !active
-  && deactivation_epoch.is_none()
+  && deactivation.is_none()
   && source_pending
 ```
 
 本模块不增加 `redelivery_pending` 这一第二真源：edge 重触发由
-`pending_latch` 表示，level 重投条件由 `line_asserted` 表示，是否可装载再
-结合 `active/inflight` 推导。必须用测试证明 active 期间的新 edge 和
-asserted level 不会丢失。
+`pending_latch` 表示，level 电气重投条件由 `line_asserted` 表示，是否可
+装载再结合 `active/inflight` 推导。trigger-independent latch 允许以后
+`ISPENDR/ICPENDR` 对 edge/level 调用同一 controller transition；本模块尚不
+开放该 MMIO 输入。必须用测试证明 active 期间的新 edge 和 asserted level
+不会丢失。
 
-`deactivation_epoch` 不是新的 pending 真源，而是 EOImode=1 cross-vCPU
+`deactivation` 不是新的 pending 真源，而是 EOImode=1 cross-vCPU
 DIR 到 LR owner 的一次性 completion command。只有 owner delivery port
 确认 epoch 与 resident slot 一致、清除 LR active bit 并 fold 后才能消费。
 同 epoch 的重复 DIR 幂等合并；旧 epoch 的迟到 command 不能作用于随后同
 INTID 的新 residency。
 
 `deliverable` 只表示能占用一个空 LR，不等于“target 是否需要运行”。对
-`inflight_epoch.is_some()` 的记录，line/pending 变化可能要求修正 resident
+`inflight.is_some()` 的记录，line/pending 变化可能要求修正 resident
 LR：
 
 ```text
@@ -463,7 +510,7 @@ pulse while inactive
 
 commit to LR
   → pending_latch consumed
-  → inflight = true
+  → inflight = Some({ owner = route_target, epoch = fresh_epoch })
 
 pulse while LR active/inflight
   → retain one pending instance
@@ -497,7 +544,7 @@ raise
   → if enabled and not inflight: deliverable
 
 commit to LR
-  → inflight = true
+  → inflight = Some({ owner = route_target, epoch = fresh_epoch })
 
 guest acknowledge
   → active = true
@@ -511,11 +558,11 @@ lower while resident LR is Pending
   → target invalidates Pending LR before the next guest entry
 
 deactivate while asserted
-  → active/inflight = false
+  → active = false, inflight = None
   → deliverable again
 
 deactivate after lower
-  → active/inflight = false
+  → active = false, inflight = None
   → inactive
 ```
 
@@ -639,7 +686,9 @@ deliverable，也必须产生或保留 service hint：
 
 该优化不能改变正确性：
 
-- run loop 每次 guest entry 都检查/refill；
+- 通用 run loop 在两个 queue drain 后调用默认 no-op 的
+  `ArchOps::before_vcpu_entry`；AArch64 在该 hook 每次 guest entry 只执行
+  一次检查/refill；
 - maintenance underflow/EOI 会再次触发目标处理，fold 再确认是否已
   deactivate；
 - stale/重复 kick 始终允许。
@@ -650,12 +699,12 @@ deliverable，也必须产生或保留 service hint：
 
 ### 9.1 状态归属
 
-每个 `ArmVcpu` 保存 raw ICH context，AxVM 私有 `AxvmArmVcpu` 另持有可选
+每个 `ArmVcpu` 保存 typed ICH context，AxVM 私有 `AxvmArmVcpu` 另持有可选
 delivery port：
 
 ```rust
 struct IchVcpuContext {
-    hcr: u64,
+    hcr: IchHcrPolicy,
     vmcr: u64,
     ap0r: [u64; MAX_APR_REGS],
     ap1r: [u64; MAX_APR_REGS],
@@ -668,6 +717,14 @@ struct IchVcpuContext {
 能力，不作为可写 vCPU 状态保存。delivery port 另保存该 vCPU 的
 `LR slot → (ArmSpiIntId, DeliveryEpoch)` 驻留映射；active record 在 guest
 deactivate 前不得从 live/saved LR 集合驱逐。
+
+`IchHcrPolicy` 只表达本模块拥有的 `EN`、`UIE` 和 `TDIR`。HCR 不作为
+opaque `u64` 原样保存：NPIE/LRENPIE、group maintenance、trap-all 和未知位
+均不继承；EOICOUNT 属于 active-outside-LR 协议而不是普通配置。当前模块
+entry 显式写 EOICOUNT=0，save 若观察到非零值则在安全 cleanup 后返回
+`BadState`，避免把上一 vCPU 的一次运行时状态带到下一次 bind。未来若支持
+active-outside-LR，只扩展 typed context/adapter，不影响 controller、
+Router 或 sender。
 
 ### 9.2 ICH capability profile
 
@@ -753,7 +810,7 @@ pin 内复用现有 bind/run/unbind 状态转换。
 - TDIR 对 INTID 不可选择，因此未被 module 3 controller 拥有的 SGI/PPI/DIR
   必须委托给保持既有行为的 ICH deactivation compatibility helper，不能吞掉；
 - 因不存在 active-outside-LR，本模块不需要 EOIcount 补偿，也不启用
-  LRENPIE。
+  LRENPIE；HCR.EOICOUNT 必须保持 0。
 
 若实现不能维持 active-resident 约束，prepare/运行边界必须返回明确
 unsupported/error，不能静默遗失 active state。以后支持 active-outside-LR
@@ -783,9 +840,11 @@ lower-EL maintenance IRQ exit
 ```
 
 maintenance action 不直接进入 `ArmVgicController`，只使用 per-pCPU
-“当前是否有 bound vCPU/是否观察到 maintenance”的最小架构状态。不得把
-ICH fold 放进 deferred handler；届时 vCPU 已 unbind，banked ICH 不再有
-可靠 owner。AArch64 应覆盖默认 `after_external_interrupt()`，只保留
+“当前是否有 bound vCPU/是否观察到 maintenance”的最小架构状态。
+observation 必须携带 `(vm_id, vcpu_id, bind_generation)` 并在 unbind 消费
+时重验，不能用会泄漏给下一 vCPU 的 per-CPU bool。不得把 ICH fold 放进
+deferred handler；届时 vCPU 已 unbind，banked ICH 不再有可靠 owner。
+AArch64 应覆盖默认 `after_external_interrupt()`，只保留
 `check_timer_events()`，不再调用第二次 `dispatch_host_irq(vector)`；其他架构
 的默认 hook 不变。普通 host IRQ 的现有一次 dispatch 和 timer check 行为
 必须回归。
@@ -807,11 +866,13 @@ controller lock 与 ICH 操作的规则：
 
 优先使用短锁内本地 sysreg write，避免为当前单一实现引入公共 token API。
 
-当前 `AxVM::pulse_interrupt()` 在 `with_resources()` 持有 machine lock 时直接
-调用 Fabric。AArch64 Router 随后通过 sender 查询同一 VM runtime 会再次获取
-machine lock，形成自锁。模块 3 必须让该 wrapper 只在锁内克隆内部
-Fabric/sink capability，释放 machine lock 后再调用 `pulse()`；未来
-`set_interrupt_level()` 遵循同一模式。AxVM 仍不向外暴露 Fabric 引用。
+当前基线已经修复 `AxVM::pulse_interrupt()` 的 machine-lock 重入：
+`interrupt_fabric_snapshot()` 在锁内验证 lifecycle 并克隆内部 Fabric
+capability，释放 machine lock 后才调用 `pulse()`。修复来自 PR #1679 /
+commit `5155111ef`，并由
+`interrupt_pulse_runs_after_snapshot_lock_is_released` 覆盖。模块 3 不再
+修改该锁路径；新增 `set_interrupt_level()` 必须复用同一 snapshot 模式。
+AxVM 仍不向外暴露 Fabric 引用或公共 clone accessor。
 
 ## 10. LR 编码、fold 与 refill
 
@@ -827,8 +888,8 @@ Fabric/sink capability，释放 machine lock 后再调用 `pulse()`；未来
 - HW：0；
 - EOI：软件 level interrupt 置位。
 
-当前 register wrapper 缺少 EOI bit，3A 必须补齐。所有字段编码使用 typed
-helper 和范围校验，不直接拼接未经验证的裸 `usize`。
+当前 register wrapper 缺少 EOI bit，PR 3.1 必须补齐。所有字段编码使用
+typed helper 和范围校验，不直接拼接未经验证的裸 `usize`。
 
 ### 10.2 fold
 
@@ -887,25 +948,32 @@ maintenance PPI 必须通过 host platform IRQ 解析和注册获得 typed `IrqI
 不能硬编码 QEMU 常见的 PPI 25。具体归属为：
 
 1. `somehal` GICv3 FDT probe 解析 GIC 节点 `interrupts` 中的 maintenance
-   specifier；
-2. 在 GIC dynamic IRQ domain 分配后，将其翻译为该 domain 中的 typed
-   `IrqId`，并经 `ax-plat`/`ax-hal` 的 typed AArch64 platform capability
-   发布；AxVM 不直接依赖 `somehal`；
-3. AxVM AArch64 的 `ArchOps::register_platform_irq_injector()` 在所有 pCPU
-   已完成 virtualization enable 后只注册一次 `request_percpu_irq` action，
+   specifier；在注册 GIC device 前复制 cells，不保存 FDT lifetime 引用；
+2. 在 GIC dynamic IRQ domain 分配并以
+   `dev.register(rdif_intc::Intc::new(domain, gic))` 注册后，通过该确切
+   device/domain 的 `Intc::translate_fdt()`/`configure()` 将其翻译为 typed
+   `IrqId`；禁止使用可能选中任意控制器的 `get_one()`，并验证结果属于该
+   domain 且是 private/per-CPU IRQ；
+3. 只有上述步骤成功才经 `ax-plat`/`ax-hal` 的 typed AArch64 platform
+   capability 发布；AxVM 不直接依赖 `somehal`；
+4. AxVM AArch64 的 `ArchOps::register_platform_irq_injector()` 在所有 pCPU
+   已完成 virtualization enable 后只调用一次现有
+   `ax_plat::irq::request_percpu_irq()`，
    CPU mask 覆盖 enabled virtualization CPUs；
-4. host-lifetime owner 保存返回的 `IrqHandle`，重复初始化必须幂等或返回
+5. host-lifetime owner 保存返回的 `IrqHandle`，重复初始化必须幂等或返回
    明确错误；
-5. 现有 hook 返回 `()`，因此 capability registry 需保存
+6. 现有 hook 返回 `()`，因此 capability registry 需保存
    registered/unavailable/error 状态；缺失 PPI 不阻止纯 passthrough host
    初始化；
-6. VM prepare 只检查该 capability 和 CPU coverage，不按 VM 重复注册 PPI，
+7. VM prepare 只检查该 capability 和 CPU coverage，不按 VM 重复注册 PPI，
    emulated mode 遇到 unavailable/error 时返回原始上下文。
 
 IRQ framework/GIC dispatch 是 host PPI transaction 的唯一 owner；注册的
 maintenance action 只记录 per-pCPU maintenance observation，不修改 VGIC
-controller。AArch64 VGIC delivery path 必须在 unbind 内、仍属于目标
-vCPU 的上下文读取
+controller。observation 以当前 publication 的
+`(vm_id, vcpu_id, bind_generation)` 为 owner key，多次同 owner observation
+可合并，owner mismatch不得作用于下一 vCPU。AArch64 VGIC delivery path
+必须在 unbind 内、仍属于目标 vCPU 的上下文读取
 `ICH_MISR_EL2`/`ICH_EISR_EL2` 并 fold；refill 在下一次 bind/guest entry
 前完成。普通非 maintenance host IRQ 不触发 VGIC completion。
 
@@ -913,8 +981,8 @@ vCPU 的上下文读取
 
 - EOI maintenance：提示检查软件 level LR；以 LR active bit 是否清除确认
   deactivate；
-- underflow maintenance：通过 UIE 观察 LR 出现可用容量，且软件 pending
-  尚存；
+- underflow maintenance：UIE 在零个或一个 LR仍 valid时提供 refill机会，
+  delivery port重查软件 pending；不能把它解释为“任意 LR一空就通知”；
 - NPIE 在本模块保持关闭；refill 不依赖“所有 LR 都不再 pending”才获得通知；
 - LRENPIE 在本模块 active-resident 约束下保持关闭；
 - 未知 MISR 原因：记录并按明确 unsupported/error 策略处理；
@@ -951,17 +1019,24 @@ command 不能把新的 pending instance 误清除。
 ```text
 1. 解析 VM config、vCPU placement 和 fixed_irq_routes
 2. 验证 host GICv3 virtualization/TDS/maintenance capability 与共同 profile
-3. 创建 ArmVgicController
+3. 创建 ArmVgicControllerBuilder 和尚未 sealed 的共享 controller
 4. 用 AxVMRef 创建 VmInterruptSender
-5. 创建带 ArmVgicDeliveryPort 的 vCPU
-6. 创建 ArmInterruptRouter
-7. 创建 InterruptFabric
-8. 用同一 controller 创建 VGIC MMIO wrapper
-9. 构造其他设备并向其提供 IrqLine
-10. 收集 Resource::IrqLine，绑定 trigger + fixed route
-11. 校验 route 无遗漏/无多余
-12. 原子提交 PreparedVm
+5. 创建 ArmInterruptRouter 和 InterruptFabric
+6. 用同一 controller 创建 VGIC MMIO wrapper
+7. 构造其他设备并向其提供最终 IrqLine
+8. 经 `PreparedDevices::devices()` 和 `AxVmDevices::devices()` 的现有只读
+   iterator收集每个 `Device::resources()` 中的 `Resource::IrqLine`，校验并
+   向 builder绑定 trigger + fixed route
+9. finish builder，seal controller
+10. 创建带 ArmVgicDeliveryPort 的 vCPU
+11. 完成 mapping/setup 后原子提交 PreparedVm
 ```
+
+controller 在 sealed 前对任何 runtime line/MMIO/delivery 操作返回明确
+NotReady；设备 bundle 此时尚未发布，factory constructor 不得产生异步 IRQ。
+这一一次性 builder 解决 trigger 只有在设备构造完成后才能从
+`Device::resources()` 确认的构造环，不穿透 `DeviceBundle` 私有字段，也
+不允许运行期继续创建 record。
 
 当前 `AxVmDevices` 对 `InterruptController` 使用 legacy fallback 并在内部
 执行 `Vgic::new()`。emulated GICv3 分支必须由 AArch64 prepare 认领这一
@@ -971,6 +1046,9 @@ architecture-owned 配置：
   config，拒绝重复 controller；
 - 用预先创建的 `Arc<ArmVgicController>` 构造 VGIC MMIO wrapper，并将
   wrapper 注册到同一个临时 `PreparedDevices`；
+- wrapper使用配置的 64KiB对齐 base、`length=0x1_0000` 和空 cfg_list；
+  SPI ISENABLER代理共享 controller，禁止调用仍硬编码地址并持有 legacy
+  512项 SPI状态的 `Vgic::new()`；
 - 其余设备仍经原 `DeviceFactoryRegistry` 和 `DeviceBuildContext` 构造；
 - 不向通用 `DeviceBuildContext` 塞入 `Any`/downcast 架构服务，也不允许
   legacy fallback 再创建第二个 `Vgic`；
@@ -995,10 +1073,8 @@ AxVM
                       → Weak<AxVM>
 
 AxvmArmVcpu
-  → ArmVgicDeliveryPort
-      → Arc<ArmVgicController>
-      → VmInterruptSender
-          → Weak<AxVM>
+  → ArmVgicDeliveryPort → Arc<ArmVgicController>
+  → VmInterruptSender → Weak<AxVM>
 
 VGIC MMIO wrapper
   → Arc<ArmVgicController>
@@ -1205,12 +1281,14 @@ synthetic emulated device 从 vCPU MMIO exit 上下文调用。module 1 dispatch
 
 ### 15.4 QEMU SMP2
 
-新增 case：
-`test-suit/axvisor/normal/qemu/emulated-gicv3-spi-smp2/qemu-aarch64.toml`，
+新增独立 build-wrapper case：
+`test-suit/axvisor/normal/emulated-gicv3-spi-smp2/qemu-aarch64.toml`，
 并在同目录增加专用 `build-aarch64-unknown-none-softfloat.toml`。专用 wrapper
 沿用普通 AArch64 wrapper 的 host target/features，但引用本用例自己的 VM
 config 和下述 guest build；它构成独立 build group，不把测试 feature、guest
-产物或 emulated VM config 带入现有 smoke。QEMU machine 明确使用
+产物或 emulated VM config 带入现有 smoke。该目录必须与现有
+`normal/qemu/` 平级，因为当前 discovery 遇到父 build wrapper 后不会发现
+嵌套 build wrapper。QEMU machine 明确使用
 `virt,virtualization=on,gic-version=3` 和至少 `-smp 2`。测试 VM 配置把
 `phys_cpu_ids = [0, 1]` 用作 guest MPIDR，并以
 `phys_cpu_sets = [1, 2]` 将 vCPU 0/1 分别固定到 host pCPU 0/1，避免
@@ -1241,8 +1319,8 @@ prebuild 字符串。
 
 1. 解析并校验 `guest_builds`，拒绝重复 output、越出 workspace/tmp 的 output
    和不受支持的 output format；
-2. 用 pinned toolchain 构建 guest ELF，并使用同 toolchain 的 LLVM objcopy
-   生成临时 raw binary；
+2. 用 pinned toolchain 构建 guest ELF，并调用仓库约定的
+   `rust-objcopy -O binary` 生成临时 raw binary；
 3. 原子替换最终 output，保证失败构建不留下可被 host `include_bytes!` 误用的
    半成品；同一 build group 内按完整 build 描述去重；
 4. 再加载/构建 AxVisor host artifact。
@@ -1294,41 +1372,30 @@ cargo xtask axvisor test qemu --arch aarch64 --test-group normal \
 - `axvmconfig` 旧配置反序列化；
 - module 1 sender/dispatcher tests。
 
-## 16. 子模块与合入顺序
+## 16. 五个 PR 与合入顺序
 
-### 3A：INTID/寄存器修正
+依赖顺序固定为：
 
-只修无损 INTID、typed LR error 和缺失的 LR EOI、HCR TDIR/maintenance、
-VTR TDS、MISR/EISR fields，并提供真实测试调用者。不切换 producer。
+```text
+PR 3.1 → PR 3.2 → PR 3.3 → PR 3.4 → PR 3.5
+```
 
-### 3B：VGIC state
+| PR | 内容 | 详细设计 | 对真实 producer 的影响 |
+|----|------|----------|-------------------------|
+| 3.1 | 无损 INTID、ICH 字段、typed LR error、legacy Vgicd 越界修复 | [`design_3_1.md`](./design_3_1.md) | 不切换 |
+| 3.2 | per-vCPU ICH context、capability registry、同 CPU pin 生命周期 | [`design_3_2.md`](./design_3_2.md) | 不切换 |
+| 3.3 | VGIC state、epoch、TDIR/maintenance、fold/reconcile/refill | [`design_3_3.md`](./design_3_3.md) | 仅直接构造测试 |
+| 3.4 | fixed route、两阶段初始化、Router、sender、target consumer | [`design_3_4.md`](./design_3_4.md) | 唯一 production 切换点 |
+| 3.5 | synthetic device、EL1 guest、typed guest build、SMP2 QEMU | [`design_3_5.md`](./design_3_5.md) | 增加行为证据 |
 
-加入 controller state、固定 route 和纯状态机测试。接口保持 crate 最小可见，
-同一变更中由测试和下一层 adapter 消费。
+3A–3F 仍可作为功能工作包术语：PR 3.1 对应 3A，PR 3.2 对应 3C 的 context/
+pin 前半，PR 3.3 合并 3B 与 3C 的 delivery 后半，PR 3.4 合并 3D 与 3E，
+PR 3.5 对应 3F。功能工作包不再作为提交边界。
 
-### 3C：ICH lifecycle
-
-实现 per-vCPU context、fold/refill、TDIR completion 和 EOI/underflow
-maintenance。此阶段可用 fake controller/adapter 验证，不对设备开放半成品
-路径。
-
-### 3D：初始化
-
-加入配置与两阶段构造，保持 passthrough 分支原样；失败不提交半初始化 VM。
-
-### 3E：Router
-
-接通 `IrqLine → controller → sender kick → target refill`，此时才启用新的
-emulated SPI producer path。
-
-### 3F：端到端
-
-增加 synthetic device、专用 EL1 SMP2 guest、typed guest prebuild、
-VM/QEMU config 和端到端验证，完成行为证据。
-
-每个子模块必须保持可构建、可测试；不得用 `todo!()`、no-op 或 silent
-fallback 维持中间状态。若一个新内部 API 在当前子模块没有真实消费者，应与
-其首个消费者合并提交。
+每个 PR 必须保持可构建、可测试；不得用 `todo!()`、no-op 或 silent
+fallback 维持中间状态。PR 3.1–3.3 不允许把真实设备接入半成品路径；PR 3.4
+必须同时提交完整 production 接线和回滚；PR 3.5 暴露的问题先在最低责任层
+增加回归再修复。
 
 ## 17. 验收映射
 
@@ -1368,20 +1435,21 @@ fallback 维持中间状态。若一个新内部 API 在当前子模块没有真
 
 以下是基于当前代码边界的净新增/修改量，不含自动生成文件和第三方代码：
 
-| 子模块 | 生产代码 | 测试/配置 | 难度 | 主要风险 |
-|--------|----------|-----------|------|----------|
-| 3A | 100–220 行 | 100–180 行 | 中高 | host trait 扩宽、register/TDIR field 正确性 |
-| 3B | 280–500 行 | 280–450 行 | 中高 | edge/level/deactivation command 状态机 |
-| 3C | 520–900 行 | 380–650 行 | 高 | ICH owner、TDIR、maintenance、refill、platform PPI |
-| 3D | 200–360 行 | 100–200 行 | 中高 | 配置兼容、构造顺序和失败回滚 |
-| 3E | 150–280 行 | 150–260 行 | 中高 | kick 语义、machine lock、stale event |
-| 3F | 150–300 行 | 500–900 行 | 中高 | guest build、EL1 handler、SMP2 和 LR pressure 证据 |
+| PR | 生产代码 | 测试/配置 | 难度 | 主要风险 |
+|----|----------|-----------|------|----------|
+| 3.1 | 120–240 行 | 120–220 行 | 中高 | host trait 扩宽、register field 正确性 |
+| 3.2 | 260–460 行 | 220–380 行 | 高 | ICH save/restore、cleanup、CPU pin |
+| 3.3 | 700–1,150 行 | 650–1,050 行 | 最高 | 状态机、epoch、TDIR、maintenance、refill |
+| 3.4 | 420–700 行 | 300–520 行 | 中高 | 配置兼容、构造回滚、kick/consumer 接线 |
+| 3.5 | 180–320 行 | 650–1,100 行 | 中高 | guest build、EL1 SMP2 和 LR pressure 证据 |
 
-各项存在复用和重叠，整体预计：
+整体预计：
 
-- 生产 Rust：约 1,200–2,100 行；
-- 单元/集成测试、guest、runner 支持与配置：约 1,300–2,400 行；
-- 总变更：约 2,500–4,500 行。
+- 生产 Rust：约 1,680–2,870 行；
+- 单元/集成测试、guest、runner 支持与配置：约 1,940–3,270 行；
+- 总变更：约 3,620–6,140 行。
 
-整体难度评为高。3C 是关键路径，3B 和 3D 决定后续是否需要返工；3E 本身代码
-不多，但必须等前述状态、生命周期和 capability 边界稳定后再接 producer。
+以上是五个 PR 区间逐项相加，未另计自动生成文件。估算比早期工作包口径更高，
+原因是五 PR 文档把 capability registry、host IRQ
+单事务、失败清理、typed guest build 和确定性测试计入了实现。整体难度为高；
+PR 3.3 是关键路径，PR 3.4 只能在前三个边界稳定后接入真实 producer。

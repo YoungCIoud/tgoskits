@@ -354,7 +354,7 @@ Router 到 AxVM 只有弱引用，不形成强引用环。Router 不持有 runti
 
 AArch64 的 vCPU delivery port 还会持有同一个 VGIC controller core 和
 弱生命周期 sender，但不持有 Router、runtime 或 task；详细引用关系见
-[`design_3.md`](./design_3.md)。
+[`design_3.md`](./M3/design_3.md)。
 
 ## 8. 各架构设计
 
@@ -378,8 +378,8 @@ device IrqLine
 
 ### 8.2 AArch64
 
-模块 3 的完整设计见 [`design_3.md`](./design_3.md)，执行清单见
-[`issue_3.md`](./issue_3.md)。
+模块 3 的完整设计见 [`design_3.md`](./M3/design_3.md)，执行清单见
+[`issue_3.md`](./M3/issue_3.md)。
 
 范围限定为 host/guest GICv3、wired SPI INTID 32–1019 和 host 配置的
 固定显式路由。`ArmInterruptRouter` 只负责把 line 操作输入 VGIC，并在
@@ -517,15 +517,19 @@ host IRQ 的 edge/level 属性由 x86 host IRQ glue 保存。是否解除 host m
 
 ### 模块 3：AArch64 emulated SPI
 
-模块 3 按 [`design_3.md`](./design_3.md) 和
-[`issue_3.md`](./issue_3.md) 拆分：
+模块 3 按 [`design_3.md`](./M3/design_3.md) 和
+[`issue_3.md`](./M3/issue_3.md) 拆成五个顺序 PR：
 
-- **3A：无损 INTID、ICH/TDIR register fields 和可恢复 LR error**；
-- **3B：VGIC SPI 状态机与固定显式 route**；
-- **3C：per-vCPU ICH context、TDIR/maintenance completion 和 LR refill**；
-- **3D：route 配置、controller 共享所有权和两阶段初始化**；
-- **3E：`ArmInterruptRouter`、sender kick 和目标 vCPU refill**；
-- **3F：synthetic SPI device 与 emulated GICv3 SMP2 QEMU**。
+- **PR 3.1：**无损 INTID、ICH register fields 和可恢复 LR error，
+  详见 [`design_3_1.md`](./M3/design_3_1.md)；
+- **PR 3.2：**per-vCPU ICH context、capability registry 和 CPU pin，
+  详见 [`design_3_2.md`](./M3/design_3_2.md)；
+- **PR 3.3：**VGIC SPI 状态机、TDIR/maintenance completion 和 LR refill，
+  详见 [`design_3_3.md`](./M3/design_3_3.md)；
+- **PR 3.4：**fixed route、两阶段初始化、`ArmInterruptRouter`、sender kick
+  和 target consumer，详见 [`design_3_4.md`](./M3/design_3_4.md)；
+- **PR 3.5：**synthetic SPI device、专用 EL1 guest 与 emulated GICv3
+  SMP2 QEMU，详见 [`design_3_5.md`](./M3/design_3_5.md)。
 
 模块 3 不迁移 SGI/PPI/IPI，不实现 guest `GICD_IROUTER` 或完整
 pending/active MMIO，不改变 GPPT/passthrough。
