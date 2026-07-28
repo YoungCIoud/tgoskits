@@ -124,8 +124,8 @@ RISC-V 已有可用的 `RiscvPlicIrqSink`，本模块只验证共享层没有造
 
 ### 模块 3：AArch64 emulated SPI 分层投递
 
-详细范围、拆分和验收见 [`issue_3.md`](./issue_3.md)，完整设计见
-[`design_3.md`](./design_3.md)。
+详细范围、拆分和验收见 [`issue_3.md`](./M3/issue_3.md)，完整设计见
+[`design_3.md`](./M3/design_3.md)。
 
 - [ ] **3A：**修正 INTID 截断、ICH/TDIR register fields 和 LR 可恢复错误。
 - [ ] **3B：**实现 VGIC SPI line/pending/active 状态与固定显式 route。
