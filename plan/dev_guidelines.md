@@ -106,168 +106,75 @@ cargo xtask axvisor qemu \
 
 ---
 
-## 三、refactor/device-manager 分支问题总结
+## 三、近期 PR 审阅问题与教训
 
-本分支的核心工作是：**将 AxEmuDevices（3 个 Vec，O(n) 查找）重构为基于 BTreeMap 的 DeviceManager（O(log n) 分派）**，并引入统一的 `Device` trait。该 PR (#1335) 包含 19 个 commit，其中初始重构后经历了 **14 个 fix 提交**。以下是按问题类别总结的错误及教训。
+本节汇总 PR #1335、#1630、#1661、#1679、#1715 在审阅中暴露的问题。描述只保留可复用的模式，具体实现细节回到对应 PR 查看。
 
-### 3.1 API 变更影响面评估不足
+### 3.1 API 影响面评估不足
 
-**涉及 commit**：`aefc9691e`, `f7eacf400`
+**问题**：#1335 修改设备注册 API 后，下游 `axvm`、测试 crate、架构特定导入没有同步迁移；#1679 修改 `axvm-types` 公开 trait 时，一度把有默认实现的方法改成必需方法；#1715 修改 `ArmHostOps` 这类公共边界时也需要同步 README、adapter 和契约测试。
 
-**问题描述**：初始重构移除了旧的 per-bus 注册 helper（`add_mmio_dev`、`add_sys_reg_dev` 等）和 `DeviceRegistration::Mmio/Port/SysReg` 变体，但只检查了当前 crate 的编译，没有搜索所有下游使用者。
+**教训**：公共 trait、enum、helper、re-export 变更前，必须搜索全工作区和直接下游 crate；对已发布 crate 的公开 trait，优先保持兼容默认实现或明确版本/发布策略。
 
-**具体断裂点**：
-- `axvm/src/vm.rs` 仍调用已移除的 `add_sys_reg_dev()` 来注册 aarch64 vtimer 设备
-- `axvm/src/vm.rs` 仍使用已标记 deprecated 的 `map_device_of_type` 进行 GICv3 SPI 分配
-- `axvm/src/irq/riscv.rs` 的 PLIC 工厂仍使用旧的 `DeviceRegistration::Mmio` 变体
-- `axvm/src/vcpu.rs` 仍 `pub use` 已不存在的 `arm_vgic::vtimer::get_sysreg_device`
-- `PortDeviceAdapter` 的导入在非 x86_64 架构上触发 `unused-import` 警告
+### 3.2 架构边界与并行设计冲突
 
-**教训**：
-- 大型 API 变更时，**必须**用 `grep` 搜索整个工作区中的引用，而不仅仅是编译当前 crate
-- 涉及跨 crate 的 trait/类型变更时，优先检查直接依赖该 crate 的所有下游包
-- 架构相关的导入需用 `#[cfg(target_arch = "...")]` 包裹
+**问题**：#1630 把 IRQ line 放入 `Device::resources()`，但开放 PR #1612 已在相同模块采用不兼容的 topology/planner 模型；#1335 也与早期设备模型重构 PR 存在方向重叠。
 
-### 3.2 并发安全问题：UnsafeCell + unsafe impl Send/Sync 的滥用
+**教训**：共享边界开工前先检查开放 PR、issue 设计和 base 现状；若两套模型会改写同一公开 API，先确定取舍和合并顺序，再实现细节。
 
-**涉及 commit**：`a2b28ba9d`, `4c973ec38`, `f153dfa89`
+### 3.3 资源范围和 ID 边界处理不完整
 
-**问题描述**：
-1. VGicR、VGicD、Gits 使用 `UnsafeCell<T>` 包装内部状态，然后添加 `unsafe impl Send + Sync` 来满足 `Device: Send + Sync` bound。但这些设备被多个 vCPU 通过共享引用并发访问，`UnsafeCell` 本身不提供任何同步保证。
-2. Adapter 中添加了 6 个不必要的 `unsafe impl Send/Sync` 块，而编译器可以从 `Arc<T>`、`String`、`Box<[Resource]>` 自动推导正确的 bounds。
+**问题**：#1335 暴露了 zero-size、`base + size` 溢出、SysReg 区间中间地址、`u32::MAX` 单点区间、同设备内部资源重叠等问题；#1715 暴露了 AArch64 virtual INTID `u8` 截断和非法 INTID 表示能力不足。
 
-**修复**：
-- 将 `UnsafeCell<VGicRRegs>` / `UnsafeCell<VirtualGitsRegs>` 替换为 `SpinNoIrq<T>`
-- 删除裸引用返回方法（`regs()` / `regs_mut()`），改用持有锁的闭包（`with_regs()` / `with_regs_mut()`）
-- 删除 adapter 中手写的 `unsafe impl Send/Sync`，让编译器自动推导
+**教训**：地址、端口、寄存器、IRQ/INTID 都要用 typed ID 和 checked conversion；范围计算明确半开/闭区间语义，并覆盖零长度、最大值、溢出、内部重叠和跨设备冲突。
 
-**教训**：
-- **绝对不要**用 `unsafe impl Send/Sync` 来回避同步问题——如果类型不是线程安全的，加 unsafe impl 只会让问题更难发现
-- 共享状态必须通过真实的同步原语（`SpinNoIrq`、`Mutex` 等）保护
-- `unsafe impl` 的合理性需要严格审查：是否真的安全？是否有更安全的替代方案？
+### 3.4 事务语义和生命周期原子性不足
 
-### 3.3 边界条件处理缺失
+**问题**：#1335 的 `register_bundle()` 失败时曾留下部分注册状态；#1630 进一步要求 MMIO、Port、SysReg、IRQ line 都能在 bundle 失败时统一回滚；#1679 的 sender 需要在同一次 VM machine 锁内选择当前 runtime，避免 stop/reset/start 后写入旧 dispatcher。
 
-**涉及 commit**：`9ff062db7`, `50d1e0f08`, `4e109739c`, `6d10006c2`
+**教训**：批量注册、runtime 选择、sender 投递都要先定义事务边界：成功后状态完整可见，失败后不泄漏部分状态，生命周期替换后不缓存旧对象。
 
-#### 3.3.1 地址范围溢出（wrapped range）
+### 3.5 并发安全不能靠 `unsafe impl` 兜底
 
-**问题**：`check_mmio_conflict` 没有检测 `base + size` 溢出的资源范围。如果 base 接近 `u64::MAX`，`base + size` 会 wrap 回 0，导致范围检查逻辑完全错误。
+**问题**：#1335 中 VGIC/GITS 曾用 `UnsafeCell` 加手写 `Send/Sync` 暴露共享可变状态；GITS CWRITER 处理消除了 Rust 数据竞争后，仍存在复合命令提交竞态。#1679 也反复检查 enqueue、notify、IPI 是否在正确锁边界外执行。
 
-**修复**：在注册时拒绝溢出的资源范围；在 lookup 路径上使用 `wrapping_add` 防止对已存在 wrap 值 panic。
+**教训**：共享状态必须用真实同步原语保护；`unsafe impl Send/Sync` 只能在有完整安全论证时使用。复合状态机要用单一事务锁或明确锁顺序，不能只保证单个字段访问安全。
 
-**教训**：任何涉及 `base + size` 的地址范围计算都必须检查溢出（`checked_add`）。
+### 3.6 新路径不能只“入队成功”而没有消费者
 
-#### 3.3.2 零大小范围
+**问题**：#1679 早期 sender 已返回成功，但 vCPU run loop 尚未 drain 新 dispatcher，后续 Router 一旦使用 sender，中断会成功入队却永远不注入 guest。
 
-**问题**：初始实现没有拒绝 `size == 0` 或 `count == 0` 的资源范围。
+**教训**：分阶段开发可以保留 dead code，但一旦暴露成功返回的运行时 API，就必须接通最小 consumer，或让 API 明确返回 unsupported，避免形成“成功但无效果”的路径。
 
-**修复**：在 conflict check 中返回 `InvalidResourceReason::ZeroSized`。
+### 3.7 语义元数据必须传到最终边界
 
-**教训**：资源范围的 size/count 为 0 通常意味着配置错误，应在注册时拒绝。
+**问题**：#1679 的 `PendingVcpuInterrupt` 携带 edge/level trigger，但默认注入实现曾丢弃 trigger，导致 x86 level-triggered 语义可能退化；#1715 的 GICv2 direct injection 曾无意改变 Group/EOI maintenance 策略。
 
-#### 3.3.3 SysReg 范围内部地址查找失败
+**教训**：协议字段不能只在中间结构中保留，必须一直传到架构/硬件后端；兼容路径的默认行为要有回归测试，尤其是 interrupt trigger、EOI、group、priority 这类硬件语义。
 
-**问题**：`lookup_sysreg` 使用 `BTreeMap::get` 精确匹配起始地址。如果一个 SysReg 范围声明为 `0x100..=0x110`，访问 `0x108` 会返回 `NotFound`。
+### 3.8 测试必须可执行且验证真实行为
 
-**修复**：改用 predecessor query（`range(..=addr).next_back()`）+ 包含范围检查（`addr <= start + count - 1`），与 `lookup_mmio` 和 `lookup_port` 的语义一致。
+**问题**：#1661 曾把 dispatcher 测试整段注释，CI 不会执行；#1679 早期测试只覆盖队列局部，没有覆盖 sender→runtime→drain→inject；#1715 曾用 `include_str!` 搜源码文本证明 GICv2 策略，不能证明真实实现会写出正确寄存器配置。
 
-**教训**：范围查找应该用 predecessor query 而非精确匹配。不同 bus 的查找语义必须保持一致。
+**教训**：测试必须被 runner 发现并执行，且观察真实 API/模块行为。不能用注释测试、源码文本搜索或只测 helper 名称来替代行为回归；host-test 边界要提前拆清楚。
 
-#### 3.3.4 SysReg u32::MAX off-by-one
+### 3.9 错误类型和命名要表达可恢复语义
 
-**问题**：`addr = u32::MAX, count = 1` 被错误地拒绝为 `AddressOverflow`。实际上 `u32::MAX + 0` 不会溢出。
+**问题**：#1335 曾把不同 `RegistryError` 统一映射成 `InvalidInput`，也有 `iter_*_dev()` 名称暗示按 bus 过滤但实际返回全部设备；#1715 将 LR 满载、异常 LR、非法 INTID 从 panic/截断改成 typed error 后，调用方才能恢复或重试。
 
-**修复**：使用 `checked_add(count.saturating_sub(1))` 而非 `checked_add(count)` 来检查溢出。
+**教训**：错误映射要保留调用方决策所需的信息；函数名必须与实际过滤、查找、生命周期语义一致。客户机可触发路径不能 panic，必须返回明确错误。
 
-**教训**：包含范围 `[addr, addr + count - 1]` 的溢出检查要考虑 `count == 1` 的特殊情况。
+### 3.10 格式、CI 和测试矩阵不能只看远端绿灯
 
-#### 3.3.5 同设备内部资源重叠
+**问题**：#1335、#1661 都出现过格式/import 顺序或 test target clippy 问题；#1661 的远端 formatting job 因路径矩阵跳过，没有覆盖本地 `cargo fmt --all --check` 失败；#1335 多次需要区分真实代码回归和 self-hosted/board 环境波动。
 
-**问题**：资源冲突检测只考虑跨设备冲突。同一设备声明的两个资源范围如果重叠，不会被检测到。
+**教训**：提交前本地跑 `cargo fmt --all --check`、目标 crate clippy 和相关测试；远端 skipped 不等于通过。CI 红灯只有在有本地复现、重跑通过或可追踪基础设施证据时，才能判定为非代码阻塞。
 
-**修复**：将资源验证和索引插入合并为单遍处理，使同一设备的早期资源已进入索引，后续资源检查时会命中自身。
+### 3.11 模块布局和 cfg 也是公共契约
 
-**教训**：资源验证需要考虑**同设备内部**的资源重叠，不能假设只有跨设备冲突。
+**问题**：#1715 的测试/辅助模块一度放在不符合 `axvm` 架构目录契约的位置，触发 `arch_boundary_contract` 失败；移除 crate 级 `cfg(target_arch = "aarch64")` 后又带来重复 cfg 和 host-test 暴露边界问题。
 
-### 3.4 事务原子性缺失
-
-**涉及 commit**：`4c973ec38`
-
-**问题**：`register_bundle` 注册多个设备时，如果中间某个设备失败，前面已注册的设备没有被回滚。这导致 bundle 不是真正的原子操作。
-
-**修复**：在失败时使用 `pop()` + 索引键移除来回滚已注册的设备。
-
-**教训**：批量操作必须考虑事务语义——要么全部成功，要么全部回滚。注册操作尤其需要原子性，因为部分成功会导致不一致的状态。
-
-### 3.5 错误类型映射不正确
-
-**涉及 commit**：`2fa166beb`
-
-**问题**：`register_bundle` 将所有 `RegistryError` 统一映射为 `InvalidInput`，但 `AddressConflict` 应该映射为 `AddrInUse`。
-
-**修复**：区分 `AddressConflict`（映射到 `AddrInUse`）和其他错误（映射到 `InvalidInput`）。
-
-**教训**：错误类型的映射需要仔细设计。不同的底层错误应映射到不同的上层错误类型，以便调用者做出正确的处理决策。
-
-### 3.6 命名与语义不一致
-
-**涉及 commit**：`f153dfa89`
-
-**问题**：`iter_mmio_dev()`、`iter_sys_reg_dev()`、`iter_port_dev()` 的命名暗示按 bus 类型过滤，但实际上返回所有设备。这种误导性命名会导致调用者做出错误假设。
-
-**修复**：移除这些别名，调用者统一使用 `devices()` + `Device::resources()` 或 `Device::as_any()` 进行过滤。
-
-**教训**：命名必须准确反映行为。如果函数名暗示某种过滤或语义，实际行为必须与之匹配。
-
-### 3.7 静默类型截断
-
-**涉及 commit**：`f153dfa89`
-
-**问题**：`BusRouter::dispatch` 和 `lookup` 中使用 `as` 转换（`addr as u16`、`addr as u32`），可能导致静默截断，将超出范围的地址错误地路由到错误的设备。
-
-**修复**：使用 `u16::try_from` / `u32::try_from` + `map_err` 来显式处理超出范围的情况。
-
-**教训**：在地址/端口等关键路径上，避免使用可能静默截断的 `as` 转换。优先使用 `try_from` 并在失败时返回明确的错误。
-
-### 3.8 测试与代码重构不同步
-
-**涉及 commit**：`be8342680`, `1a8660592`, `5205d15d3`, `f7eacf400`
-
-**问题**：
-- 清理 `Resource` 变体（移除 `Irq`、`PciBar`、`MSI`、`DmaCapable`）后，测试中的断言没有同步更新
-- 移除 `map_device_of_type` 后，测试代码仍使用该方法
-- 重构错误类型（引入 `InvalidResourceReason`）后，测试的 `match` 模式不匹配
-- `DeviceRegistration` 变体变更后，测试工厂函数断裂
-
-**修复**：逐一更新所有测试文件中的断言、工厂函数和导入。
-
-**教训**：
-- **代码重构和测试更新必须同步进行**。不要先合入重构再修测试。
-- 在 IDE 中运行 `cargo test --workspace` 确保所有 crate 的测试都能编译通过。
-- 涉及 enum/struct 变体变更时，特别注意 pattern match 的 exhaustiveness。
-
-### 3.9 代码格式问题
-
-**涉及 commit**：`d2596a9a2`, `94d441f22`
-
-**问题**：
-- import 排序不符合 `rustfmt.toml` 的 `group_imports = "StdExternalCrate"` 要求
-- 存在重复的 `#[allow(clippy::...)]` 属性
-
-**教训**：每次提交前运行 `cargo fmt --all`。将格式化集成到提交前的工作流程中（如 pre-commit hook 或手动检查清单）。
-
-### 3.10 竞态条件（Race Condition）
-
-**涉及 commit**：`6d10006c2`
-
-**问题**：GITS 的 CWRITER 命令队列提交路径没有加锁。两个 vCPU 可能同时读取相同的 stale `creadr` 值，然后都尝试处理已经被另一个 vCPU 处理过的命令。
-
-**修复**：添加 `submission_lock: SpinNoIrq<()>` 保护 CWRITER 提交路径。
-
-**教训**：任何共享可变状态的访问路径都必须评估并发安全性。特别是：
-- 读取-修改-写入序列必须是原子的
-- 不要假设单个寄存器操作是原子的——读取和写入之间可能有其他 vCPU 介入
+**教训**：模块位置、目录形状、`cfg` 粒度会影响测试发现、host 构建和公共导出。架构私有 helper 应放回对应 `src/arch/<arch>/`，跨架构 host-test API 要集中导出而不是散落重复 cfg。
 
 ---
 
