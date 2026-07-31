@@ -227,7 +227,8 @@ arm-gic-driver.workspace = true
 当前 wrapper 中除 LR.EOI 外的大部分字段已经存在，不能重复定义。必须：
 
 - 增加 LR 的软件 EOI overlay（与 `HW=0` 语义配套）；
-- 将 `ICH_VTR_EL2.IDBITS` 修正为架构规定的 1 bit，避免与 PREBITS 重叠；
+- 将 `ICH_VTR_EL2.IDBITS` 修正为架构规定的 3 bit `[25:23]`，避免与从
+  bit 26 开始的 PREBITS 重叠；
 - 保留 PINTID/EOI 的条件 overlay，由 `IchLrEntry` 根据 HW 语义选择；
 - 把 raw slot helper 的 0–15 panic封装在事先 checked 的 safe access 内。
 
