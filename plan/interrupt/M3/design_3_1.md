@@ -1,17 +1,32 @@
 # PR 3.1 设计：无损 INTID 与 ICH 寄存器边界
 
+## 0. 同步状态
+
+- 目标基线：`dev@31f341abca46e2c8920c607c2e63316ea374a290`。
+- 实现：`fix/armINTID@473406e0e55f79b6ab7390e4107380002069ecac`，已完成但
+  未合入；该分支仍基于 `024ecca10a4240a84b2c24bed2dc2361a6043d3e`。
+- 分支实际 diff 为 20 个文件、`+758/-118`，覆盖 `arm-gic-driver`、
+  `arm_vcpu`、legacy `arm_vgic`、AxVM AArch64 adapter 及测试；第一节原
+  代码量区间保留为设计阶段估算，不代表实际 diff。
+- 合入前必须 rebase 到目标基线，并重新执行本设计第九节验证。旧基线上的
+  测试结果只能作为历史证据，不能替代最新 dev 验证。
+- 从 PR 3.1 的旧基线到当前 dev，双方唯一共同修改的路径是 `Cargo.lock`；
+  rebase 时先合并代码与 manifest，再按仓库规范由 Cargo 重新生成 lockfile，
+  不手工拼接冲突内容。
+
 ## 1. PR 定位
 
 - 建议标题：`fix(arm-vcpu): preserve full virtual interrupt IDs`
-- 依赖：模块 1、模块 2 已合入；不依赖后续模块 3 PR。
+- 依赖：模块 1 已完成、模块 2 已验证；不依赖后续模块 3 PR。
 - 后继：PR 3.2 依赖本 PR 提供的 ICH capability/寄存器基础；PR 3.3
   依赖本 PR 的 LR 编解码和可恢复错误。
-- 预计变更：生产代码 120–240 行，测试 120–220 行。
+- 设计阶段预计变更：生产代码 120–240 行，测试 120–220 行；实际分支见
+  “同步状态”。
 - 难度：中高。风险集中在架构字段编码和保持现有 SGI/PPI/direct inject
   兼容，而不是代码量。
 
-本 PR 只修复底层表示能力和失败语义，不引入 VGIC SPI controller，不切换
-设备 producer，也不启用 TDIR、UIE 或 maintenance。
+本 PR 的实现只修复底层表示能力和失败语义，不引入 VGIC SPI controller，
+不切换设备 producer，也不启用 TDIR、UIE 或 maintenance。
 
 ## 2. 要解决的问题
 
@@ -333,6 +348,9 @@ cargo fmt --all -- --check
 
 ## 10. 完成条件与交接
 
+下列完成条件已在 `fix/armINTID` 的代码和确定性测试中实现；“完成”表示实现
+分支内容完备，不表示已经合入 `dev`。rebase 后仍需复验。
+
 - 代码中不存在 virtual INTID 到 `u8` 的转换。
 - direct inject 对 1019 可编码，对 1020 返回 typed error。
 - LR full 不 panic。
@@ -343,3 +361,4 @@ cargo fmt --all -- --check
 交给 PR 3.2 的稳定契约是：`ArmVirtualIntId`、ICH capability 字段和 LR
 plain-data 编解码已经可用。交给 PR 3.3 的稳定契约是：本地 LR 操作会明确
 报告满载/非法状态，不再截断或 panic。
+

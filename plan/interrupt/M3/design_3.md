@@ -1,5 +1,19 @@
 # 模块 3 设计：AArch64 emulated GICv3 SPI 分层投递
 
+## 0. 文档同步基线
+
+- 目标代码基线：`dev@31f341abca46e2c8920c607c2e63316ea374a290`。
+- PR 3.1 实现分支：`fix/armINTID@473406e0e55f79b6ab7390e4107380002069ecac`，
+  基于 `024ecca10a4240a84b2c24bed2dc2361a6043d3e`，截至 2026-08-01 尚未合入
+  `dev`。
+- 状态口径：模块 1 已完成，模块 2 已验证；PR 3.1 已在独立分支实现，PR
+  3.2–3.5 尚未实现。本文描述模块 3 完成态，第三节单独区分 `dev` 缺口与
+  PR 3.1 已实现增量。
+- `refactor/interrupt` 是废弃方案，不作为接口、目录或行为兼容基线。
+- 同步以最新 `dev` 的 CPU-local `CpuPin`、typed IRQ domain、runtime
+  dispatcher、`InterruptFabric` snapshot 生命周期为约束；后续实现若再次
+  rebase，必须重新核对这些边界并重跑相应验证。
+
 ## 1. 摘要
 
 模块 3 完成 AArch64 emulated SPI 从设备线路到目标 vCPU GICv3 List
@@ -71,20 +85,25 @@ deactivation，不改变其 producer、route 或 pending 模型。
 现有最小 enable 行为接入这套状态。未实现的 guest register 访问继续按现有
 兼容行为处理，但不能形成第二套 pending/active/route 状态。
 
-## 3. 当前实现差距
+## 3. `dev` 基线差距与 PR 3.1 状态
 
 ### 3.1 INTID 截断
 
-共享层的 `VirtualInterruptId` 是 `u32`，但
+`dev` 中共享层的 `VirtualInterruptId` 是 `u32`，但
 `virtualization/arm_vcpu/src/vcpu.rs` 中的 `ArmVcpu::inject_interrupt()`
 调用 `ArmHostOps::inject_virtual_interrupt(u8)`。这一转换使合法 SPI
-256–1019 静默截断，必须先修正底层边界，不能在 Router 中用范围限制掩盖。
+256–1019 静默截断。PR 3.1 分支已通过 `ArmVirtualIntId` 和 checked conversion
+修正；合入前 `dev` 仍存在该缺口，不能在 Router 中用范围限制掩盖。
 
 ### 3.2 LR 满载 panic 和事件丢失
 
-当前 `virtualization/axvm/src/arch/aarch64/gic.rs` 的 GICv3 注入函数扫描
+`dev` 的 `virtualization/axvm/src/arch/aarch64/gic.rs` GICv3 注入函数扫描
 `ICH_ELRSR_EL2` 后选择一个空 LR，没有空 LR 时 panic。runtime dispatcher
 会先 drain 全部事件；单项注入失败只记录日志，事件不会自动回到队列。
+
+PR 3.1 分支已把 direct-injection 的 LR 满载改为 typed
+`NoFreeListRegister`，但尚未提供 durable pending 或 refill；后两项仍属于
+PR 3.3，不能把 PR 3.1 的可恢复错误误写成完整投递保证。
 
 因此 dispatcher 不能成为 AArch64 pending 的状态真源。LR 容量是有限硬件
 cache，VGIC 软件状态必须保留尚未装入 LR 的中断。
@@ -96,9 +115,10 @@ MMIO wrapper，没有 Router 可用的 typed SPI line/route/delivery 状态边�
 GPPT `v3::VGicD/VGicR` 是宿主 GIC MMIO partial-passthrough，不是本模块
 需要的 per-VM emulated controller。
 
-现有 `Vgicd` 还使用 512 项 `VgicInt` 数组，`ISENABLER` 直接根据寄存器
-index 访问。即使 LR 编码扩为 `u32`，合法 INTID 512–1019 仍会越界；模块 3
-必须同时移除这一隐含上限，不能只修 host injection 签名。
+`dev` 的 `Vgicd` 仍使用 512 项 `VgicInt` 数组。PR 3.1 分支已把 legacy
+`ISENABLER` 等外部访问改为 checked RAZ/WI，消除了高 INTID 越界，但没有让
+512–1019 获得功能状态。PR 3.3 仍必须以 sparse controller 提供真正的
+module-owned SPI 状态，不能把 legacy 安全修复当成功能支持。
 
 ### 3.4 ICH state 不属于 vCPU
 
@@ -114,14 +134,15 @@ pCPU 时，三个阶段之间存在迁移窗口；ICH restore、guest run 和 sa
 
 ### 3.5 deactivation 不可观测
 
-当前 LR 只写 Pending/Group，没有软件 level interrupt 所需的 EOI
+`dev` 当前 LR 只写 Pending/Group，没有软件 level interrupt 所需的 EOI
 maintenance，也没有 fold EISR/LR state 的入口。guest 实际 deactivate 后
 line 仍 asserted 时无法重新 pending。
 
 `drivers/intc/arm-gic-driver/src/sys_reg/ich.rs` 已有 HCR
 UIE/LRENPIE/NPIE/TDIR、MISR/EISR 和 VTR.TDS 字段，但 LR 尚未定义软件
 EOI overlay，`ICH_VTR_EL2.IDBITS` 当前以 4 bit 定义并与 PREBITS 重叠。
-PR 3.1 必须修正这两个 register boundary，而不是复制一套 AxVM 私有位号。
+PR 3.1 分支已修正这两个 register boundary，并以纯 LR 编解码测试约束字段；
+PR 3.2/3.3 必须复用该边界，不得复制一套 AxVM 私有位号。
 
 ## 4. 规范与 prior art
 
@@ -888,7 +909,7 @@ AxVM 仍不向外暴露 Fabric 引用或公共 clone accessor。
 - HW：0；
 - EOI：软件 level interrupt 置位。
 
-当前 register wrapper 缺少 EOI bit，PR 3.1 必须补齐。所有字段编码使用
+`dev` 的 register wrapper 缺少 EOI bit；PR 3.1 分支已经补齐。后续所有字段编码使用
 typed helper 和范围校验，不直接拼接未经验证的裸 `usize`。
 
 ### 10.2 fold
@@ -1380,13 +1401,13 @@ cargo xtask axvisor test qemu --arch aarch64 --test-group normal \
 PR 3.1 → PR 3.2 → PR 3.3 → PR 3.4 → PR 3.5
 ```
 
-| PR | 内容 | 详细设计 | 对真实 producer 的影响 |
-|----|------|----------|-------------------------|
-| 3.1 | 无损 INTID、ICH 字段、typed LR error、legacy Vgicd 越界修复 | [`design_3_1.md`](./design_3_1.md) | 不切换 |
-| 3.2 | per-vCPU ICH context、capability registry、同 CPU pin 生命周期 | [`design_3_2.md`](./design_3_2.md) | 不切换 |
-| 3.3 | VGIC state、epoch、TDIR/maintenance、fold/reconcile/refill | [`design_3_3.md`](./design_3_3.md) | 仅直接构造测试 |
-| 3.4 | fixed route、两阶段初始化、Router、sender、target consumer | [`design_3_4.md`](./design_3_4.md) | 唯一 production 切换点 |
-| 3.5 | synthetic device、EL1 guest、typed guest build、SMP2 QEMU | [`design_3_5.md`](./design_3_5.md) | 增加行为证据 |
+| PR | 当前状态 | 内容 | 详细设计 | 对真实 producer 的影响 |
+|----|----------|------|----------|-------------------------|
+| 3.1 | 已实现、未合入 | 无损 INTID、ICH 字段、typed LR error、legacy Vgicd 越界修复 | [`design_3_1.md`](./design_3_1.md) | 不切换 |
+| 3.2 | 待实现 | per-vCPU ICH context、capability registry、同 CPU pin 生命周期 | [`design_3_2.md`](./design_3_2.md) | 不切换 |
+| 3.3 | 待实现 | VGIC state、epoch、TDIR/maintenance、fold/reconcile/refill | [`design_3_3.md`](./design_3_3.md) | 仅直接构造测试 |
+| 3.4 | 待实现 | fixed route、两阶段初始化、Router、sender、target consumer | [`design_3_4.md`](./design_3_4.md) | 唯一 production 切换点 |
+| 3.5 | 待实现 | synthetic device、EL1 guest、typed guest build、SMP2 QEMU | [`design_3_5.md`](./design_3_5.md) | 增加行为证据 |
 
 3A–3F 仍可作为功能工作包术语：PR 3.1 对应 3A，PR 3.2 对应 3C 的 context/
 pin 前半，PR 3.3 合并 3B 与 3C 的 delivery 后半，PR 3.4 合并 3D 与 3E，
@@ -1437,19 +1458,21 @@ fallback 维持中间状态。PR 3.1–3.3 不允许把真实设备接入半成�
 
 | PR | 生产代码 | 测试/配置 | 难度 | 主要风险 |
 |----|----------|-----------|------|----------|
-| 3.1 | 120–240 行 | 120–220 行 | 中高 | host trait 扩宽、register field 正确性 |
+| 3.1 | 已实现：20 个文件，`+758/-118`（含测试与 `Cargo.lock`） | 已实现：同左，未按类别拆分 | 中高 | 合入前 rebase、最新 dev 回归验证 |
 | 3.2 | 260–460 行 | 220–380 行 | 高 | ICH save/restore、cleanup、CPU pin |
 | 3.3 | 700–1,150 行 | 650–1,050 行 | 最高 | 状态机、epoch、TDIR、maintenance、refill |
 | 3.4 | 420–700 行 | 300–520 行 | 中高 | 配置兼容、构造回滚、kick/consumer 接线 |
 | 3.5 | 180–320 行 | 650–1,100 行 | 中高 | guest build、EL1 SMP2 和 LR pressure 证据 |
 
-整体预计：
+剩余 PR 3.2–3.5 预计：
 
-- 生产 Rust：约 1,680–2,870 行；
-- 单元/集成测试、guest、runner 支持与配置：约 1,940–3,270 行；
-- 总变更：约 3,620–6,140 行。
+- 生产 Rust：约 1,560–2,630 行；
+- 单元/集成测试、guest、runner 支持与配置：约 1,820–3,050 行；
+- 总变更：约 3,380–5,680 行。
 
-以上是五个 PR 区间逐项相加，未另计自动生成文件。估算比早期工作包口径更高，
-原因是五 PR 文档把 capability registry、host IRQ
+PR 3.1 使用分支实际 diff，不再与区间估算相加；剩余数值为 PR 3.2–3.5
+逐项相加，未另计自动生成文件。估算比早期工作包口径更高，原因是文档把
+capability registry、host IRQ
 单事务、失败清理、typed guest build 和确定性测试计入了实现。整体难度为高；
 PR 3.3 是关键路径，PR 3.4 只能在前三个边界稳定后接入真实 producer。
+

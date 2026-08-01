@@ -1,5 +1,16 @@
 # PR 3.2 设计：per-vCPU ICH context 与 CPU pin 生命周期
 
+## 0. 同步基线
+
+- 面向 `dev@31f341abca46e2c8920c607c2e63316ea374a290`，依赖尚未合入的
+  `fix/armINTID@473406e0e55f79b6ab7390e4107380002069ecac`。
+- 最新 dev 的 `AxVCpu::with_current_cpu_set()` 已用 `NoPreempt` 和
+  `ax_percpu::with_cpu_pin()` 建立 `CpuPin`，并用 guard-scoped
+  `CURRENT_VCPU` publication 验证 host CPU area/TLS 恢复；PR 3.2 应扩展这
+  一现有事务覆盖 bind/run/unbind，而不是建立第二套 pin primitive。
+- 所有 CPU-local/per-CPU 访问必须显式受借用的 `CpuPin` 或同一 closure
+  生命周期约束；不得缓存由 pin 派生的引用、指针或 CPU-local capability。
+
 ## 1. PR 定位
 
 - 建议标题：`feat(arm-vcpu): preserve per-vCPU ICH execution state`
@@ -27,7 +38,7 @@ pending/active 状态，不启用 maintenance/TDIR，不接 Router。
 
 - `ArmVcpu::bind()`/`unbind()` 当前是 no-op。
 - ICH state 不在 `ArmVcpu` 中。
-- `AxVCpu::run_vcpu()` 在 `with_current_cpu_set()` 之前 bind，在离开 pin
+- `ArchOps::run_vcpu()` 在 `with_current_cpu_set()` 之前 bind，在离开 pin
   scope 后 unbind，存在迁移窗口。
 - `ArmPerCpu::hardware_enable()` 没有读取/发布 GIC virtualization interface
   capability。
@@ -250,7 +261,7 @@ restore 失败必须把本地 HCR.EN 清零并使所有可访问 LR Invalid，�
 
 ## 6. CPU pin/run-loop 重构
 
-当前通用 `virtualization/axvm/src/vcpu.rs` 必须把：
+当前通用 `virtualization/axvm/src/architecture/ops.rs::run_vcpu()` 必须把：
 
 ```text
 bind
@@ -262,23 +273,24 @@ unbind
 
 ```text
 with_current_cpu_set {
-    bind_published
-    run_published loop
-    unbind_published
+    bind
+    run loop
+    unbind
 }
 ```
 
 具体要求：
 
-- 在 `AxVCpu` 增加 crate-private、只供已有 publication scope 调用的
-  `bind_published()`、`run_published()`、`unbind_published()`；它们执行原
-  state transition/backend call，但不再次进入
-  `with_current_cpu_set()`；
-- `ArchOps::run_vcpu()` 只建立一次 outer publication/pin，并在其中调用这些
-  helper；不能把现有会各自 publication 的 `bind()/run()/unbind()` 简单嵌套
-  进去；
-- public/其他 caller需要的 standalone `bind()/run()/unbind()` 可继续用
-  `with_current_cpu_set()` 包装同一内部 helper，避免复制状态机；
+- 复用 `AxVCpu::with_current_cpu_set()` 现有 `NoPreempt + CpuPin +
+  CurrentVcpuPublication` 事务；`CpuPin` 只能借用于该 closure，不能被存入
+  `ArmVcpu`、ICH context 或 delivery port；
+- 最新 dev 已允许同一 vCPU 的 nested `with_current_cpu_set()` 复用现有
+  publication，并在每次 nested operation 后校验 host CPU area/TLS。因此
+  首版直接把现有 `bind()`、run loop 和 `unbind()` 移入一个 outer scope，
+  不新增 `bind_published()`/`run_published()`/`unbind_published()`；
+- 若实现中证明 nested wrapper 妨碍错误清理或借用，再在同一 PR 内提取
+  crate-private helper，但 helper 只能复用现有状态机，不能绕过 publication
+  或 CPU binding 检查；
 - `with_current_cpu_set()` publication 和 CPU pin 覆盖 bind 到 unbind 的完整
   生命周期；
 - 进入 scope 后记录 CPU ID，bind 前、每次 guest entry 前和 unbind 前均可用
@@ -291,9 +303,8 @@ with_current_cpu_set {
 - 其他架构 bind/unbind 语义不变。
 
 不新增通用 `run_bound` 抽象；直接在 `ArchOps::run_vcpu()` 的单一 outer
-publication scope中保存 run result，并汇入一次显式
-`unbind_published()` cleanup。host test通过现有 fake backend覆盖每个退出
-分支。
+publication scope 中保存 run result，并汇入一次显式 unbind cleanup。host
+test 通过现有 fake backend 覆盖每个退出分支。
 
 ## 7. 并发与内存顺序
 
@@ -401,3 +412,4 @@ cargo fmt --all -- --check
 
 PR 3.3 可以假定：目标 vCPU entry/exit 时已在正确 pCPU 上拥有可安全读写的
 `BoundIch`，且 context 会随 vCPU 保存恢复。
+

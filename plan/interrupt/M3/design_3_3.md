@@ -1,5 +1,16 @@
 # PR 3.3 设计：VGIC SPI 状态机、ICH completion 与 LR refill
 
+## 0. 同步基线
+
+- 面向 `dev@31f341abca46e2c8920c607c2e63316ea374a290`，顺序依赖 PR 3.1 和
+  PR 3.2；PR 3.1 当前仅在 `fix/armINTID` 实现，PR 3.2 尚未实现。
+- 平台 IRQ 必须使用最新 dev 的 typed `IrqId`/domain、`request_percpu_irq()`
+  和 owner-CPU dispatch 边界；禁止重新引入裸 IRQ number 或第二次
+  acknowledge/EOI。
+- maintenance observation 与 ICH fold 仍只能在目标 vCPU 的同一
+  `CpuPin`/bind generation 范围内消费，不能由 deferred handler 在 unbind
+  后访问 banked ICH 寄存器。
+
 ## 1. PR 定位
 
 - 建议标题：`feat(arm-vgic): implement emulated SPI delivery state`
@@ -516,7 +527,8 @@ maintenance 使 host 获得 service；fold 观察 LR active bit清除：
 EOIR 只 priority drop，LR 仍 Active，不能重投。后续 guest 写
 `ICC_DIR_EL1`：
 
-- PR 3.1 的 TDIR bit使其 trap到现有 `ArmVmExit::SysRegWrite`；
+- PR 3.1 提供正确的 TDIR 字段边界；本 PR 在完成 DIR handler 后启用 TDIR，
+  使写入 trap 到现有 `ArmVmExit::SysRegWrite`；
 - `sysreg.rs` 使用 `ArmSysRegAddr::new(0x32_3016)` 识别 `ICC_DIR_EL1`，并以
   `virtualization/aarch64_sysreg::SystemRegType::ICC_DIR_EL1` 的现有值作
   回归对照，禁止从 magic CRn/CRm 算术猜测；
@@ -755,3 +767,4 @@ cargo fmt --all -- --check
 
 PR 3.4 可以只把配置 route、device `IrqLine`、controller、sender 和每个
 delivery port 组合起来；不得在接线 PR 中重新定义本 PR 的状态转换。
+

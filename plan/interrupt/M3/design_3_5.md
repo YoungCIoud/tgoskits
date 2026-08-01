@@ -1,5 +1,16 @@
 # PR 3.5 设计：synthetic SPI device 与 AArch64 SMP2 端到端验证
 
+## 0. 同步基线
+
+- 面向 `dev@31f341abca46e2c8920c607c2e63316ea374a290`，依赖 PR 3.1–3.4。
+- 当前 dev 的 AxVisor QEMU case 以 `test-suit/axvisor/normal/<wrapper>/` 为
+  build wrapper，`normal/qemu/` 已拥有 AArch64 smoke；独立平级 wrapper 的
+  选择仍与 discovery 结构一致。
+- 当前 `scripts/axbuild` 尚无 `guest_builds` schema；本 PR 的 typed build
+  支持是显式新增能力，不能依赖 flatten 后被忽略的未知字段或 shell prebuild。
+- 该 PR 是验证闭环，不得用 synthetic device 绕过正常 `DeviceFactory →
+  Resource::IrqLine → InterruptFabric` production boundary。
+
 ## 1. PR 定位
 
 - 建议标题：`test(axvisor): cover AArch64 emulated SPI delivery`
@@ -484,3 +495,4 @@ cargo xtask axvisor test qemu --arch aarch64 --test-group normal \
 
 该 PR 完成后，模块 3 的功能和证据同时闭环；测试支持不能成为 production
 绕过 controller/Router/delivery分层的后门。
+

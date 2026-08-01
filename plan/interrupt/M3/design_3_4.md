@@ -1,5 +1,14 @@
 # PR 3.4 设计：固定路由配置、Router 与 AArch64 runtime 接通
 
+## 0. 同步基线
+
+- 面向 `dev@31f341abca46e2c8920c607c2e63316ea374a290`；PR 3.1 已实现未合入，
+  PR 3.2/3.3 尚未实现。
+- 最新 dev 已包含 `InterruptFabric` snapshot 后锁外 `pulse()` 的修复，且模块
+  1 的 `VmInterruptSender`/runtime dispatcher 已存在。PR 3.4 只扩展 level
+  wrapper 和 AArch64 producer/consumer 接线，不重写这两条共享生命周期。
+- `refactor/interrupt` 不作为 Router API 兼容目标。
+
 ## 1. PR 定位
 
 - 建议标题：`feat(axvm): route AArch64 emulated SPIs through the VGIC`
@@ -22,7 +31,7 @@
 - `InterruptFabric` 是 cloneable capability；
 - 已有
   `interrupt_pulse_runs_after_snapshot_lock_is_released` 回归测试；
-- 修复来自 PR #1679 / commit `5155111ef`，当前 plan 基线已包含。
+- 修复来自 PR #1679 / commit `5155111ef`，当前 dev 基线已包含。
 
 因此本 PR 不再修改 `pulse_interrupt()` 锁逻辑，只运行该测试。新增
 `AxVM::set_interrupt_level()` 时必须复用同一个 snapshot helper，禁止重新
@@ -415,3 +424,4 @@ cargo fmt --all -- --check
 
 完成本 PR 后，模块 3 的 production 链路已经可用；PR 3.5 负责提供可重复的
 SMP2、INTID 256、level EOI重投和 LR pressure 行为证据。
+
