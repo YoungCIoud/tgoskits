@@ -1,6 +1,36 @@
-# TGOSKits / AxVisor 开发规范与 refactor/device-manager 分支问题总结
+# TGOSKits / AxVisor 开发规范与PR复审问题总结
 
-> 本文档总结项目仓库中声明的开发规范、AxVisor 的开发规范，以及 refactor/device-manager 分支在 commit 过程中碰到的问题，供后续开发参考。
+> 本文档总结项目仓库中声明的开发规范、AxVisor 的开发规范，以及在 PR 复审过程中碰到的问题，供后续开发参考。
+
+---
+
+## 必读前置
+
+阅读本文档前，必须先完整阅读以下仓库核心规范和技能。
+
+### 核心规范（按优先级排序）
+
+| 优先级 | 文件 | 说明 |
+|--------|------|------|
+| 1 | `AGENTS.md` | 项目顶层指令：编码标准（2024 nightly、rustfmt 为格式真理、`no_std` 优先、typed IDs/newtypes、组合优先、`thiserror`）、skill 触发条件、PR 标题格式 `type(scope): content`（英文标题+中文正文）、验证命令、禁止 AI/agent 标签 |
+| 2 | `book/guideline/code-quality.md` | Rust 代码质量强制基线（1930 行）：命名表达业务意图、函数（入口在前、目录式编排、≤3 参数）、模块边界（`foo/mod.rs` + `foo/child.rs`、默认私有、~400 行审视拆分/~800 行必须拆分、`#[cfg]` 收敛到最窄共同边界）、错误处理（`thiserror`、禁止裸 `unwrap`、panic 只用于不可恢复不变量）、类型系统（newtype/enum 表达约束、非法状态不可构造）、组合优先、并发（短锁、不持锁做 I/O）、测试（附录在文件末尾、禁止 `include_str!` 测代码行为）、PR 检查清单 20 条 |
+| 3 | `book/guideline/feature-development.md` | 新功能设计/实现/审核准则：风险分级（局部/共享/高风险）、审核顺序（必要性→重复性→prior art→方案选择→设计→实现→验证）、方案比较表、hack 识别条件、接口设计原则、变更形状规则（一个 PR 一个问题）、验证证据映射、合入判断（阻塞/非阻塞） |
+
+### 平台与架构技能
+
+| 文件 | 说明 |
+|------|------|
+| `.claude/skills/arch-platform-porting/SKILL.md` | 架构移植规则：target/toolchain 契约、CPU-local 寄存器 ABI（x86_64/AArch64/RISC-V/LoongArch）、AArch64 GIC maintenance IRQ 完整契约（typed `IrqCapabilityStatus` 区分 `Unavailable`/`Error`、禁止 `IrqError::Unsupported` 表缺失、`Busy` 区分、per-CPU handler 注册与 host-lifetime 所有权、host IRQ 单事务 `FetchHandled`/`DeferredDispatch`、ICH fold 时序）、IRQ 命名空间规则（`IrqId` 禁止 `usize`、typed domain/hwirq）、SMP bring-up、UEFI handoff、动态平台 boot、验证梯度 |
+
+### 其他规范
+
+| 文件 | 说明 |
+|------|------|
+| `.claude/skills/cross-kernel-driver/SKILL.md` | 跨内核驱动架构：Driver Core / Capability Boundary / OS Glue / Runtime 分层 |
+| `docs/community/contributing.md` | 公开贡献指南 |
+| `os/StarryOS/CONTRIBUTING.md` | StarryOS 专项贡献规范 |
+| `docs/community/sync-lint.md` | 原子操作 `Relaxed` 误用静态检查规则 |
+| `.github/MAINTAINERS.md` | Reviewer 路由源（M/R/F/K 字段），PR reviewer 分配的严格 allowlist |
 
 ---
 
