@@ -58,7 +58,7 @@ cargo xtask test axvisor --test uefi/qemu-nimbos
 
 ### 1.4 非目标
 
-- pflash 设备及 OVMF VARS 持久化（P1 阶段独立设计，见 §6.11）；
+- pflash 设备及 OVMF VARS 持久化；
 - Secure Boot、SMM、TPM、网络启动（PXE）；
 - virtio-net、virtio-console 的完整实现（virtio-blk 优先）；
 - LoongArch UEFI 功能（LoongArch 已有独立实现路径）；
@@ -97,18 +97,18 @@ cargo xtask test axvisor --test uefi/qemu-nimbos
 
 按 `book/guideline/feature-development.md` §4.2 证据优先级检索：
 
-| 规范 / 资料 | 版本 / 标识 | 与本方案相关的结论 |
-|------------|------------|-------------------|
-| UEFI Specification | 2.10 (§7.2, §7.5, §8, §10) | 固件从 reset vector 进入 SEC，依次通过 PEI、DXE、BDS；DXE 阶段通过 ACPI/PCI 发现硬件；BDS 通过 UEFI Boot Manager 选择启动项 |
-| ACPI Specification | 6.5 (§5.2.5, §5.2.8, §5.2.9, §5.2.11, §5.2.12) | RSDP 含 XSDT 指针；XSDT 指向 FADT/MADT/MCFG 等表；MADT 含 LAPIC（type 0）、IOAPIC（type 1）、Interrupt Source Override（type 2）entry |
-| PCI Firmware Specification | 3.3 (§4.1) | ECAM 基址和总线范围在 MCFG 中声明；每个 bus 的配置空间映射为 MMIO 窗口 |
-| VirtIO Specification | 1.2 (§4.1, §4.2) | PCI transport 通过 PCI capability 链暴露 Common/Notify/ISR/Device CFG 结构；transport 与 device type（blk/net/console）分层 |
-| Intel SDM | Vol.3 §10.4, §10.12, §11.9 | LAPIC 在 `0xFEE00000`，xAPIC/x2APIC 模式；IOAPIC 在 `0xFEC00000`；MSI address `0xFEE00000-0xFEEFFFFF`，data 含 vector + delivery mode + trigger mode |
-| Intel SDM | Vol.3 §9.1.4 | x86 reset vector `0xFFFFFFF0`，CS=0xF000、CS.base=0xFFFF0000、RIP=0xFFF0 |
-| EDK2 / OvmfPkg | `edk2-stable202605`，`OvmfPkg/OvmfPkgX64.dsc` | 4MB FD 布局：VARS 在 `0x0-0x84000`，CODE 在 `0x84000-0x400000`；CODE 映射到 `0xFFC84000-0xFFFFFFFF`，reset vector 落在 CODE 最后 16 字节 |
-| QEMU q35 机型 | QEMU 9.2，`hw/i386/pc_q35.c`，`hw/pci-host/q35.c` | MCH 的 PCI 主桥在 bus 0 slot 0 function 0；PIRQA→GSI16, PIRQB→GSI17, PIRQC→GSI18, PIRQD→GSI19；ECAM 默认 `0xB0000000`（可重定位）；fw_cfg PIO 在 `0x510`/`0x511` |
-| QEMU fw_cfg | `docs/specs/fw_cfg.rst`，`hw/nvram/fw_cfg.c` | PIO selector `0x510`、data `0x511`；DMA 通过 `0x514` 的 8 字节寄存器触发；file directory 结构为 4 字节 count + 每项 64 字节（size + selector + reserved + name） |
-| qemu-x86_64-axvisor-uefi Ci job | tgoskits `ci.yml:692-714`（当前被注释） | 展示 CI 集成所需的基础命令和目标配置 |
+| 规范 / 资料 | 版本 / 标识 | 可获取位置 | 与本方案相关的结论 |
+|------------|------------|-----------|-------------------|
+| UEFI Specification | 2.10 (§7.2, §7.5, §8, §10) | uefi.org/specifications | 固件从 reset vector 进入 SEC，依次通过 PEI、DXE、BDS；DXE 阶段通过 ACPI/PCI 发现硬件；BDS 通过 UEFI Boot Manager 选择启动项 |
+| ACPI Specification | 6.5 (§5.2.5, §5.2.8, §5.2.9, §5.2.11, §5.2.12) | uefi.org/specifications | RSDP 含 XSDT 指针；XSDT 指向 FADT/MADT/MCFG 等表；MADT 含 LAPIC（type 0）、IOAPIC（type 1）、Interrupt Source Override（type 2）entry |
+| PCI Firmware Specification | 3.3 (§4.1) | pcisig.com/specifications | ECAM 基址和总线范围在 MCFG 中声明；每个 bus 的配置空间映射为 MMIO 窗口 |
+| VirtIO Specification | 1.2 (§4.1, §4.2) | docs.oasis-open.org/virtio/ | PCI transport 通过 PCI capability 链暴露 Common/Notify/ISR/Device CFG 结构；transport 与 device type 分层 |
+| Intel SDM | Vol.3 §10.4, §10.12, §11.9 | intel.com/sdm | LAPIC 在 `0xFEE00000`，xAPIC/x2APIC 模式；IOAPIC 在 `0xFEC00000`；MSI address `0xFEE00000-0xFEEFFFFF`，data 含 vector + delivery mode + trigger mode |
+| Intel SDM | Vol.3 §9.1.4 | intel.com/sdm | x86 reset vector `0xFFFFFFF0`，CS=0xF000、CS.base=0xFFFF0000、RIP=0xFFF0 |
+| EDK2 / OvmfPkg | `edk2-stable202605`，`OvmfPkg/OvmfPkgX64.dsc` | github.com/tianocore/edk2 | 4MB FD 布局：VARS 在 `0x0-0x84000`，CODE 在 `0x84000-0x400000`；CODE 映射到 `0xFFC84000-0xFFFFFFFF`，reset vector 落在 CODE 最后 16 字节 |
+| QEMU q35 机型 | QEMU 9.2，`hw/i386/pc_q35.c`，`hw/pci-host/q35.c` | gitlab.com/qemu-project/qemu | MCH 的 PCI 主桥在 bus 0 slot 0 function 0；PIRQA→GSI16, PIRQB→GSI17, PIRQC→GSI18, PIRQD→GSI19；ECAM 默认 `0xB0000000`（可重定位）；fw_cfg PIO 在 `0x510`/`0x511` |
+| QEMU fw_cfg | `docs/specs/fw_cfg.rst`，`hw/nvram/fw_cfg.c` | gitlab.com/qemu-project/qemu | PIO selector `0x510`、data `0x511`；DMA 通过 `0x514` 的 8 字节寄存器触发；file directory 结构为 4 字节 count + 每项 64 字节（size + selector + reserved + name） |
+| tgoskits CI | `ci.yml:692-714`（当前被注释） | 本仓库 `.github/workflows/ci.yml` | 展示 CI 集成所需的基础命令和目标配置 |
 
 ---
 
@@ -123,6 +123,7 @@ cargo xtask test axvisor --test uefi/qemu-nimbos
 | **接口代价** | 无 | `mptable.rs` 扩展为 ACPI 生成器（职责混乱） | 新增 `arch/x86_64/boot/acpi.rs`、`axdevice/src/pci/`、`axdevice/src/virtio/` | 新增大量 q35 设备模型和持久化接口 |
 | **实现复杂度** | — | 低（但功能不完整） | 中等，分 5 阶段递进 | 极高，远超当前需求 |
 | **兼容性** | 不变 | 不影响现有 BIOS 路径 | 不影响现有 BIOS 路径，UEFI 在新配置中 opt-in | 现有配置需要大量适配 |
+| **资源与性能** | 无额外开销 | 与现状相同 | 新增 ACPI blob 内存（~16 KiB）、PCI ECAM MMIO 窗口（128 MiB guest 地址空间）、virtio virtqueue DMA（开销与现有 passthrough 路径相当） | 需大量常驻内存和 MMIO 窗口 |
 | **可测试性** | — | 仅能验证 MP 表生成 | 每阶段有独立测试和退出条件 | 需要 q35 兼容性测试套件 |
 | **演进成本** | 积累技术债务 | 后续仍需 ACPI，MP 表路径会成为废弃代码 | 阶段 5 抽取跨架构公共部分 | 过度投入，多数设备 guest 不使用 |
 
@@ -280,8 +281,8 @@ virtio-blk 完成 IO 请求
 |------|--------|---------|--------|
 | PCI ECAM 配置空间 | `PciHostBridge`（VM 级） | 多 vCPU 可能同时访问不同 bus/device | `SpinNoIrq`，每个 access 持锁时间仅限于单次 MMIO 读写 |
 | virtio-blk virtqueue | `VirtioBlk`（VM 级） | vCPU 提交请求，设备侧处理完成 | virtqueue 的 avail/used ring 通过内存序同步；设备侧不持锁等待 IO |
-| i8259 PIC 状态（IMR/IRR/ISR） | `Pic`（VM 级） | vCPU PIO 访问 + vIOAPIC EOI 级联 | `SpinNoIrq`，PIO handler 不回调外部 |
-| MSI 路由表 | `MsiRouter`（VM 级） | vCPU MSI 写 + 设备中断注入 | 读写锁，MSI 写为读侧（高频），路由变更为写侧（低频） |
+| i8259 PIC 状态（IMR/IRR/ISR） | `Pic`（VM 级） | vCPU PIO 访问 | `SpinNoIrq`。PIO handler 在 vCPU VM-exit 上下文中执行，不能睡眠；PIC handler 不回调其他 Device 锁，避免重入 |
+| MSI 路由表 | `MsiRouter`（VM 级） | vCPU MSI 写（VM-exit 上下文，高频）+ 设备中断路由注册（低频） | `SpinNoIrq` 读写锁。MSI 写路径在 VM-exit 上下文中运行，必须使用非睡眠锁；读侧（MSI 拦截）高频，写侧（PCI 设备 MSI capability 初始化）低频 |
 | vLAPIC SIPI pending | per-vCPU | 发起 vCPU 写 ICR → 目标 vCPU 读 | 通过 `VmInterruptSender` 消息队列，无共享锁 |
 
 **锁顺序**（从外到内）：
