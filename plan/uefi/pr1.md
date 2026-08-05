@@ -159,9 +159,9 @@ feat(axvisor): add fixed OVMF SEC entry diagnostics for x86_64 UEFI guests
 ```markdown
 ## 解决的问题
 
-AxVisor 的 x86_64 路径缺少可诊断的 UEFI guest 启动支持：没有可复现的固定资产（发行版 OVMF 版本漂移）、没有装载时的布局强制、没有统一的设备访问 trace、没有 SEC 到达的端到端测试门禁。UEFI 固件进入 SEC 后"走了哪一步、访问了什么"完全不可见，后续 fw_cfg/ACPI/PCI/virtio 支持（设计文档阶段 2-5）缺少诊断基础。
+AxVisor 的 x86_64 路径缺少可诊断的 UEFI guest 启动支持：没有可复现的固定资产（发行版 OVMF 版本漂移）、没有装载时的布局强制、没有统一的设备访问 trace、没有 SEC 到达的端到端测试门禁。UEFI 固件进入 SEC 后"走了哪一步、访问了什么"完全不可见，后续 fw_cfg/ACPI/PCI/virtio 平台发现与启动盘支持缺少诊断基础。
 
-**本 PR**：为 x86_64 guest UEFI 建立阶段 1 的最小闭环——固定 OVMF 资产校验 + loader 布局强制 + 设备访问 trace + ovmf-entry SEC 到达诊断，共 5 个提交。阶段 2-5（ACPI/PCI/virtio/中断）保留为 `plan/uefi/design.md` 路线图，不在本 PR 范围。
+**本 PR**：为 x86_64 guest UEFI 建立阶段 1 的最小闭环——固定 OVMF 资产校验 + loader 布局强制 + 设备访问 trace + ovmf-entry SEC 到达诊断，共 5 个提交。本 PR 为后续 UEFI 支持（fw_cfg/ACPI/PCI/virtio 平台发现与启动盘路径）提供可诊断的基础。
 
 ## 改了什么
 
@@ -178,7 +178,7 @@ AxVisor 的 x86_64 路径缺少可诊断的 UEFI guest 启动支持：没有可�
 ## 每步的逻辑
 
 - **先校验后装载（提交 1 → 2）**：资产校验在构建编排层完成（替代 shell 脚本），loader 只做装载时的布局强制；两层都以固定常量为准，任何一层发现不匹配都显式报错而非回退到发行版 OVMF。校验作用域收窄到"profile 显式声明"——这是不破坏 dev 现存 `arceos-uefi-smp1.toml` 的前提。
-- **trace 只加日志不改行为（提交 3）**：SEC 到达后的下一个问题必然是"OVMF 接下来访问了什么"，trace 作为阶段 2+ 的诊断输入；`result=<ok|error>` 保留失败可见性，为后续设备实现提供首个未支持访问的定位。
+- **trace 只加日志不改行为（提交 3）**：SEC 到达后的下一个问题必然是"OVMF 接下来访问了什么"，trace 作为后续 UEFI 支持的诊断输入；`result=<ok|error>` 保留失败可见性，为后续设备实现提供首个未支持访问的定位。
 - **固定资产接线用 pflash 而非 ostool（提交 4）**：ostool 的 `uefi = true` 会下载 `edk2-stable202508-r1` 并注入 FAT ESP，验证的不是本 PR 固定的 `edk2-stable202605` 资产；因此 `uefi = false` + 校验过的 CODE/VARS 以 pflash 注入，成功判定只来自 guest COM1 的 SEC marker。
 - **用例保持 non-gating**：SEC marker 的 VMX/SVM 两机真实硬件证据尚未齐备，合入后继续跟踪（见遗留事项），证据齐全后再升级 gating。
 
@@ -191,8 +191,8 @@ AxVisor 的 x86_64 路径缺少可诊断的 UEFI guest 启动支持：没有可�
 
 ## 遗留事项
 
-- `agent_review_bench` 已知 flaky（非本分支引入），见 `plan/collect_issue.md` #1；
-- VMX/SVM 两机硬件验证未完成，ovmf-entry 保持 non-gating，见 `plan/collect_issue.md` #6。
+- `agent_review_bench` 已知 flaky（非本分支引入，建议 CI 失败时按已知 flake 单独重跑确认）；
+- VMX/SVM 两机硬件验证未完成，ovmf-entry 保持 non-gating，证据齐全后再升级 gating。
 ```
 
 ## 8. 合入前检查（复用 solve_conflict.md §7 验收标准中适用于本 PR 的项）
