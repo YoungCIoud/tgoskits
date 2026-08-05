@@ -22,17 +22,17 @@
 | 4 | `9881374a6` | test(axvisor): add fixed OVMF entry diagnostics | `os/axvisor/configs/vms/qemu/x86_64/ovmf-entry.toml`(新增)、`scripts/axbuild/src/axvisor/test/qemu.rs`(+753)、`test-suit/axvisor/uefi/ovmf-entry/`(4 个 TOML 新增) |
 | 5 | `093e0c1fa` | docs(axvisor): document the fixed OVMF profile | `.claude/skills/arch-platform-porting/references/boot-debugging.md`(+84)、`docs/docs/architecture/`(3 个)、`docs/docs/build/`(2 个) |
 
-## 2. 问题背景：uefi/p0 与 dev 的冲突
+## 2. 问题背景：x86_64 guest UEFI 启动诊断缺失
 
-`uefi/p0`（`941134916`，1 个集中提交 +1707/-193，24 文件）在实现后未及时合入，dev 在其共同基点 `024ecca10` 之后前进了 34 个提交，重构了 P0 依赖的核心边界（详见 `plan/uefi/solve_conflict.md` §1.2）。直接 rebase/cherry-pick 不可行，核心冲突：
+AxVisor 的 x86_64 路径缺少可诊断的 UEFI guest 启动支持：OVMF 固件从 reset vector 进入 SEC 后，AxVisor 无法确定"固件走到了哪一步"——没有可复现、可归因的固定资产（发行版 OVMF 版本漂移、不可复现）、没有装载时的布局强制（CODE 大小/GPA/reset vector 无校验）、没有统一的设备访问 trace（无法定位固件首次未支持的平台访问）、没有 SEC 到达的端到端测试门禁。这使后续 UEFI 功能（fw_cfg/ACPI/PCI/virtio，见 `plan/uefi/design.md` 阶段 2-5）缺少诊断基础。
 
-- **串口变为 machine-owned 资源**：x86 machine profile 固定提供 16550 COM1（`virtualization/axvm/src/machine.rs:335`，PIO `0x3f8` + GSI 4），并明确禁止 `emu_devices`/`serial` 字段。P0 的 guest TOML COM1 声明、`guest_serial.rs` 全局 matcher、`before_first_run`/`on_last_vcpu_exit` 挂钩全部失效；
-- **脚本与用例删除**：`d7050469f` 删除了 `setup_qemu.sh`/`quick-start.sh`/`ovmf-profile.sh`/NimbOS 配置/qemu-nimbos 用例，旧校验职责（shell 脚本）与旧用例不能恢复；
-- **配置模型重构**：VM 配置改为 `guest_type = "passthrough"` + `[devices] passthrough/disabled`，`vm_type = 1`/`emu_devices = [...]` 已失效；
-- **Device 新 API**：`Device` trait 迁到 `axdevice_base`（`name/resources/access`），`DeviceAccess` 在 `axdevice_base/src/lib.rs:355`，`DeviceRuntime::dispatch` 返回 `Result<BusResponse, DeviceError>`，P0 在旧 `device.rs` 的 trace 实现不能直接搬用；
-- **测试规范收紧**：禁止源码文本断言（`book/guideline/code-quality.md:1713`），P0 的 `ovmf_tests.rs` 大量读取源码/TOML 文本断言，必须重写。
+同时，dev 现有边界对实现提出了明确约束（见 `plan/uefi/design.md` §4）：
 
-**结论（solve_conflict.md §1.3）**：推翻旧实现、保留设计目标；`uefi/p0` 与 `feat/uefi-phase1` 保留不合并、不删除，仅作需求参考；从最新 dev 新建 `feat/uefi-p0-r2` 重做。
+- **串口为 machine-owned 资源**：x86 machine profile 固定提供 16550 COM1（`virtualization/axvm/src/machine.rs:335`，PIO `0x3f8` + GSI 4），并明确禁止 `emu_devices`/`serial` 字段——SEC 判定不能通过 guest TOML 注册 COM1 或新增串口截获代码；
+- **配置模型为 `guest_type = "passthrough"` + `[devices]`**：旧 `vm_type = 1`/`emu_devices = [...]` 配置模型已失效，新用例须按新模型编写；
+- **`Device` trait 在 `axdevice_base`**（`name/resources/access`），`DeviceRuntime::dispatch` 返回 `Result<BusResponse, DeviceError>`——设备访问 trace 须按新 API 实现；
+- **测试规范收紧**：禁止源码文本断言（`book/guideline/code-quality.md:1713`），校验测试须编译并调用真实 API；
+- **脚本/用例已删除**：`d7050469f` 删除了 `setup_qemu.sh`/`quick-start.sh`/`ovmf-profile.sh`/NimbOS 配置/qemu-nimbos 用例，固件校验职责与测试用例须迁入 Rust 编排层与新的 `test-suit/axvisor/` 分组。
 
 ## 3. 方案概述
 
@@ -81,7 +81,7 @@
 - 统一 trace 点：`DeviceRuntime::dispatch` 路由路径与绕过 dispatch 的 `handle_mmio_write_with_memory` 路径各加一处 `trace_device_access`，输出格式 `guest device access: device=<name> bus=PIO|MMIO direction=read|write addr=<addr:#x> width=<width> value=<value> result=<ok|error>`；
 - 未注册地址仍返回 `DeviceError::NotFound` 并记录为 `device=<unregistered>`，不伪造返回值；SysReg 访问视为高频噪声不 trace；替换死代码 `log_device_io`（含其 `allow(dead_code)`）。
 
-**为什么这么改**：按 `axdevice_base` 新 `Device`/`BusAccess` API 重写 P0 的旧 trace，不搬用旧实现；trace 只加日志、不改行为，作为阶段 2+ 的"OVMF 接下来访问了什么"的诊断输入（design.md §7 阶段 1 工作项 4）。
+**为什么这么改**：按 `axdevice_base` 新 `Device`/`BusAccess` API 实现设备访问 trace；trace 只加日志、不改行为，作为阶段 2+ 的"OVMF 接下来访问了什么"的诊断输入（design.md §7 阶段 1 工作项 4）。
 
 **验证**：9 个 host 单测覆盖注册设备 read/write/error 结果不变、未注册设备四种宽度两种 bus、越界端口地址——断言 trace 点不改变既有访问结果。
 
@@ -117,7 +117,7 @@
 - `axvisor/overview.md`：x86_64 行从 stub 占位更新为"VMX/SVM 运行时按 CPUID 选择 + 固定 OVMF UEFI guest 阶段 1 SEC 诊断已落地"，并说明 UEFI 固件字段与 `firmware_profile` 布局强制；
 - `platform/testing.md`、`axvisor-guest-machine.md`、`axvisor/test.md`、`ci.md`：补充 `uefi` 测试分组布局、ovmf-entry 用例、固件参数与 non-gating 表述。
 
-**为什么这么改**：`boot-debugging.md` 在 solve_conflict.md §1.4 冲突清单中，必须同步；不恢复已删除的 quick-start 文档与脚本；同步计划即 solve_conflict.md §5.1 表格（design.md 同步已在实现前完成评审）。
+**为什么这么改**：`boot-debugging.md` 属于 arch-platform-porting 的 UEFI 调试参考（AGENTS.md 要求 UEFI 调试流程变更须同步），必须更新；不恢复已删除的 quick-start 文档与脚本；文档同步清单见 solve_conflict.md §5.1（design.md 同步已在实现前完成评审）。
 
 ## 5. 验证汇总
 
@@ -138,7 +138,7 @@
 
 ## 6. 遗留事项与 non-gating 说明
 
-以下遗留项收敛于 `plan/collect_issue.md`（UEFI P0-R2 评审遗留 Issue 清单），不阻塞本 PR 合入：
+以下遗留项收敛于 `plan/collect_issue.md`（本分支评审遗留 Issue 清单），不阻塞本 PR 合入：
 
 - **agent_review_bench flaky**（清单 #1，高）：`scripts/axbuild/src/agent_review_bench/sandbox.rs` 的 `mock_agents_write_artifacts_and_reject_invalid_json` 间歇失败，根因是 git maintenance 竞态 + 时间戳偏差；**非本分支引入**（分支 git diff 不涉及该模块）。CI 失败时按已知 flake 重跑确认；
 - **VMX/SVM 两机硬件验证未完成**（清单 #6，高，任务 4 遗留）：本机 WSL2 嵌套虚拟化存疑，未完成真实验证；ovmf-entry 用例**保持 non-gating**，直到固定 DEBUG bundle 在 VMX（Intel）/SVM（AMD）两机各验证一次 SEC marker 后再升级 gating（`cargo xtask axvisor test qemu --arch x86_64 --test-group uefi --test-case ovmf-entry-{vmx,svm} --firmware-bundle-path <bundle>`）；
@@ -159,9 +159,9 @@ feat(axvisor): add fixed OVMF SEC entry diagnostics for x86_64 UEFI guests
 ```markdown
 ## 解决的问题
 
-`uefi/p0` 分支实现后未及时合入，dev 在其共同基点后前进了 34 个提交并重构了核心边界：串口变为 machine-owned 资源（guest TOML 的 COM1 声明、`guest_serial.rs` 全局 matcher 失效）、配置模型改为 `guest_type = "passthrough"`、`Device` trait 迁到 `axdevice_base` 新 API、`ovmf-profile.sh`/NimbOS 配置/qemu-nimbos 用例被删除、测试规范禁止源码文本断言。旧实现约一半以上代码失效，无法直接合并。
+AxVisor 的 x86_64 路径缺少可诊断的 UEFI guest 启动支持：没有可复现的固定资产（发行版 OVMF 版本漂移）、没有装载时的布局强制、没有统一的设备访问 trace、没有 SEC 到达的端到端测试门禁。UEFI 固件进入 SEC 后"走了哪一步、访问了什么"完全不可见，后续 fw_cfg/ACPI/PCI/virtio 支持（设计文档阶段 2-5）缺少诊断基础。
 
-**方案**：推翻旧实现、保留设计目标，从最新 dev（`4c7aa8577`）新建 `feat/uefi-p0-r2` 重做阶段 1——固定 OVMF 资产校验 + x86 loader 布局强制 + 设备访问 trace + ovmf-entry SEC 到达诊断，共 5 个提交。阶段 2-5（ACPI/PCI/virtio/中断）保留为 `plan/uefi/design.md` 路线图，不在本 PR 范围。
+**本 PR**：为 x86_64 guest UEFI 建立阶段 1 的最小闭环——固定 OVMF 资产校验 + loader 布局强制 + 设备访问 trace + ovmf-entry SEC 到达诊断，共 5 个提交。阶段 2-5（ACPI/PCI/virtio/中断）保留为 `plan/uefi/design.md` 路线图，不在本 PR 范围。
 
 ## 改了什么
 
@@ -197,7 +197,7 @@ feat(axvisor): add fixed OVMF SEC entry diagnostics for x86_64 UEFI guests
 
 ## 8. 合入前检查（复用 solve_conflict.md §7 验收标准中适用于本 PR 的项）
 
-- [ ] 分支仅含 §1 的 5 个提交，`uefi/p0` 与 `feat/uefi-phase1` 保留未合并；
+- [ ] 分支仅含 §1 的 5 个提交；
 - [ ] 合入前刷新远端并复核 `dev` 是否再次变化（方案基于本地 `dev@4c7aa8577`）；
 - [ ] `plan/uefi/design.md`/`solve_conflict.md` 与实现一致，`collect_issue.md` 已跟踪遗留项；
 - [ ] 无源码文本断言测试残留；未引入任何已删除的脚本/NimbOS 配置/guest-owned COM1 声明；
