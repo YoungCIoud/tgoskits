@@ -174,16 +174,14 @@ AxVisor 的 x86_64 路径缺少可诊断的 UEFI guest 启动支持：没有可�
 
 ## 改了什么
 
-1. **feat(axbuild): verify fixed OVMF debug bundles** — 新增 `scripts/axbuild/src/axvisor/ovmf.rs`：固定 profile 常量、`OvmfManifest`/`VerifiedOvmfBundle`/`FirmwareSource` 私有类型与 `verify_firmware` 校验链（manifest `deny_unknown_fields` 解析、逐字段值校验、逐文件大小与 SHA-256、VARS||CODE 拼接布局），替代已删除的 `ovmf-profile.sh`；CLI 新增 `--firmware-bundle-path`/`--allow-unverified-firmware`。17 个 host 单测。
+本 PR 沿"资产校验 → 装载强制 → 诊断观察 → 端到端用例 → 文档"五层建立阶段 1 闭环，外加一处真实验证暴露的修复：
 
-2. **feat(axvm): enforce the fixed x86 OVMF CODE layout** — `axvmconfig` 新增 `firmware_profile` 字段（非 UEFI 协议声明时拒绝）；x86 loader 在 fs 与内存两条 UEFI 装载路径上，仅当 profile 为固定值时校验 CODE 大小 `0x37c000`、GPA `0xffc84000`、reset vector `0xfffffff0` 并打印装载日志。未声明 profile 时行为与 dev 完全一致，现有 `arceos-uefi-smp1.toml`（`bios_load_addr = 0xffc0_0000`）不受影响。
-
-3. **feat(axdevice): trace guest device accesses in DeviceRuntime** — 在 `DeviceRuntime::dispatch` 与 `handle_mmio_write_with_memory` 路径记录 `device= bus= direction= addr= width= value= result=` 统一 trace；未注册地址仍返回 `DeviceError::NotFound` 并记为 `device=<unregistered>`；SysReg 不 trace；删除死代码 `log_device_io`。9 个 host 单测验证 trace 不改变访问结果。
-
-4. **test(axvisor): add fixed OVMF entry diagnostics** — 新增 `test-suit/axvisor/uefi/` 分组与 `ovmf-entry` 用例（VMX/SVM 变体仅 `-cpu` 不同）：QEMU `-kernel` 启动 Axvisor 宿主（`uefi = false` 阻断 ostool 自带 OVMF），Axvisor 加载嵌套 OVMF 作为 UEFI guest 固件，`success_regex` 以 `(?s)VCpu[0] running...` 锚定嵌套 VM 后匹配 guest COM1 的 `SecCoreStartupWithStack(`（前缀锚定防止误匹配宿主 OVMF，见提交 6）。runner 消费 `--firmware-bundle-path`：校验过的 CODE 经 `include_bytes!` 嵌入 VM 配置并作为 QEMU pflash unit 0（VARS 每运行独立拷贝为 unit 1），两层固件字节级相同；无 bundle 时 fail-fast，绝不静默 fallback 到发行版 OVMF；`--list` 不要求 bundle。新增专用 VM 配置 `os/axvisor/configs/vms/qemu/x86_64/ovmf-entry.toml`。
-
-5. **docs(axvisor): document the fixed OVMF profile** — `boot-debugging.md` 新增固定 OVMF 章节（常量表/CLI/接线/失败模式），`axvisor/overview.md` x86_64 更新为 VMX/SVM + 固定 OVMF UEFI 状态，`axvisor/test.md`/`ci.md` 等补充 `uefi` 分组与固件参数。
-6. **fix(axvisor): anchor ovmf-entry SEC match to the nested VM** — 修复真实验证发现的 success_regex 假阳性：QEMU 层宿主 OVMF 与嵌套 OVMF 输出相同 SEC 行，裸 regex 847ms 即匹配宿主层；改为 `(?s)VCpu[0] running...` 前缀锚定嵌套层，修复后真实 QEMU 23s PASS。
+- **固定 OVMF 资产校验（axbuild）**：新增 `scripts/axbuild/src/axvisor/ovmf.rs`，以 typed Rust verifier 替代已删除的 `ovmf-profile.sh`——`OvmfManifest`（`deny_unknown_fields` 解析）/`VerifiedOvmfBundle`/`FirmwareSource` 私有类型，`verify_firmware` 校验 manifest 逐字段值、文件大小与 SHA-256、VARS||CODE 拼接布局；CLI 新增 `--firmware-bundle-path` 与 `--allow-unverified-firmware`（未验证固件必须显式 opt-in 并打印哈希）。
+- **x86 loader 布局强制（axvm/axvmconfig）**：`axvmconfig` 新增 `firmware_profile` 配置字段（非 UEFI boot 协议声明时拒绝）；x86 loader 在 fs 与内存两条 UEFI 装载路径上，仅当 profile 为固定值时强制 CODE 大小 `0x37c000`、GPA `0xffc84000`、reset vector `0xfffffff0` 并打印装载日志。未声明 profile 时行为与 dev 完全一致，现有 `arceos-uefi-smp1.toml`（`bios_load_addr = 0xffc0_0000`）不受影响。
+- **设备访问 trace（axdevice）**：在 `DeviceRuntime::dispatch` 与 `handle_mmio_write_with_memory` 路径记录统一格式 trace（`device= bus= direction= addr= width= value= result=`），未注册地址仍返回 `NotFound` 并记为 `device=<unregistered>`，SysReg 不 trace；替换死代码 `log_device_io`。trace 只加日志不改行为，作为后续 UEFI 支持的诊断输入。
+- **ovmf-entry 端到端用例（test-suit + axbuild runner）**：新增 `test-suit/axvisor/uefi/` 分组与 `ovmf-entry` 用例（VMX/SVM 变体仅 `-cpu` 不同，天然 non-gating）：QEMU `-kernel` 启动 Axvisor 宿主（`uefi = false` 阻断 ostool 下载自带 OVMF），Axvisor 加载嵌套 OVMF 作为 UEFI guest 固件，success_regex 匹配嵌套 VM 启动后的 `SecCoreStartupWithStack(`。runner 消费 `--firmware-bundle-path`：校验过的 CODE 经 `include_bytes!` 嵌入 VM 配置并作为 QEMU pflash unit 0（VARS 每运行独立拷贝），两层固件字节级相同；无 bundle 时 fail-fast，绝不静默 fallback 到发行版 OVMF；`--list` 不要求 bundle。新增专用 VM 配置 `os/axvisor/configs/vms/qemu/x86_64/ovmf-entry.toml`。
+- **文档（docs + skill reference）**：`boot-debugging.md` 新增固定 OVMF 章节（常量/CLI/接线/失败模式），`axvisor/overview.md` x86_64 更新为 VMX/SVM + 固定 OVMF UEFI 状态，`axvisor/test.md`/`ci.md` 等补充 `uefi` 分组与固件参数。
+- **修复：success_regex 锚定嵌套 VM**：真实 QEMU 验证发现 QEMU 层宿主 OVMF（为引导 axvisor 注入的 pflash）与嵌套 OVMF 输出相同的 SEC 行，裸 regex 847ms 即误匹配宿主层；改为 `(?s)VCpu[0] running...` 前缀锚定嵌套层，修复后真实 QEMU 23s PASS。
 
 ## 每步的逻辑
 
@@ -196,8 +194,57 @@ AxVisor 的 x86_64 路径缺少可诊断的 UEFI guest 启动支持：没有可�
 
 - 分支 std 套件 `cargo xtask test`：49 包 1184 passed / 0 failed / 7 ignored；axvm 242、axdevice 47、axvmconfig 14 全过；
 - `cargo xtask clippy --package axbuild/axvm/axvmconfig/axdevice` 零告警零 allow；`cargo fmt` 通过；
-- ovmf-entry：`--list` 正确发现 vmx/svm 变体；无 bundle 时 fail-fast；真实 QEMU（SVM，本机 AMD）固定 DEBUG bundle 23s PASS，嵌套 SEC 匹配（提交 6 修复后）；
+- ovmf-entry：`--list` 正确发现 vmx/svm 变体；无 bundle 时 fail-fast；
+- 真实 QEMU（SVM，本机 AMD）：固定 DEBUG bundle 校验通过后 23s PASS，嵌套 SEC 匹配（提交 6 修复后）；
 - 每提交经 subagent 全量评审（实跑 clippy/fmt/单测）→ fix → 复审闭环。
+
+### 手动部署固件并测试
+
+以下为在本机复现 ovmf-entry 端到端验证的步骤（已在 AMD/SVM 环境实测通过）：
+
+1. **构建固定 DEBUG OVMF**（需要 edk2 源码，`edk2-stable202605` tag）：
+
+   ```bash
+   cd <edk2>
+   git checkout edk2-stable202605
+   # 构建 OvmfPkgX64 DEBUG/GCC/4MB/DEBUG_ON_SERIAL_PORT，产物在 Build/OvmfX64/DEBUG_GCC/FV/
+   # 关键产物: OVMF_CODE.fd (0x37c000) / OVMF_VARS.fd (0x84000) / OVMF.fd (0x400000)
+   ```
+
+2. **组装 bundle 目录**（verifier 要求的格式：三个文件 + manifest.toml）：
+
+   ```bash
+   mkdir -p <bundle-dir>
+   cp <edk2>/Build/OvmfX64/DEBUG_GCC/FV/{OVMF_CODE.fd,OVMF_VARS.fd,OVMF.fd} <bundle-dir>/
+   # manifest.toml 需按 scripts/axbuild/src/axvisor/ovmf.rs 的字段契约填写:
+   #   profile = "qemu_x86_64_axvisor_ovmf_debug", edk2_tag = "edk2-stable202605",
+   #   edk2_commit = <实际 commit>, architecture/target/toolchain/platform, 全部 GPA/大小常量,
+   #   code/vars/combined 的 _sha256(用 sha256sum 计算), 布尔开关, 5 个 boot marker。
+   # 用 sha256sum <bundle-dir>/*.fd 计算哈希填入。
+   ```
+
+3. **运行 ovmf-entry 用例**（本机 AMD 用 SVM 变体，Intel 用 VMX）：
+
+   ```bash
+   cd <tgoskits>
+   cargo xtask axvisor test qemu --arch x86_64 --test-group uefi \
+     --test-case ovmf-entry-svm --firmware-bundle-path <bundle-dir>
+   ```
+
+4. **预期结果**：`ok: ovmf-entry-svm`（约 20-30s）。日志中可见完整嵌套链路证据：
+
+   ```
+   selected firmware profile: qemu_x86_64_axvisor_ovmf_debug ... verification_label=VERIFIED
+   Loading fixed OVMF CODE profile <memory> (3653632 bytes) into GPA @0xffc84000 with reset vector 0xfffffff0
+   VM[1] boot success
+   VM[1] VCpu[0] running...
+   SecCoreStartupWithStack(          ← 嵌套 OVMF SEC, success_regex 锚定点
+   === SUCCESS PATTERN MATCHED: (?s)VCpu\[0\] running\.\.\..*SecCoreStartupWithStack ===
+   ```
+
+   若 `success_regex` 在 1 秒内即匹配（约 847ms），说明匹配到了宿主 OVMF 的 SEC 而非嵌套层——检查用例 TOML 的 regex 是否带 `VCpu[0] running...` 前缀锚定。
+
+   **注意**：OVMF 必须为 DEBUG 构建（含 `SecCoreStartupWithStack(` 输出）；RELEASE 构建无此 SEC marker，用例会超时失败。
 
 ## 遗留事项
 
