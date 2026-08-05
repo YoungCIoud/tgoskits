@@ -1,8 +1,9 @@
 # AxVisor x86_64 Guest UEFI 支持 — 设计方案
 
-> 基线：`dev` 分支当前 HEAD（`47c044f7d`）。
+> 基线：`dev` 分支当前 HEAD（`4c7aa8577`，2026-08-04 复核）。
 > 风险等级：**高风险功能**（涉及硬件协议、MMIO/DMA/IRQ、页表、启动/虚拟化契约、跨 vCPU 并发、新 crate 边界和公共 API）。
 > 本文为独立可评审的设计材料，按 `book/guideline/feature-development.md` 高风险功能要求编写。
+> 历史说明：本设计最初编写于 `dev@47c044f7d`，2026-08-04 按最新 dev 复核并同步。当前执行范围为**阶段 1（SEC 到达验证）**，阶段 2-5 保留为后续路线图，不在本次实现范围内。
 
 ## 1. 目标
 
@@ -17,16 +18,16 @@ AxVisor 当前只能以传统 BIOS/multiboot 方式启动 x86_64 guest：
 
 **证据**：
 
-- `os/axvisor/configs/vms/qemu/x86_64/nimbos-uefi-smp1.toml`：`emu_devices = []`，IOAPIC/HPET 仅穿透，无 ACPI/PCI/virtio 设备；
+- `virtualization/axvm/src/machine.rs:335`：x86 machine profile 固定提供 16550 COM1（PIO `0x3f8`，GSI 4）、vIOAPIC、PIT，且配置明确禁止 `emu_devices`/`serial` 等字段（`docs/docs/architecture/axvisor-guest-machine.md:70`）——UEFI 固件在 AxVisor 上首次启动只能落在 SEC 之前，尚无 ACPI/PCI/virtio 平台发现路径；
 - `arch/x86_64/boot/mptable.rs`：x86 仅有 SMP MP 表（legacy），无 ACPI 表生成；
-- `axvm-types/src/lib.rs:981`：`VirtioBlk/VirtioNet/VirtioConsole` 类型已定义，但 `axdevice/src/lib.rs:78` 注释掉了 `pub use virtio_dev::*`，无 DeviceFactory 实现；
-- `.github/workflows/ci.yml:692-714`：x86 UEFI CI job 被整块注释；
+- `axvm-types/src/lib.rs`：`VirtioBlk/VirtioNet/VirtioConsole` 类型已定义，但无 DeviceFactory 实现（`axdevice/src/lib.rs` 未导出 virtio 设备）；
+- `.github/workflows/ci.yml`：x86 UEFI 相关 CI 目前仅保留 axloader 的 UEFI smoke（`ci.yml:705-743`，下载发行版 OVMF 后执行 `cargo axloader test qemu --target x86_64-unknown-uefi`）；AxVisor 侧无 UEFI 测试门禁（阶段 1 计划为 non-gating，阶段 5 升级为 gating）；
 - LoongArch 已有完整 ACPI + fw_cfg + PCI + virtio 的 UEFI 启动参考实现（`arch/loongarch64/boot/`），x86 侧完全缺失。
 
 **受众**：
 
 - AxVisor x86 平台开发者：需要可诊断的 UEFI 启动路径来开发和调试虚拟设备；
-- Guest OS 集成者：需要标准 UEFI 环境来启动 Linux、NimbOS 和其他 UEFI 应用；
+- Guest OS 集成者：需要标准 UEFI 环境来启动 Linux 和其他 UEFI 应用（NimbOS 用例及其配置已被 `d7050469f` 从 dev 删除，仅作历史背景）；
 - CI 维护者：需要可复现的 UEFI 测试门禁。
 
 ### 1.2 使用场景
@@ -34,27 +35,27 @@ AxVisor 当前只能以传统 BIOS/multiboot 方式启动 x86_64 guest：
 开发者构建包含固定 OVMF 固件和 rootfs 的 AxVisor 镜像后，执行：
 
 ```bash
-cargo xtask test axvisor --test uefi/ovmf-entry
+cargo xtask axvisor test qemu --arch x86_64 --test-group uefi --test-case ovmf-entry-svm
 ```
 
-期望结果：AxVisor 启动指定 VM，OVMF 固件从 reset vector 进入 SEC 阶段，Guest COM1 输出 `VM[1] guest COM1 reached OVMF SEC: SecCoreStartupWithStack(`，测试通过。
+期望结果：AxVisor 启动指定 VM，OVMF 固件从 reset vector 进入 SEC 阶段，Guest COM1 输出 `SecCoreStartupWithStack(`，测试通过。
 
 最终场景（阶段 3 完成后）：
 
 ```bash
-cargo xtask test axvisor --test uefi/qemu-nimbos
+cargo xtask axvisor test qemu --arch x86_64 --test-group uefi --test-case linux-uefi
 ```
 
-期望结果：OVMF 通过 ACPI 发现平台硬件、通过 PCI 枚举发现 virtio-blk 启动盘、加载 NimbOS EFI 应用，guest 自身输出 `usertests passed!`。
+期望结果：OVMF 通过 ACPI 发现平台硬件、通过 PCI 枚举发现 virtio-blk 启动盘、加载 Linux EFI 应用（原 NimbOS 用例及其测试框架已被 `d7050469f` 从 dev 删除，阶段 3 的目标用例按现有 `arceos-uefi-smp1.toml` 的配置模型新建对应的 Linux EFI 启动配置）。
 
 ### 1.3 成功标准
 
-1. 固定版本的 OVMF 固件在 AxVisor VMX 和 SVM 后端上稳定进入 SEC，Guest COM1 输出 VM-qualified SEC marker；
+1. 固定版本的 OVMF 固件在 AxVisor VMX 和 SVM 后端上稳定进入 SEC，Guest COM1 输出 SEC marker（阶段 1 目标）；
 2. OVMF 通过 fw_cfg 获取 ACPI 表，推进到 DXE/BDS；
-3. OVMF 通过 PCI 枚举发现 virtio-blk 设备，读取 ESP 并进入 UEFI Shell 或 EFI 应用；
+3. OVMF 通过 PCI 枚举发现 virtio-blk 设备，读取 ESP 并进入 UEFI Shell 或 EFI 应用（阶段 3 起）；
 4. Linux EFI stub 通过 virtio-blk 成功启动到 initramfs shell；
 5. SMP guest（≥2 vCPU）通过 INIT/SIPI 成功启动；
-6. 以上所有场景的测试在 CI 中为 gating。
+6. 以上所有场景的测试在 CI 中为 gating（阶段 1 保持 non-gating，证据齐全后升级）。
 
 ### 1.4 非目标
 
@@ -89,9 +90,10 @@ cargo xtask test axvisor --test uefi/qemu-nimbos
 | `arch/x86_64/irq.rs` | host IRQ forwarding 框架（GSI lease、mask/re-arm、drain-before-run）已就绪 | 复用 `X86InterruptDomain`，新增 PIC/MSI 路由 |
 | `arch/loongarch64/boot/acpi.rs`（878 行） | 完整 ACPI 表生成（RSDP/RSDT/FADT/MADT/SRAT/SPCR/MCFG + DSDT AML + QEMU loader） | 作为 x86 实现的**参考模板**，但表内容（MADT entry 类型、DSDT AML 设备树）为 arch-specific，不能直接复用 |
 | `arch/loongarch64/boot/` 的 `GuestPlatform`、`probe.rs`、`fdt/` | 完整的平台发现→ACPI 构建→fw_cfg 注入→FDT 生成链路 | 整体架构可借鉴，x86 不需要 FDT 分支 |
-| `test-suit/axvisor/uefi/qemu-nimbos/` | 已有 NimbOS UEFI 测试框架和 VM 配置 | 复用测试框架，更新 success_regex |
-| `uefi/p0` 分支（52b2edc） | 旧 P0 实现（固定 OVMF profile、SEC observer、trace） | 功能意图可参考，但接口基线已过时（依赖已删除的 `AxVmDevices`），不直接复用代码 |
-| `.github/workflows/ci.yml:692-714` | x86 UEFI CI job 被注释 | 阶段 1 恢复为 non-gating，阶段 5 升级为 gating |
+| `os/axvisor/configs/vms/qemu/x86_64/arceos-uefi-smp1.toml` | 现存 UEFI guest 配置（`guest_type = "passthrough"`、`boot_protocol = "uefi"`、`uefi_firmware_path`、`bios_load_addr`，机器设备由 machine profile 提供） | 阶段 1 复用该配置模型，新建专用 ovmf-entry 配置 |
+| `uefi/p0` 分支（`941134916`） | 旧 P0 实现（固定 OVMF profile、SEC observer、trace），涉及 24 文件 +1707/-193 | 功能意图可参考，但基线过旧：COM1 已 machine-owned、配置模型已改、脚本/NimbOS 用例已删除。不直接复用代码，按 `solve_conflict.md` 重做 |
+| `feat/uefi-phase1` 分支（`3782df379` + `f0fdd421c`） | 基于 `f1774c1f6` 的复刻：固定 OVMF 校验、SEC observer、设备 trace、ovmf-entry 配置 | 同上，代码不直接搬用；其中的 SEC 到达验证经验保留为需求输入 |
+| `.github/workflows/ci.yml` | x86 UEFI 相关 CI 仅保留 axloader 的 UEFI smoke（`ci.yml:705-743`，下载发行版 OVMF 后执行 `cargo axloader test qemu --target x86_64-unknown-uefi`） | AxVisor 侧无 UEFI 测试门禁；阶段 1 恢复为 non-gating，阶段 5 升级为 gating |
 
 ### 2.2 外部规范与参考
 
@@ -108,7 +110,7 @@ cargo xtask test axvisor --test uefi/qemu-nimbos
 | EDK2 / OvmfPkg | `edk2-stable202605`，`OvmfPkg/OvmfPkgX64.dsc` | github.com/tianocore/edk2 | 4MB FD 布局：VARS 在 `0x0-0x84000`，CODE 在 `0x84000-0x400000`；CODE 映射到 `0xFFC84000-0xFFFFFFFF`，reset vector 落在 CODE 最后 16 字节 |
 | QEMU q35 机型 | QEMU 9.2，`hw/i386/pc_q35.c`，`hw/pci-host/q35.c` | gitlab.com/qemu-project/qemu | MCH 的 PCI 主桥在 bus 0 slot 0 function 0；PIRQA→GSI16, PIRQB→GSI17, PIRQC→GSI18, PIRQD→GSI19；ECAM 默认 `0xB0000000`（可重定位）；fw_cfg PIO 在 `0x510`/`0x511` |
 | QEMU fw_cfg | `docs/specs/fw_cfg.rst`，`hw/nvram/fw_cfg.c` | gitlab.com/qemu-project/qemu | PIO selector `0x510`、data `0x511`；DMA 通过 `0x514` 的 8 字节寄存器触发；file directory 结构为 4 字节 count + 每项 64 字节（size + selector + reserved + name） |
-| tgoskits CI | `ci.yml:692-714`（当前被注释） | 本仓库 `.github/workflows/ci.yml` | 展示 CI 集成所需的基础命令和目标配置 |
+| tgoskits CI | `ci.yml:705-743`（axloader UEFI smoke：下载发行版 OVMF 后执行 `cargo axloader test qemu --target x86_64-unknown-uefi`） | 本仓库 `.github/workflows/ci.yml` | 展示 x86 UEFI 测试的基础命令与配置格式；AxVisor 侧 UEFI 门禁阶段 1 为 non-gating，阶段 5 升级为 gating |
 
 ---
 
@@ -147,19 +149,31 @@ cargo xtask test axvisor --test uefi/qemu-nimbos
 **启动配置模型**
 - `VMBootProtocol::Uefi` 枚举，TOML 解析 `boot_protocol = "uefi"`（`axvmconfig/src/lib.rs`）
 - `uefi_firmware_path` / `bios_load_addr` 配置字段，arch 校验矩阵
-- `load_uefi_from_configured_path()` 从文件系统加载固件（`arch/x86_64/boot/mod.rs:261`）
-- x86 vCPU reset vector `0xfffffff0` → `CS:F000, IP:FFF0` 正确映射（`x86_vcpu/src/lib.rs:164`）
+- `load_uefi_from_configured_path()` 从文件系统加载固件（`arch/x86_64/boot/mod.rs:259`，含大小查询与 layout 校验挂点）
+- x86 vCPU reset vector `0xfffffff0` → `CS:F000, IP:FFF0` 正确映射（`x86_vcpu/src/lib.rs`）
+
+**machine-owned 串口**
+- x86 machine profile 固定提供 16550 COM1（PIO `0x3f8`，GSI 4，`virtualization/axvm/src/machine.rs:335`），配置不能覆盖；输出统一经 `os/axvisor/src/guest_console/mux/mod.rs:308` 汇聚，每次设备 generation 创建新 backend（`axdevice/src/serial/backend.rs:19`）
+- 因此阶段 1 的 SEC 判定直接以 guest COM1 输出为准（success_regex），无需在 axvm 侧再实现串口截获或 observer 注册
+
+**host 依赖边界（`4c7aa8577` 新增）**
+- `virtualization/axvm/src/host/`：host OS 适配边界（`host/mod.rs`、`host/arceos.rs`），`os/axvisor` 不再反向依赖 axvm 的 host 细节
+- 阶段 1 若需要固件相关 host 服务（如镜像 registry 访问、IO 路径），应放入 `axvm/src/host/` 或 axbuild，不直接在 `os/axvisor/src/config.rs` 扩展
 
 **fw_cfg 传输层**
-- 完整的 QEMU 兼容 MMIO fw_cfg 设备：选择器/数据寄存器、DMA 传输、QEMU loader 协议（`axdevice/src/fw_cfg.rs`，995 行）
+- 完整的 QEMU 兼容 MMIO fw_cfg 设备：选择器/数据寄存器、DMA 传输、QEMU loader 协议（`axdevice/src/fw_cfg.rs`，994 行）
 - `FwCfgAcpiBlobs` / `FwCfgPlatformConfig` 类型，ACPI/SMBIOS/memmap 文件目录
 - `DeviceFactory` 注册、DMA grant、payload factory 均就绪
 
 **已模拟的 x86 平台设备**
-- COM1 串口（`x86_vlapic::EmulatedSerialPort`），PIO `0x3f8-0x3ff`
+- COM1 串口（`x86_vlapic::EmulatedSerialPort`），PIO `0x3f8-0x3ff`（由 machine profile 注册，GSI 4）
 - PIT 定时器（`x86_vlapic::EmulatedPit`），PIO `0x40-0x61`
 - vIOAPIC（`x86_vlapic::EmulatedIoApic`），MMIO `0xfec00000`
-- 以上设备均通过 `DeviceFactory` 注册（`arch/x86_64/mod.rs:471`）
+- 以上设备均由 machine profile 通过 `DeviceFactory` 注册（`machine.rs:335`），配置不能覆盖
+
+**guest 串口输出路径**
+- guest COM1 输出经 `os/axvisor/src/guest_console/mux/` 汇聚（`mux/mod.rs:308` 起），每次设备 generation 创建新 backend（`axdevice/src/serial/backend.rs:19`）
+- 阶段 1 的 SEC 判定直接以该路径的 guest 输出为准（success_regex），**不需要**在 axvm 侧重新实现串口截获、VM ID 全局表或 `before_first_run`/`on_last_vcpu_exit` 挂钩（旧 P0 方案已过时）
 
 **中断链路**
 - vLAPIC：xAPIC MMIO（`0xfee00000`）、x2APIC MSR、EOI 处理、IPI Fixed 模式、Timer（OneShot/Periodic/TSCDeadline）、全部 LVT 条目（`x86_vlapic/src/vlapic.rs`）
@@ -208,18 +222,30 @@ cargo xtask test axvisor --test uefi/qemu-nimbos
 本方案新增的能力分布在以下层次：
 
 ```text
+axdevice_base/     （已存在——OS-neutral 基元）
+└── lib.rs         Device trait（name/resources/access）、DeviceAccess、BusAccess
+
 axdevice/          （可复用设备模型——OS-neutral）
 ├── fw_cfg.rs      已存在：fw_cfg MMIO core + DMA + ACPI blob 容器
+├── serial/        已存在：per-generation serial backend（machine-owned）
 ├── pci/           新增：PCI 主桥 + ECAM 配置空间（不依赖 OS）
 ├── virtio/        新增：virtio-pci transport + virtio-blk device
 └── x86/pic.rs     新增：i8259 PIC（x86-only，PIO 设备）
 
 axvm/arch/x86_64/  （x86 平台接入——依赖 axdevice）
 ├── boot/acpi.rs   新增：x86 ACPI 表生成器（含 DSDT AML）
-├── boot/mod.rs    修改：fw_cfg 注册、ACPI 管线
-├── mod.rs         修改：lifecycle hook、设备工厂注册
+├── boot/mod.rs    修改：UEFI layout 校验（load_uefi_from_configured_path）
+├── mod.rs         修改：设备工厂注册
 ├── msi.rs         新增：MSI/MSI-X 地址拦截与翻译
 └── irq.rs         修改：PIC IRQ 注入、中断风暴保护
+
+axvm/host/         （已存在——host OS 适配边界）
+└── arceos.rs      阶段 1 的固件相关 host 服务放入此处，不扩展 os/axvisor
+
+os/axvisor/        （OS 层）
+├── guest_console/mux/  已存在：guest COM1 输出汇聚（阶段 1 SEC 判定数据源）
+└── config.rs            不改动：VM 创建顺序已固定（new → prepare_memory_layout
+                         → load_images → prepare → register_vm）
 
 x86_vlapic/        （已存在——vLAPIC/vIOAPIC/PIT/COM1 core）
 └── vlapic.rs      修改：INIT/SIPI/NMI 补全
@@ -227,9 +253,11 @@ x86_vlapic/        （已存在——vLAPIC/vIOAPIC/PIT/COM1 core）
 
 层次原则：
 
-- `axdevice/` 中的 PCI 和 virtio 设备模型不依赖任何 OS 或平台类型，只通过 `DeviceFactory`、`DeviceBundle` 和 DMA grant 接入；
-- `axvm/arch/x86_64/` 负责 x86 平台特有的 ACPI 内容生成和中断路由，是架构适配层；
-- `x86_vlapic/` 保持 OS-neutral，只通过 `X86VlapicHostOps` trait 与宿主交互。
+- `axdevice_base`/`axdevice/` 中的设备模型不依赖任何 OS 或平台类型，只通过 `DeviceFactory`、`DeviceBundle` 和 DMA grant 接入；trace 实现基于 `Device`/`BusAccess` 新 API；
+- `axvm/arch/x86_64/` 负责 x86 平台特有的 ACPI 内容生成、固件 layout 校验和中断路由，是架构适配层；
+- `axvm/host/` 承接 host OS 适配，`os/axvisor` 不反向依赖 axvm 内部细节；
+- `x86_vlapic/` 保持 OS-neutral，只通过 `X86VlapicHostOps` trait 与宿主交互；
+- 阶段 1 不新增 guest 串口截获代码：SEC 判定直接以 `os/axvisor/src/guest_console/mux/` 汇聚的 guest COM1 输出为准。
 
 ### 5.2 关键数据流
 
@@ -237,11 +265,12 @@ x86_vlapic/        （已存在——vLAPIC/vIOAPIC/PIT/COM1 core）
 
 ```text
 OVMF_CODE.fd (文件系统)
-    → load_uefi_from_configured_path()
+    → load_uefi_from_configured_path()（含 layout 校验：大小/GPA/reset vector）
     → 写入 guest 物理内存 [0xffc84000, 0x100000000)
     → vCPU reset vector 0xfffffff0 落在该窗口
     → OVMF SEC → PEI → DXE
-    → DXE 阶段通过 fw_cfg PIO (0x510/0x511) 获取 ACPI 表
+    → （阶段 1 止步于此：SEC marker 经 guest COM1 → guest_console/mux 输出）
+    → DXE 阶段通过 fw_cfg PIO (0x510/0x511) 获取 ACPI 表（阶段 2）
     → FwCfg 设备返回 ACPI blob（RSDP → XSDT → FADT/MADT/MCFG/DSDT）
     → OVMF 解析 ACPI 表，发现 LAPIC/IOAPIC/PCI 总线
 ```
@@ -321,7 +350,7 @@ DeviceRuntime::dispatch()
 
 4. **中断状态按 VM 所有，不引入全局状态**。i8259 PIC、MSI/MSI-X 路由均通过 `X86InterruptDomainKey` 和 `VmInterruptSender` 注入，不恢复旧式按 VM ID 查全局 forwarding state 的轮询模式。
 
-5. **Guest COM1 作为阶段判定的可信数据源**。成功判定始终来自目标 VM 的 Guest COM1 输出（VM-qualified marker），不依赖宿主日志混合匹配。每个 OVMF 阶段 marker 的首次出现即为该阶段的进入证据。
+5. **Guest COM1 作为阶段判定的可信数据源**。成功判定始终来自目标 VM 的 Guest COM1 输出（VM-qualified marker），不依赖宿主日志混合匹配。每个 OVMF 阶段 marker 的首次出现即为该阶段的进入证据。阶段 1 中 COM1 已由 machine profile 提供，直接以测试 success_regex 匹配 guest 输出，不新增串口截获代码。
 
 6. **每个阶段不能"跳跃"**。如果 SEC marker 出现但 PEI marker 缺失，不能说"PEI 大概过了"。Trace 中的第一个未支持访问是下一阶段的优先级输入，不伪造返回值来模拟通过。
 
@@ -331,31 +360,34 @@ DeviceRuntime::dispatch()
 
 ## 7. 实现路径
 
-### 阶段 1：诊断基础 — 固件入口验证
+### 阶段 1：诊断基础 — 固件入口验证（本阶段实现范围）
 
 **目标**：建立可复现、可归因的诊断链，让每次 UEFI 启动都能确定 OVMF 走到了哪一步。
 
 **为什么是第一步**：后续 ACPI、PCI、virtio 等设备实现时，需要精确知道"OVMF 接下来访问了什么"，而不是靠猜。
 
+**范围界定**：本阶段**不实现**完整 UEFI 启动（fw_cfg/ACPI/PCI/virtio 属阶段 2-5），只建立"固定 OVMF 资产 + 固件装载校验 + SEC 到达判定"的最小闭环。COM1 已由 machine profile 提供，SEC 判定直接以 guest COM1 输出为准。
+
 **工作项**：
 
 1. **固定 OVMF profile**：选定 `edk2-stable202605`、`OvmfPkg/OvmfPkgX64.dsc`、DEBUG、GCC、4MB FD、`DEBUG_ON_SERIAL_PORT`、`BUILD_SHELL=TRUE`。记录 CODE 布局（`0xffc84000-0xffffffff`）和 SHA-256，不扫描发行版 `/usr/share/OVMF`。
 
-2. **Guest COM1 阶段 observer**：在 COM1 字节流中识别 OVMF 阶段标记（`SecCoreStartupWithStack(` → `Platform PEIM Loaded` → `DXE IPL Entry` → `[BdsDxe]`）。输出带 VM ID 前缀，不与其他 VM 混淆。标记匹配基于 `edk2-stable202605` DEBUG 构建的已知输出格式。observer 通过 `ArchOps::before_first_run` 激活，`on_last_vcpu_exit` 清理。
+2. **OVMF 资产校验（axbuild）**：新增私有类型 `OvmfManifest`/`VerifiedOvmfBundle` 等（serde/TOML + `deny_unknown_fields`）。校验 CODE/VARS 大小、SHA-256、拼接关系、profile、GPA。未验证的本地固件必须显式 opt-in 并打印哈希（用 `FirmwareSource` 枚举区分固定资产与未验证固件，避免布尔参数扩散）。替代旧 `ovmf-profile.sh` 脚本——脚本不恢复，校验职责迁入 Rust 编排层。
 
-3. **设备访问 trace**：在 `DeviceRuntime` 的统一访问路径上记录 `device=<name> bus=PIO|MMIO direction=read|write addr=<addr> width=<width> value=<value> result=<ok|error>`。对未注册资源返回 `DeviceError::NotFound`，不伪造返回值。覆盖 `dispatch()` 和 `handle_mmio_write_with_memory()` 两条路径。
+3. **x86 loader layout 校验（axvm）**：在 `arch/x86_64/boot/mod.rs:259` 的 `load_uefi_from_configured_path`（及内存镜像路径）上增加小型私有校验：CODE 大小 `0x37c000`、GPA `0xffc84000`、reset vector `0xfffffff0`；multiboot/direct boot 路径保持不变。成功日志打印 profile、路径、大小、GPA、reset vector。
 
-4. **固件装载日志**：记录 profile 名、文件路径、SHA-256、大小、GPA 范围、reset vector。
+4. **设备访问 trace（axdevice）**：在 `DeviceRuntime` 的统一访问路径（`axdevice/src/device.rs:1149` `dispatch()`，含 `handle_mmio_write_with_memory`）上记录 `device=<name> bus=PIO|MMIO direction=read|write addr=<addr> width=<width> value=<value> result=<ok|error>`。对未注册资源返回 `DeviceError::NotFound`，不伪造返回值。按 `axdevice_base` 的 `Device`/`BusAccess` 新 API 实现（`Device::name/resources/access`，`BusAccess` 含 `kind/addr/width/is_read/data`），不搬用旧 P0 在 device.rs 的 trace 实现。
 
-5. **ovmf-entry 测试用例**：新增 `test-suit/axvisor/uefi/ovmf-entry/`，成功判定仅为 VM-qualified SEC marker。初始为 non-gating diagnostic。
+5. **ovmf-entry 测试用例**：新增 `test-suit/axvisor/uefi/ovmf-entry/`，接入现有测试编排（`scripts/axbuild/src/axvisor/test/` 的 discovery/qemu 机制）。VMX/SVM 使用同一个 backend-neutral build 配置，分别用对应 QEMU/KVM 参数。success_regex 直接匹配 guest COM1 输出 `SecCoreStartupWithStack\(`。初始为 non-gating diagnostic。
 
 **退出条件**：
 
 | 条件 | 可观察证据 |
 |------|-----------|
-| 固定 OVMF 在 VMX 后端进入 SEC | Guest COM1 输出 `VM[1] guest COM1 reached OVMF SEC: SecCoreStartupWithStack(` |
+| 固定 OVMF 在 VMX/SVM 后端进入 SEC | Guest COM1 输出 `SecCoreStartupWithStack(`，测试 success_regex 命中 |
 | Trace 记录首个未支持的平台访问 | CI 日志中可定位到具体的 `device= bus= addr=` 行 |
-| ovmf-entry 测试可运行 | `cargo xtask test axvisor --test uefi/ovmf-entry` 执行并报告结果 |
+| 固件装载日志完整 | 日志含 profile、路径、SHA-256、大小、GPA、reset vector |
+| ovmf-entry 测试可运行 | `cargo xtask axvisor test qemu --arch x86_64 --test-group uefi --test-case ovmf-entry-svm`（及 `--test-case ovmf-entry-vmx`）执行并报告结果 |
 
 ### 阶段 2：平台发现 — fw_cfg 与 ACPI
 
@@ -386,7 +418,7 @@ DeviceRuntime::dispatch()
 |------|-----------|
 | OVMF DXE 阶段加载 ACPI 表 | Trace 中可见 `fw_cfg` 设备和 `FW_CFG_ACPI_TABLES`/`FW_CFG_ACPI_RSDP` selector 的 DMA 读操作，且返回的 blob 不含全零填充 |
 | OVMF 推进到 BDS | Guest COM1 输出 `VM[1] guest COM1: [BdsDxe]` |
-| ACPI 表的 MCFG 和 MADT 被解析 | OVMF 日志出现 `MCFG base=0x20000000` 或 PCI 枚举相关消息（阶段 1 observer 扩展） |
+| ACPI 表的 MCFG 和 MADT 被解析 | OVMF 日志出现 `MCFG base=0x20000000` 或 PCI 枚举相关消息（阶段 1 设备访问 trace 扩展） |
 
 ### 阶段 3：PCI 与启动盘 — virtio-pci
 
@@ -408,7 +440,7 @@ DeviceRuntime::dispatch()
 |------|-----------|
 | OVMF 枚举到 virtio-blk | Guest COM1 或 trace 中出现 `VirtioBlk` 或 `0x1AF4/0x1042` 的 PCI config 读 |
 | OVMF 能读 ESP 文件 | Guest COM1 出现 UEFI Shell 提示符或 EFI 应用加载消息 |
-| NimbOS UEFI 启动到 guest 自身标记 | NimbOS 输出 `usertests passed!`（不再是宿主 `VM[1] boot success`） |
+| Linux EFI 启动到 guest 自身标记 | Linux guest 输出 kernel banner（不再是宿主侧 `VM[1] boot success`） |
 
 ### 阶段 4：中断完善
 
@@ -449,7 +481,7 @@ DeviceRuntime::dispatch()
 
 4. **公共部分抽取**：识别 `fw_cfg` 管线、ACPI blob 组装、QEMU loader 协议的两架构共用部分，抽取到 `axdevice/` 公共层。LoongArch 保留 FDT 路径。
 
-5. **CI 门禁**：ovmf-entry 和 NimbOS UEFI 从 non-gating 升级为 gating，补全 `.github/workflows/ci.yml` 中注释的 x86 UEFI job。
+5. **CI 门禁**：ovmf-entry 和 Linux UEFI 用例从 non-gating 升级为 gating，在 `.github/workflows/ci.yml` 中新增 x86 UEFI gating job（现有 `ci.yml:705-743` 仅为 axloader 的 UEFI smoke，下载发行版 OVMF）。
 
 **退出条件**：Linux 启动到 initramfs；HPET/RTC UEFI 可用；x86 UEFI CI gating。
 
@@ -469,6 +501,8 @@ DeviceRuntime::dispatch()
 | 4 | `Pic` struct + `Device` impl | `axdevice` | i8259 PIC 设备 |
 | 4 | `MsiRouter` struct（arch private） | `axvm` | MSI/MSI-X 地址拦截与路由 |
 
+> 阶段 1 不新增公共接口：axbuild 校验类型（`OvmfManifest`/`VerifiedOvmfBundle`/`FirmwareSource`）为私有实现，x86 loader 的 layout 校验为 `arch/x86_64/boot/mod.rs` 内的私有函数，trace 仅改 `axdevice` 内部日志路径。
+
 **接口设计原则**：
 
 - 所有新设备通过现有 `DeviceFactory` trait 注册，不新增 trait 方法；
@@ -484,15 +518,16 @@ DeviceRuntime::dispatch()
 
 | 功能声明 | 验证层级 | 命令/用例 | 可观察通过条件 | 阶段 |
 |----------|---------|-----------|---------------|------|
-| OVMF 固定 profile 进入 SEC | QEMU VMX/SVM | `cargo xtask test axvisor --test uefi/ovmf-entry-vmx` (同理 SVM) | Guest COM1 输出 VM-qualified `SecCoreStartupWithStack(` | 1 |
+| OVMF 固定 profile 进入 SEC | QEMU VMX/SVM | `cargo xtask axvisor test qemu --arch x86_64 --test-group uefi --test-case ovmf-entry-vmx`（同理 SVM） | Guest COM1 输出 `SecCoreStartupWithStack(`，success_regex 命中 | 1 |
+| OVMF 资产校验（manifest/哈希/大小/拼接） | host 单元测试 | `cargo xtask clippy --package axbuild`（含 `cargo test -p axbuild`） | 错误哈希/大小/base/未知字段/重复字段均被拒绝；未验证固件缺 opt-in 时拒绝 | 1 |
+| x86 loader layout 校验 | host 单元测试 | axvm 单测 | 错误 CODE 大小/GPA/entry point 被拒绝（真实 API 调用，非源码文本断言） | 1 |
 | 设备 trace 记录未支持访问 | 同上 | 同上 | CI 日志含 `device= bus= addr=` trace 行，首个 `result=NotFound` 后至少有一个后续 trace 行 | 1 |
 | OVMF 通过 fw_cfg 获取 ACPI 表 | QEMU VMX | ovmf-entry 测试（扩展） | trace 含 `fw_cfg DMA read selector=0x23`（ACPI_TABLES），返回非零长度 | 2 |
 | OVMF 进入 BDS | QEMU VMX | ovmf-entry 测试 | Guest COM1 输出 `[BdsDxe]` | 2 |
-| OVMF PCI 枚举发现 virtio-blk | QEMU VMX | NimbOS UEFI 测试 | trace 含 `pci` device 的 config read，VendorID=0x1AF4 | 3 |
-| NimbOS UEFI 完整启动 | QEMU VMX | `cargo xtask test axvisor --test uefi/qemu-nimbos` | NimbOS 输出 `usertests passed!` | 3 |
-| virtio-blk MSI 中断投递 | QEMU VMX | NimbOS UEFI + trace | `inject_interrupt` 日志含 virtio-blk MSI vector | 4 |
-| SMP UEFI 启动 | QEMU VMX | 新增 `uefi/qemu-nimbos-smp2` | `usertests passed!`，且至少 2 个 vCPU 的 COM1 有活跃输出 | 4 |
-| Linux EFI stub 启动 | QEMU VMX | 新增 `uefi/qemu-linux-efi` | Guest COM1 输出 Linux kernel banner + initramfs shell prompt | 5 |
+| OVMF PCI 枚举发现 virtio-blk | QEMU VMX | Linux UEFI 测试 | trace 含 `pci` device 的 config read，VendorID=0x1AF4 | 3 |
+| Linux EFI stub 启动 | QEMU VMX | `cargo xtask axvisor test qemu --arch x86_64 --test-group uefi --test-case linux-uefi` | Guest COM1 输出 Linux kernel banner + initramfs shell prompt | 3/5 |
+| virtio-blk MSI 中断投递 | QEMU VMX | Linux UEFI + trace | `inject_interrupt` 日志含 virtio-blk MSI vector | 4 |
+| SMP UEFI 启动 | QEMU VMX | 新增 `linux-uefi-smp2` 用例 | Linux 启动，且至少 2 个 vCPU 的 COM1 有活跃输出 | 4 |
 | 重复 VM reset 无中断泄漏 | QEMU VMX | 新增压力测试：连续 reset 5 次 | 每次 reset 后的首次 MSI 延迟与前次无统计显著差异 | 4 |
 | 回归：BIOS/multiboot 不受影响 | QEMU VMX | 现有 direct VMX/SVM smoke | 与 dev 基线一致 | 1-5 |
 
@@ -502,7 +537,7 @@ DeviceRuntime::dispatch()
 
 - ovmf-entry：若 OVMF CODE 映射错误或 reset vector 未命中，Guest COM1 将无 SEC marker 输出，测试超时；
 - ACPI 表缺失：OVMF DXE 阶段无法完成平台发现，不会输出 `[BdsDxe]` 或 `[BdsDxe]` 后立即挂起，测试超时；
-- virtio-blk 缺失：OVMF BDS 无法找到 boot option，UEFI Shell 无输出或 NimbOS 不启动；
+- virtio-blk 缺失：OVMF BDS 无法找到 boot option，UEFI Shell 无输出或 Linux EFI 应用不启动；
 - 中断缺失：virtio-blk IO 请求完成后 guest 永远收不到中断，测试超时。
 
 ---
@@ -511,7 +546,7 @@ DeviceRuntime::dispatch()
 
 ```mermaid
 graph TD
-    P1[阶段1: 诊断基础] --> P2[阶段2: fw_cfg + ACPI]
+    P1[阶段1: 诊断基础（本次实现）] --> P2[阶段2: fw_cfg + ACPI]
     P2 --> P3[阶段3: PCI + virtio-blk]
     P3 --> P4[阶段4: 中断完善]
     P2 --> P4
@@ -521,7 +556,7 @@ graph TD
 
 **数据依赖**：
 
-- 阶段 2 依赖阶段 1 的 trace 输出确定 fw_cfg/ACPI 相关访问；
+- 阶段 2 依赖阶段 1 的 trace 输出确定 fw_cfg/ACPI 相关访问（阶段 1 已交付 trace 基础设施）；
 - 阶段 3 依赖阶段 2 的 MCFG/DSDT PCI0 声明（ECAM base、_PRT）；
 - 阶段 4 MSI/MSI-X 依赖阶段 3 的 virtio-pci capability 结构和 PCI BAR 布局；
 - 阶段 4 PIC 不依赖阶段 3，可在阶段 2 后并行开始；
@@ -534,6 +569,8 @@ graph TD
 | 风险 | 可能性 | 影响 | 缓解 |
 |------|:---:|------|------|
 | 固定 OVMF 在 AxVisor 上无法进入 SEC | 低 | 阻塞阶段 1 | 先用标准 QEMU q35 验证同一固件可完成 SEC→BDS，排除固件自身问题；若 QEMU 通过而 AxVisor 不通过，是 vCPU/NPT 问题 |
+| OVMF 资产（tgosimages bundle）不可达 | 低 | 阻塞阶段 1 的测试 | 校验与下载分离：资产校验逻辑先行落地；下载失败时明确报错，不静默 fallback 到发行版 OVMF |
+| test-suit 新分组（`test-suit/axvisor/uefi/`）未被 discovery 发现 | 中 | 阻塞阶段 1 用例 | 先跑通一个最小用例确认发现机制（`scripts/axbuild/src/axvisor/test/`），再补 VMX/SVM 参数 |
 | MSI 写触发 panic（`ApicRegOffset::from(0)` 无对应 arm） | 高 | 阻塞阶段 3+ | 阶段 2 先加 offset 0 显式处理（返回 0 + trace），避免 PCI 枚举时的意外 panic |
 | vLAPIC SIPI 跨 vCPU 同步问题 | 中 | 阻塞阶段 4 SMP | 利用已有 `VmInterruptSender` 和 vCPU 消息队列，避免引入新同步原语；单 vCPU 场景不受影响 |
 | OVMF 依赖 VARS store 查找 boot option | 中 | 可能阻塞阶段 3 UEFI Shell 入口 | OVMF 在 shell 编译开关开启时，即使无 VARS 也会进入 shell；若标准构建不进入 shell，可通过 fw_cfg 传递 `bootorder` 文件引导特定条目 |
@@ -546,11 +583,11 @@ graph TD
 
 - **启用**：通过 VM 配置中 `boot_protocol = "uefi"` opt-in，不影响默认 BIOS/multiboot 路径；
 - **禁用**：将 `boot_protocol` 改回 `"multiboot"` 或 `"direct"`，无需重新编译 AxVisor；
-- **确认功能在使用**：Guest COM1 trace 中出现 VM-qualified marker、loader 日志中的 `boot_protocol=uefi` 行；
+- **确认功能在使用**：Guest COM1 输出 SEC marker、loader 日志中的 `boot_protocol=uefi` 行与固件装载信息（profile、路径、SHA-256、大小、GPA、reset vector）；
 - **回滚**：UEFI 路径完全 opt-in，回滚只影响特定 VM 配置，不影响其他 VM 或 AxVisor 自身运行；
 - **可观测信号**：Guest COM1 阶段 marker（SEC/PEI/DXE/BDS/OS）、device access trace、fw_cfg DMA log、MSI 拦截 log；
 - **回滚触发条件**：OVMF 无法进入 SEC、PCI 枚举失败导致 BDS 超时、中断风暴；
-- **外部固件依赖不可用**：若 tgosimages 上的 OVMF bundle 不可达，setup 脚本报告明确错误，不静默 fallback 到发行版 OVMF。
+- **外部固件依赖不可用**：若 tgosimages 上的 OVMF bundle 不可达，xtask/axbuild 报告明确错误，不静默 fallback 到发行版 OVMF。
 
 ---
 
@@ -558,7 +595,7 @@ graph TD
 
 | 阶段 | 新增 | 修改 |
 |------|------|------|
-| 1 | `test-suit/axvisor/uefi/ovmf-entry/`、OVMF profile 管理脚本 | `arch/x86_64/boot/mod.rs`、`arch/x86_64/mod.rs`、`axdevice/src/device.rs`、`.github/workflows/ci.yml` |
+| 1 | `test-suit/axvisor/uefi/ovmf-entry/`（build + qemu 配置）；axbuild 私有校验类型（`OvmfManifest`/`VerifiedOvmfBundle`/`FirmwareSource`） | `arch/x86_64/boot/mod.rs`（layout 校验挂点）、`axdevice/src/device.rs`（trace 按 `axdevice_base` 新 API）、`scripts/axbuild/src/axvisor/test/`（用例接入）、`.github/workflows/ci.yml`（non-gating job） |
 | 2 | `arch/x86_64/boot/acpi.rs`、`arch/x86_64/boot/acpi/dsdt.rs` | `arch/x86_64/boot/mod.rs`、`arch/x86_64/mod.rs`、`axdevice/src/fw_cfg.rs`（PIO adapter） |
 | 3 | `axdevice/src/pci/mod.rs`、`axdevice/src/pci/ecam.rs`、`axdevice/src/virtio/pci.rs`、`axdevice/src/virtio/blk.rs` | `arch/x86_64/boot/acpi/`（DSDT 更新）、VM 配置 toml |
 | 4 | `axdevice/src/x86/pic.rs`、`arch/x86_64/msi.rs` | `x86_vlapic/src/vlapic.rs`、`x86_vcpu/`（EPT MSI range）、`arch/x86_64/irq.rs` |
