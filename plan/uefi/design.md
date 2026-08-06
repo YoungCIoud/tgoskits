@@ -3,7 +3,7 @@
 > 基线：`dev` 分支当前 HEAD（`4ade9d191`，2026-08-05 复核）。
 > 风险等级：**高风险功能**（涉及硬件协议、MMIO/DMA/IRQ、页表、启动/虚拟化契约、跨 vCPU 并发、新 crate 边界和公共 API）。
 > 本文为独立可评审的设计材料，按 `book/guideline/feature-development.md` 高风险功能要求编写。
-> 历史说明：本设计最初编写于 `dev@47c044f7d`，2026-08-04 按最新 dev 复核并同步；2026-08-05 按 `4ade9d191` 复核阶段 2 章节并同步（修正 fw_cfg PIO 接入方式、MADT override 条目、阶段 2 退出条件格式，并按 `virtualization/` 前缀统一 dev 代码路径引用）。当前执行范围为**阶段 1（SEC 到达验证）**，阶段 2-5 保留为后续路线图，不在本次实现范围内。
+> 历史说明：本设计最初编写于 `dev@47c044f7d`，2026-08-04 按最新 dev 复核并同步；2026-08-05 按 `4ade9d191` 复核阶段 2 章节并同步（修正 fw_cfg PIO 接入方式、MADT override 条目、阶段 2 退出条件格式，并按 `virtualization/` 前缀统一 dev 代码路径引用）；2026-08-06 按阶段 2 实现基线 `feat/uefi-p2`（自阶段 1 头 `67c5d605a` 创建）复核阶段 2 章节并同步（新增 PIO memory-aware 写路径与 `exit.rs` 接线点、`etc/e820` 文件生成与固件窗口 reserved 约束、`ram_regions` 从 VM 实际内存推导并排除固件窗口、ovmf-entry 低端 RAM 提升至 256M、os/axvisor 侧 fw_cfg 设备接入与 payload 工厂注册接线，并将阶段 1/2 章节代码行号与 trace result 表述统一到实现基线）。当前执行范围为**阶段 1（SEC 到达验证）**，阶段 2-5 保留为后续路线图，不在本次实现范围内。
 
 ## 1. 目标
 
@@ -88,7 +88,7 @@ cargo xtask axvisor test qemu --arch x86_64 --test-group uefi --test-case linux-
 | `x86_vcpu` 的 VMX/SVM backend、EPT/NPT、reset vector | `0xfffffff0` → CS:F000/IP:FFF0 已正确映射 | 复用现有 vCPU 入口 |
 | `virtualization/axvm/src/arch/x86_64/boot/mptable.rs` | 已有 SMP MP 表生成（LAPIC + IOAPIC + PCI INTx routing） | ACPI 表是 MP 表的替代/升级，INTx 路由值可复用 |
 | `virtualization/axvm/src/arch/x86_64/irq.rs` | host IRQ forwarding 框架（GSI lease、mask/re-arm、drain-before-run）已就绪 | 复用 `X86InterruptDomain`，新增 PIC/MSI 路由 |
-| `virtualization/axvm/src/arch/loongarch64/boot/acpi.rs`（878 行） | 完整 ACPI 表生成（RSDP/RSDT/FADT/MADT/SRAT/SPCR/MCFG + DSDT AML + QEMU loader），入口 `build()`（`acpi.rs:133-141`）返回 `FwCfgAcpiBlobs`，经 `fw_cfg_platform_config` 注入 `FwCfgPlatformConfig`（`boot/mod.rs:283`，位于 `add_uefi_fw_cfg` 的 vm setup/loader 阶段，顶层函数 `boot/mod.rs:183`） | 作为 x86 实现的**参考模板**，但表内容（MADT entry 类型、DSDT AML 设备树）为 arch-specific，不能直接复用；x86 写独立的 `build_x86_acpi()` 入口 |
+| `virtualization/axvm/src/arch/loongarch64/boot/acpi.rs`（878 行） | 完整 ACPI 表生成（RSDP/RSDT/FADT/MADT/SRAT/SPCR/MCFG + DSDT AML + QEMU loader），入口 `build()`（`virtualization/axvm/src/arch/loongarch64/boot/acpi.rs:133`）返回 `FwCfgAcpiBlobs`，经 `fw_cfg_platform_config` 注入 `FwCfgPlatformConfig`（`virtualization/axvm/src/arch/loongarch64/boot/mod.rs:283`，位于 `add_uefi_fw_cfg` 的 vm setup/loader 阶段，顶层函数 `virtualization/axvm/src/arch/loongarch64/boot/mod.rs:183`） | 作为 x86 实现的**参考模板**，但表内容（MADT entry 类型、DSDT AML 设备树）为 arch-specific，不能直接复用；x86 写独立的 `build_x86_acpi()` 入口 |
 | `virtualization/axvm/src/arch/loongarch64/boot/` 的 `GuestPlatform`、`probe.rs`、`fdt/` | 完整的平台发现→ACPI 构建→fw_cfg 注入→FDT 生成链路 | 整体架构可借鉴，x86 不需要 FDT 分支 |
 | `os/axvisor/configs/vms/qemu/x86_64/arceos-uefi-smp1.toml` | 现存 UEFI guest 配置（`guest_type = "passthrough"`、`boot_protocol = "uefi"`、`uefi_firmware_path`、`bios_load_addr`，机器设备由 machine profile 提供） | 阶段 1 复用该配置模型，新建专用 ovmf-entry 配置 |
 | `uefi/p0` 分支（`941134916`） | 旧 P0 实现（固定 OVMF profile、SEC observer、trace），涉及 24 文件 +1707/-193 | 功能意图可参考，但基线过旧：COM1 已 machine-owned、配置模型已改、脚本/NimbOS 用例已删除。不直接复用代码，按 `solve_conflict.md` 重做 |
@@ -149,7 +149,7 @@ cargo xtask axvisor test qemu --arch x86_64 --test-group uefi --test-case linux-
 **启动配置模型**
 - `VMBootProtocol::Uefi` 枚举，TOML 解析 `boot_protocol = "uefi"`（`virtualization/axvmconfig/src/lib.rs`）
 - `uefi_firmware_path` / `bios_load_addr` 配置字段，arch 校验矩阵
-- `load_uefi_from_configured_path()` 从文件系统加载固件（`virtualization/axvm/src/arch/x86_64/boot/mod.rs:259`，含大小查询与 layout 校验挂点）
+- `load_uefi_from_configured_path()` 从文件系统加载固件（`virtualization/axvm/src/arch/x86_64/boot/mod.rs:270`，含大小查询与 layout 校验挂点）
 - x86 vCPU reset vector `0xfffffff0` → `CS:F000, IP:FFF0` 正确映射（`virtualization/x86_vcpu/src/lib.rs`）
 
 **machine-owned 串口**
@@ -374,9 +374,9 @@ DeviceRuntime::dispatch()
 
 2. **OVMF 资产校验（axbuild）**：新增私有类型 `OvmfManifest`/`VerifiedOvmfBundle` 等（serde/TOML + `deny_unknown_fields`）。校验 CODE/VARS 大小、SHA-256、拼接关系、profile、GPA。未验证的本地固件必须显式 opt-in 并打印哈希（用 `FirmwareSource` 枚举区分固定资产与未验证固件，避免布尔参数扩散）。替代旧 `ovmf-profile.sh` 脚本——脚本不恢复，校验职责迁入 Rust 编排层。
 
-3. **x86 loader layout 校验（axvm）**：在 `virtualization/axvm/src/arch/x86_64/boot/mod.rs:259` 的 `load_uefi_from_configured_path`（及内存镜像路径）上增加小型私有校验：CODE 大小 `0x37c000`、GPA `0xffc84000`、reset vector `0xfffffff0`；multiboot/direct boot 路径保持不变。成功日志打印 profile、路径、大小、GPA、reset vector。
+3. **x86 loader layout 校验（axvm）**：在 `virtualization/axvm/src/arch/x86_64/boot/mod.rs:270` 的 `load_uefi_from_configured_path`（及内存镜像路径）上增加小型私有校验：CODE 大小 `0x37c000`、GPA `0xffc84000`、reset vector `0xfffffff0`；multiboot/direct boot 路径保持不变。成功日志打印 profile、路径、大小、GPA、reset vector。
 
-4. **设备访问 trace（axdevice）**：在 `DeviceRuntime` 的统一访问路径（`virtualization/axdevice/src/device.rs:1149` `dispatch()`，含 `virtualization/axdevice/src/device.rs:956` `handle_mmio_write_with_memory`）上记录 `device=<name> bus=PIO|MMIO direction=read|write addr=<addr> width=<width> value=<value> result=<ok|error>`。对未注册资源返回 `DeviceError::NotFound`，不伪造返回值。按 `axdevice_base` 的 `Device`/`BusAccess` 新 API 实现（`Device::name/resources/access`，`BusAccess` 含 `kind/addr/width/is_read/data`），不搬用旧 P0 在 device.rs 的 trace 实现。
+4. **设备访问 trace（axdevice）**：在 `DeviceRuntime` 的统一访问路径（`virtualization/axdevice/src/device.rs:1205` `dispatch()`，含 `virtualization/axdevice/src/device.rs:1010` `handle_mmio_write_with_memory`）上记录 `device=<name> bus=PIO|MMIO direction=read|write addr=<addr> width=<width> value=<value> result=<ok|error>`。对未注册资源返回 `DeviceError::NotFound`，不伪造返回值。按 `axdevice_base` 的 `Device`/`BusAccess` 新 API 实现（`Device::name/resources/access`，`BusAccess` 含 `kind/addr/width/is_read/data`），不搬用旧 P0 在 device.rs 的 trace 实现。
 
 5. **ovmf-entry 测试用例**：新增 `test-suit/axvisor/uefi/ovmf-entry/`，接入现有测试编排（`scripts/axbuild/src/axvisor/test/` 的 discovery/qemu 机制）。VMX/SVM 使用同一个 backend-neutral build 配置，分别用对应 QEMU/KVM 参数。success_regex 直接匹配 guest COM1 输出 `SecCoreStartupWithStack\(`。初始为 non-gating diagnostic。
 
@@ -395,9 +395,14 @@ DeviceRuntime::dispatch()
 
 **工作项**：
 
-1. **x86 fw_cfg PIO 接入**：q35 标准 fw_cfg 在 PIO `0x510`（selector）、`0x511`（data word）、`0x514`（DMA address，8 字节 big-endian）。dev 的 `FwCfgDmaDevice::access` 只接受 `BusKind::Mmio`（非 MMIO 返回 `OutOfRange`），`FwCfgBuildConfig.base` 为 MMIO 语义的 `GuestPhysAddr`，因此按 §6 决策 2 扩展 `FwCfg` 核心支持 Port transport（selector/data/DMA 偏移映射到 PIO `0x510`/`0x511`/`0x514`，注册为 `BusKind::Port` 设备，x86 私有配置提供 PIO 端口基址），或新增 Port 变体设备；LoongArch 保持 MMIO（`0x1e02_0000`，`virtualization/axvm/src/machine.rs:471`）不变，不可照搬其基址语义。
+1. **x86 fw_cfg PIO 接入**：q35 标准 fw_cfg 在 PIO `0x510`（selector）、`0x511`（data word）、`0x514`（DMA address，8 字节 big-endian）。dev 的 `FwCfgDmaDevice::access` 只接受 `BusKind::Mmio`（非 MMIO 返回 `OutOfRange`），`FwCfgBuildConfig.base` 为 MMIO 语义的 `GuestPhysAddr`，因此按 §6 决策 2 扩展 `FwCfg` 核心支持 Port transport（selector/data/DMA 偏移映射到 PIO `0x510`/`0x511`/`0x514`，注册为 `BusKind::Port` 设备，x86 私有配置提供 PIO 端口基址），或新增 Port 变体设备；LoongArch 保持 MMIO（`0x1e02_0000`，`virtualization/axvm/src/machine.rs:471`）不变，不可照搬其基址语义。实现时须补齐以下接线点（每条一行，不展开为方案）：
 
-2. **x86 ACPI 表生成**：新建 `virtualization/axvm/src/arch/x86_64/boot/acpi.rs`，以 LoongArch `boot/acpi.rs` 为模板。参照其入口 `build()`（`acpi.rs:133-141`，返回 `FwCfgAcpiBlobs`，经 `fw_cfg_platform_config` 注入 `FwCfgPlatformConfig`，注入发生在 `add_uefi_fw_cfg` 的 vm setup/loader 阶段，`boot/mod.rs:283`，顶层函数在 `boot/mod.rs:183`），x86 写 `build_x86_acpi()` -> `FwCfgAcpiBlobs`（arch private）。生成表集合：
+   - **PIO DMA 需要 memory-aware 写路径**：`DeviceRuntime::dispatch`（`virtualization/axdevice/src/device.rs:1205`，`impl BusRouter`，其中构造的 `RuntimeDeviceAccess.memory` 恒为 `None`，`device.rs:1229`）无法向 PIO 设备传递 guest 内存；MMIO 侧已有 `mmio_write_needs_guest_memory`（`device.rs:998`）与 `handle_mmio_write_with_memory`（`device.rs:1010`，经 `virtualization/axvm/src/vm/mod.rs:1223-1225` 的 exit 路径传入 `VmDmaAccess`），PIO 侧只有无内存的 `handle_port_read`/`handle_port_write`（`device.rs:1126`/`device.rs:1152`）。fw_cfg DMA 由写 PIO `0x514` 触发，需要 `read_guest_memory`/`write_guest_memory` 访问 DMA 描述符与目标缓冲——必须新增 `port_write_needs_guest_memory` + `handle_port_write_with_memory`（镜像 MMIO 对，按 `DmaGrant` 命中与否选择），并在 `virtualization/axvm/src/arch/x86_64/exit.rs:52-58` 的 `handle_io_write` 中按 DMA grant 命中与否选择 memory-aware 路径，否则 guest-memory 无法传递、DMA 会失败；
+   - **fw_cfg 设备项不能放 x86 machine profile**（`virtualization/axvm/src/machine.rs:335` 的 `x86_64_profile` 只有 serial/ioapic/pit）：会把 fw_cfg 强加给所有 BIOS guest，且非 UEFI 配置无 factory 时 `build_with_factories` 会报 `Unsupported`（`virtualization/axdevice/src/factory.rs:138-144`）。改为在 `os/axvisor/src/config.rs` 组装 `AxVMConfig` 时按 `boot_protocol == uefi` 追加 fw_cfg PIO 设备项（端口常量由 axvm 导出，不硬编码）；
+   - **payload 工厂注册**：x86 `init_vm` 的 `Default` 与 `Provided` 两路（`virtualization/axvm/src/arch/x86_64/vm.rs:50-57`）需补 `register_boot_payload_factories`（参照 `virtualization/axvm/src/arch/loongarch64/vm.rs:65`）；
+   - **PIO 寄存器布局**：selector `0x510`、data `0x511`、DMA `0x514`（8 字节）；MMIO 布局：data `0x00`、selector `0x08`、DMA `0x10`（现有 `FW_CFG_DATA_OFFSET`/`FW_CFG_SELECTOR_OFFSET`/`FW_CFG_DMA_OFFSET`）。两传输的寄存器偏移不同，核心按 offset-relative + 传输枚举（`Mmio { base, size }` / `Port { base: u16 }`）重构，状态机与 entry 逻辑共用。
+
+2. **x86 ACPI 表生成**：新建 `virtualization/axvm/src/arch/x86_64/boot/acpi.rs`，以 LoongArch `boot/acpi.rs` 为模板。参照其入口 `build()`（`virtualization/axvm/src/arch/loongarch64/boot/acpi.rs:133`，返回 `FwCfgAcpiBlobs`，经 `fw_cfg_platform_config` 注入 `FwCfgPlatformConfig`，注入发生在 `add_uefi_fw_cfg` 的 vm setup/loader 阶段，`virtualization/axvm/src/arch/loongarch64/boot/mod.rs:283`，顶层函数在 `virtualization/axvm/src/arch/loongarch64/boot/mod.rs:183`），x86 写 `build_x86_acpi()` -> `FwCfgAcpiBlobs`（arch private）。生成表集合：
 
    | 表 | 关键字段 |
    |---|---------|
@@ -410,13 +415,18 @@ DeviceRuntime::dispatch()
 
    所有表通过 QEMU table-loader 协议注册到 fw_cfg（`etc/acpi/tables`、`etc/acpi/rsdp`、`etc/table-loader`），checksum 正确计算。
 
-3. **DSDT AML**：参考 `build_loongarch_dsdt_aml` 的 `aml_device("PCI0", ...)` 模式（`acpi.rs:502-519`，`aml_device("PCI0", ...)` 在 `acpi.rs:508`），x86 DSDT 声明 PCI0（`_HID` PNP0A08、`_CRS`、`_PRT`、`_CBA`）与 COM1（`_HID` PNP0501、`_CRS`）。PCI0 INTx 路由表按 q35 标准：PIRQA→GSI16, PIRQB→GSI17, PIRQC→GSI18, PIRQD→GSI19。PCI0 `_CRS` 含 bus number resource（0-255）、IO resource（`0x6000-0xffff`）、32-bit MMIO resource（`0x80000000-0xbfffffff`）。
+   **etc/e820 文件生成**：x86 OVMF 的 PlatformPei/MemDetect.c（`QemuInitializeRam`）通过 fw_cfg 文件 `etc/e820` 探测 guest 内存映射，缺失时回退到 FW_CFG_RAM_SIZE/CMOS 等保守路径；QEMU 真机（q35）始终提供该文件。`FwCfgPlatformConfig`（`virtualization/axdevice/src/fw_cfg.rs:76`）需新增 e820 数据源，`FwCfg::new` 的 file_dir 列表（`virtualization/axdevice/src/fw_cfg.rs:152-183`）加入 `etc/e820`。关键约束：e820 必须把 `0xffc0_0000-0x1_0000_0000` 固件窗口标记为 reserved（type-2），不能列为 RAM——OVMF 会按 e820 建 HOB 内存映射，把固件窗口当 RAM 就会覆盖自己的 CODE。LoongArch 不提供该文件时不受影响（其 OVMF 走 FDT 路径）。
+
+3. **ram_regions 从 VM 实际内存推导并排除固件窗口**：当前 ovmf-entry.toml 只有 16M 低端 RAM（`0x0-0x100_0000`），OVMF 走到 BDS 明显不足，应提高到 256M 低端 RAM（`0x0-0x1000_0000`）；fw_cfg 的 `memmap` / `FW_CFG_RAM_SIZE` / ACPI 内存描述都必须排除 `0xffc0_0000-0x1_0000_0000` 固件窗口。注意 ovmf-entry.toml 的第二个 memory_regions 就是 `[0xffc0_0000, 0x40_0000]`（VARS + CODE 窗口）；LoongArch 的 `ram_regions` 过滤规则（`virtualization/axvm/src/arch/loongarch64/boot/mod.rs:331-358`，保留 `<0x1000_0000` 与 `>=0x8000_0000`）会把该窗口保留为 RAM，x86 不能照搬，必须按固件窗口显式排除。不能沿用 `FwCfgPlatformConfig::default()`（`virtualization/axdevice/src/fw_cfg.rs:82-101`）的静态假值（LOWMEM `0x0/0x1000_0000` + HIGHMEM `0x8000_0000/0x2400_0000`，`fw_cfg.rs:37-40`）——该默认值与 VM 实际 `memory_regions` 无关，x86 需按 LoongArch 模式（`ram_regions` 推导，`virtualization/axvm/src/arch/loongarch64/boot/mod.rs:331-358`）从 VM 实际内存推导并排除固件窗口。
+
+4. **DSDT AML**：参考 `build_loongarch_dsdt_aml` 的 `aml_device("PCI0", ...)` 模式（`acpi.rs:502-519`，`aml_device("PCI0", ...)` 在 `acpi.rs:508`），x86 DSDT 声明 PCI0（`_HID` PNP0A08、`_CRS`、`_PRT`、`_CBA`）与 COM1（`_HID` PNP0501、`_CRS`）。PCI0 INTx 路由表按 q35 标准：PIRQA→GSI16, PIRQB→GSI17, PIRQC→GSI18, PIRQD→GSI19。PCI0 `_CRS` 含 bus number resource（0-255）、IO resource（`0x6000-0xffff`）、32-bit MMIO resource（`0x80000000-0xbfffffff`）。
 
 **退出条件**：
 
 | 条件 | 可观察证据 |
 |------|-----------|
 | OVMF DXE 阶段加载 ACPI 表 | Trace 中可见 `fw_cfg` 设备和 `FW_CFG_ACPI_TABLES`/`FW_CFG_ACPI_RSDP` selector 的 DMA 读操作，且返回的 blob 不含全零填充 |
+| fw_cfg PIO 与固件窗口正确接入 | Trace 中可见 fw_cfg PIO（`0x510`/`0x511`/`0x514`）读写命中并进入 memory-aware 路径；OVMF PEI 阶段能读到 `etc/e820`（且 `0xffc0_0000-0x1_0000_0000` 为 reserved）与 `etc/memmap`，未把固件窗口当 RAM 覆盖自己的 CODE |
 | OVMF 推进到 BDS | Guest COM1 输出裸 `[BdsDxe]`（`-serial stdio` 原始字节流，无 `VM[1] guest COM1:` 前缀——该格式是旧 P0 observer 的输出，阶段 1 已确认不可用）。测试 success_regex 沿用阶段 1 实际落地的嵌套 VM 锚定思路（`(?s)VCpu\[0\] running\.\.\..*\[BdsDxe\]`，前缀锚定同阶段 1 的 `(?s)VCpu\[0\] running\.\.\..*SecCoreStartupWithStack`：`VCpu[0] running...` 仅嵌套 VM 输出，避免匹配 QEMU 层宿主 OVMF 的同名输出，见 §6 决策 5 与阶段 1 章节） |
 | ACPI 表的 MCFG 和 MADT 被解析 | OVMF 日志出现 `MCFG base=0x20000000` 或 PCI 枚举相关消息（阶段 1 设备访问 trace 扩展）；MADT 含 IRQ0→GSI2 与 IRQ5/9/10/11 override（flags=0xd）时 OVMF/guest 中断语义（SCI=9 等）才与 q35 一致 |
 
@@ -493,8 +503,10 @@ DeviceRuntime::dispatch()
 
 | 阶段 | 新增公共类型 / 接口 | 所属 crate | 说明 |
 |------|-------------------|-----------|------|
-| 2 | `FwCfg` Port transport（扩展核心；或新增 Port 变体设备） | `axdevice` | fw_cfg Port transport 扩展，实现 `Device` trait，注册为 `BusKind::Port` 设备（§6 决策 2，方案 (a)） |
-| 2 | `build_x86_acpi()` free function -> `FwCfgAcpiBlobs` | `axvm` (arch private) | x86 ACPI 表生成入口，参照 LoongArch `acpi::build`（`virtualization/axvm/src/arch/loongarch64/boot/acpi.rs:133-141`），经 `fw_cfg_platform_config` 注入 `FwCfgPlatformConfig` |
+| 2 | `FwCfg` Port transport（扩展核心；或新增 Port 变体设备） | `axdevice` | fw_cfg Port transport 扩展，实现 `Device` trait，注册为 `BusKind::Port` 设备（§6 决策 2，方案 (a)）；按 offset-relative + 传输枚举（`Mmio { base, size }` / `Port { base: u16 }`）重构，selector/data/DMA 状态机与 entry 逻辑两传输共用 |
+| 2 | `port_write_needs_guest_memory` / `handle_port_write_with_memory` | `axdevice`（`DeviceRuntime`，`virtualization/axdevice/src/device.rs`） | PIO 侧 memory-aware 写路径，镜像 MMIO 对（`mmio_write_needs_guest_memory`/`handle_mmio_write_with_memory`，`device.rs:998`/`device.rs:1010`），供 fw_cfg DMA（写 PIO `0x514` 触发）经 `virtualization/axvm/src/arch/x86_64/exit.rs:52-58` 的 `handle_io_write` 传递 guest 内存 |
+| 2 | `FwCfgPlatformConfig` 新增 e820 数据源 | `axdevice`（`virtualization/axdevice/src/fw_cfg.rs:76`） | fw_cfg 文件目录新增 `etc/e820`（OVMF PlatformPei 内存探测），固件窗口 `0xffc0_0000-0x1_0000_0000` 标记为 reserved（type-2）；x86 `ram_regions` 从 VM 实际 memory_regions 推导并排除固件窗口，不沿用 `FwCfgPlatformConfig::default()` 静态假值 |
+| 2 | `build_x86_acpi()` free function -> `FwCfgAcpiBlobs` | `axvm` (arch private) | x86 ACPI 表生成入口，参照 LoongArch `acpi::build`（`virtualization/axvm/src/arch/loongarch64/boot/acpi.rs:133`），经 `fw_cfg_platform_config` 注入 `FwCfgPlatformConfig` |
 | 3 | `PciHostBridge` struct + `Device` impl | `axdevice` | PCI 主桥设备 |
 | 3 | `VirtioPciDevice` struct + `Device` impl | `axdevice` | virtio-pci transport |
 | 3 | `VirtioBlk` struct + `Device` impl | `axdevice` | virtio-blk device type |
@@ -521,8 +533,8 @@ DeviceRuntime::dispatch()
 | OVMF 固定 profile 进入 SEC | QEMU VMX/SVM | `cargo xtask axvisor test qemu --arch x86_64 --test-group uefi --test-case ovmf-entry-vmx`（同理 SVM） | Guest COM1 输出 `SecCoreStartupWithStack(`，success_regex 命中 | 1 |
 | OVMF 资产校验（manifest/哈希/大小/拼接） | host 单元测试 | `cargo xtask clippy --package axbuild`（含 `cargo test -p axbuild`） | 错误哈希/大小/base/未知字段/重复字段均被拒绝；未验证固件缺 opt-in 时拒绝 | 1 |
 | x86 loader layout 校验 | host 单元测试 | axvm 单测 | 错误 CODE 大小/GPA/entry point 被拒绝（真实 API 调用，非源码文本断言） | 1 |
-| 设备 trace 记录未支持访问 | 同上 | 同上 | CI 日志含 `device= bus= addr=` trace 行，首个 `result=NotFound` 后至少有一个后续 trace 行 | 1 |
-| OVMF 通过 fw_cfg 获取 ACPI 表 | QEMU VMX | ovmf-entry 测试（扩展） | trace 含 `fw_cfg DMA read selector=0x23`（ACPI_TABLES），返回非零长度 | 2 |
+| 设备 trace 记录未支持访问 | 同上 | 同上 | CI 日志含 `device= bus= addr=` trace 行，首个 `result=error` 后至少有一个后续 trace 行 | 1 |
+| OVMF 通过 fw_cfg 获取 ACPI 表 | QEMU VMX | ovmf-entry 测试（扩展） | trace 含 `fw_cfg` 设备 PIO `0x514` DMA 读（selector=0x23 对应 ACPI_TABLES），返回非零长度，且 `etc/e820`/`etc/memmap` 命中、`0xffc0_0000-0x1_0000_0000` 为 reserved | 2 |
 | OVMF 进入 BDS | QEMU VMX | ovmf-entry 测试 | Guest COM1 输出 `[BdsDxe]` | 2 |
 | OVMF PCI 枚举发现 virtio-blk | QEMU VMX | Linux UEFI 测试 | trace 含 `pci` device 的 config read，VendorID=0x1AF4 | 3 |
 | Linux EFI stub 启动 | QEMU VMX | `cargo xtask axvisor test qemu --arch x86_64 --test-group uefi --test-case linux-uefi` | Guest COM1 输出 Linux kernel banner + initramfs shell prompt | 3/5 |
@@ -596,7 +608,7 @@ graph TD
 | 阶段 | 新增 | 修改 |
 |------|------|------|
 | 1 | `test-suit/axvisor/uefi/ovmf-entry/`（build + qemu 配置）；axbuild 私有校验类型（`OvmfManifest`/`VerifiedOvmfBundle`/`FirmwareSource`） | `virtualization/axvm/src/arch/x86_64/boot/mod.rs`（layout 校验挂点）、`virtualization/axdevice/src/device.rs`（trace 按 `axdevice_base` 新 API）、`scripts/axbuild/src/axvisor/test/`（用例接入）、`.github/workflows/ci.yml`（non-gating job） |
-| 2 | `virtualization/axvm/src/arch/x86_64/boot/acpi.rs`、`virtualization/axvm/src/arch/x86_64/boot/acpi/dsdt.rs` | `virtualization/axvm/src/arch/x86_64/boot/mod.rs`、`virtualization/axvm/src/arch/x86_64/mod.rs`、`virtualization/axdevice/src/fw_cfg.rs`（Port transport 扩展） |
+| 2 | `virtualization/axvm/src/arch/x86_64/boot/acpi.rs`、`virtualization/axvm/src/arch/x86_64/boot/acpi/dsdt.rs` | `virtualization/axvm/src/arch/x86_64/boot/mod.rs`、`virtualization/axvm/src/arch/x86_64/mod.rs`、`virtualization/axvm/src/arch/x86_64/vm.rs`（`init_vm` 的 `Default`/`Provided` 两路补 `register_boot_payload_factories`）、`virtualization/axvm/src/arch/x86_64/exit.rs`（`handle_io_write` 按 DMA grant 选择 memory-aware 路径）、`virtualization/axdevice/src/fw_cfg.rs`（Port transport 扩展 + `etc/e820` + x86 `ram_regions` 推导）、`virtualization/axdevice/src/device.rs`（`port_write_needs_guest_memory`/`handle_port_write_with_memory`）、`os/axvisor/src/config.rs`（按 `boot_protocol == uefi` 追加 fw_cfg PIO 设备项）、`os/axvisor/configs/vms/qemu/x86_64/ovmf-entry.toml`（低端 RAM 提至 256M） |
 | 3 | `virtualization/axdevice/src/pci/mod.rs`、`virtualization/axdevice/src/pci/ecam.rs`、`virtualization/axdevice/src/virtio/pci.rs`、`virtualization/axdevice/src/virtio/blk.rs` | `virtualization/axvm/src/arch/x86_64/boot/acpi/`（DSDT 更新）、VM 配置 toml |
 | 4 | `virtualization/axdevice/src/x86/pic.rs`、`virtualization/axvm/src/arch/x86_64/msi.rs` | `virtualization/x86_vlapic/src/vlapic.rs`、`virtualization/x86_vcpu/`（EPT MSI range）、`virtualization/axvm/src/arch/x86_64/irq.rs` |
 | 5 | Linux EFI 测试、HPET/RTC 设备 | CI workflow、`virtualization/axdevice/src/x86/hpet.rs`、公共层抽取 |
