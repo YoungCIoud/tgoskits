@@ -213,6 +213,40 @@ dev 现有边界对实现提出的约束（`plan/uefi/design.md` §4、§7）：
   - 方案 C：维持 SEC 锚定 + 转录人工确认（本提交采用的过渡形态）——自动门禁语义停留在阶段 1，不推荐作为最终形态；
 - `--list` 确认 `ovmf-entry-vmx`/`ovmf-entry-svm` 均被发现（本机 AMD/SVM，VMX 用例无法运行，与阶段 1 相同的硬件限制）。
 
+### 5.3.1 手动验证方法（如何自己确认嵌套 OVMF 到 BDS）
+
+默认 SEC 锚定门禁会在嵌套段 `SecCoreStartupWithStack(` 后立即 kill QEMU（约 24s），转录在 DXE 加载早期截断——**默认运行里看不到 `[BdsDxe]` 是预期行为，不是阶段 2 回归**。手动确认 BDS 有两种方式：
+
+**方式 A：临时切换 BDS 锚定跑一次（推荐，直接看到嵌套段完整推进）**
+
+```bash
+# 备份并临时修改 success_regex(Intel 机改 -vmx 变体)
+cp test-suit/axvisor/uefi/ovmf-entry/qemu-x86_64-svm.toml /tmp/svm.toml.bak
+# 把 success_regex 改为:
+#   "(?s)VCpu\\[0\\] running\\.\\.\\..*\\[BdsDxe\\]"
+# 运行(BDS 锚定下必然 300s 超时 FAIL——机制限制,看转录)
+cargo xtask axvisor test qemu --arch x86_64 --test-group uefi \
+  --test-case ovmf-entry-svm \
+  --firmware-bundle-path /home/young/code/tgoskits/tmp/ovmf-bundle 2>&1 | tee /tmp/bds.log
+# 恢复
+cp /tmp/svm.toml.bak test-suit/axvisor/uefi/ovmf-entry/qemu-x86_64-svm.toml
+```
+
+判读：`grep -n "VM\[1\] VCpu\[0\] running" /tmp/bds.log` 找到嵌套段起点，然后只查嵌套段之后的行：
+`QemuFwCfgProbe: Supported 1, DMA 1`（fw_cfg PIO 打通）、`etc/e820 Item:0x26` / `Reserved [0xFFC00000, 0x100000000)`（e820 读取 + 固件窗口 reserved）、`AcpiTableDxe.efi` 加载（ACPI 表消费）、最后 `BdsDxe.efi` 与 `[BdsDxe] Locate Variable Policy protocol - Success`（BDS 到达）。实测行号约 1937（嵌套起点）/ 1973 / 2040 / 2366 / 2654 / 3337；宿主层同名 marker 在 87 / 783 / 1472 行，**只认嵌套段（嵌套起点之后）的输出**。
+
+**方式 B：默认 SEC 锚定跑完后的快速证据检查（不编辑 TOML）**
+
+```bash
+cargo xtask axvisor test qemu --arch x86_64 --test-group uefi \
+  --test-case ovmf-entry-svm \
+  --firmware-bundle-path /home/young/code/tgoskits/tmp/ovmf-bundle 2>&1 | tee /tmp/ovmf-svm.log
+awk '/VM\[1\] VCpu\[0\] running/{f=1} f' /tmp/ovmf-svm.log \
+  | grep -E "QemuFwCfgProbe: Supported 1|etc/e820 Item:0x26|Reserved \[0xFFC00000"
+```
+
+三条全命中 = fw_cfg PIO 可达 + e820 读取 + 固件窗口 reserved（阶段 2 数据通路达成）；BDS 本体用方式 A 确认。方式 A 的超时 FAIL 是 §5.3 记录的机制限制（2048 字节匹配窗口），不是阶段 2 功能失败。
+
 ### 5.4 本分支自检
 
 | 验证项 | 结果 |
