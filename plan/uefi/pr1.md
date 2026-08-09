@@ -1,153 +1,101 @@
-# PR 1：固定上游 OVMF 与嵌套 fw_cfg 诊断
+## 解决的问题
 
-## 1. 元信息
+最新 `dev` 已经具备 x86_64 Axvisor guest 的 OVMF、fw_cfg 和 ACPI 启动路径，并已有 VMX `ovmf-acpi` 用例能够启动 Linux initramfs。但是现有证据还不足以稳定回答以下问题：
 
-- 基线：`dev@343d47f4e`
-- 状态：待实施设计；`feat/uefi-p0-r2` 仅作为方案参考
-- 范围：固定固件资产、loader profile、设备访问诊断和 non-gating VMX/SVM 用例
-- 不包含：BDS 门禁、guest 启动盘、EFI/Linux 启动、SMP
+- 本次运行实际使用了哪一份 Ostool OVMF，最终装入 guest 的 4 MiB 镜像是否可复核；
+- SVM 是否能使用与 VMX 完全相同的 guest 配置到达同一个 guest-side 成功条件；
+- fw_cfg ACPI table-loader 是否生成了完整且顺序正确的 allocate、pointer 和 checksum 命令；
+- `AXVISOR_X86_OVMF_ACPI_PASSED` 究竟证明了哪段启动链路，又有哪些能力仍未覆盖。
 
-## 2. 解决的问题
+本 PR 只补齐当前实现的验证与说明，不新增 guest UEFI 产品 feature，也不延续 #1888 中固定 firmware profile、首次 fw_cfg 访问 marker 或全局设备 trace 的早期诊断方案。
 
-`dev` 已有 x86 fw_cfg/ACPI 和 resolved device graph，但没有一条固定固件、能排除宿主 OVMF 误命中的嵌套 UEFI 诊断。开发者使用不同发行版 OVMF 或只匹配通用 SEC/BDS 串口文本时，结果既不可复现，也无法判断输出来自 QEMU 外层还是 Axvisor 嵌套 guest。
+## 改了什么
 
-阶段 1 PR 计划固定实际运行的上游 RELEASE OVMF，并以 Axvisor 自己的 fw_cfg 设备访问作为嵌套执行证据。
+- 在准备 x86 guest OVMF 镜像时记录实际 Ostool CODE、VARS 和最终 guest image 的路径、字节数及 SHA-256；同时区分 `split CODE/VARS` 与 `monolithic CODE` 布局，并验证最终镜像固定为 4 MiB。
+- 增加 `ovmf-acpi-svm` 用例，与 VMX 用例共用同一个 build config、guest TOML、BusyBox initramfs、OVMF 镜像和成功断言；两者只在外层 QEMU 暴露的 VMX/SVM CPU 能力上不同。
+- 扩充 ACPI table-loader 最低层测试，逐项解码并验证 table/rsdp 分配、FADT/XSDT/RSDP 指针修正以及各 ACPI 表 checksum 命令的文件、偏移、范围、宽度和顺序。
+- 更新 Axvisor 测试文档和 x86 UEFI 调试说明，明确运行命令、证据来源、成功条件以及当前不能据此声明的能力。
 
-## 3. 计划方案
+## 实现逻辑
 
-1. 先执行 `cargo xtask ovmf --arch x86_64`，由 Ostool 获取并校验固定版本的 `code.fd`/`vars.fd`；
-2. axbuild 检查固定尺寸和地址布局，打印实际摘要，不承担下载；
-3. runner 把同一 CODE/VARS 注入 QEMU 外层 pflash，使外层 OVMF 能加载 Axvisor host；
-4. runner 同时把同一 CODE 嵌入生成的 VM 配置，由 Axvisor loader 放入嵌套 guest `0xffc8_4000`；
-5. profile 强制 CODE size `0x37c000` 和 reset vector `0xfffffff0`；
-6. 嵌套 OVMF 访问 Axvisor fw_cfg PIO 时打印一次 `Nested OVMF fw_cfg accessed`；
-7. VMX/SVM case 各自选择宿主 CPU 暴露方式，但 guest 配置保持 backend-neutral。
+### 复用现有强证据
 
-## 4. 建议提交拆分
+`dev` 已有的 `AXVISOR_X86_OVMF_ACPI_PASSED` 来自嵌套 Linux initramfs。只有在 OVMF 完成 kernel handoff、Linux 进入早期用户态，并且 guest 能读取 DSDT、APIC、FACP、SPCR、发现 `ttyS0`、初始化 IOAPIC 且 online CPU 集合为 `0` 时才会输出。
 
-### 提交 1：固件来源与布局检查
+这个判据比“OVMF 首次访问 fw_cfg”更强，因此本 PR 不在产品代码中增加新的诊断 marker，也不改变 loader、fw_cfg、ACPI、PIO/MMIO 或中断运行语义。
 
-在 axbuild 增加类型化固件来源、固定布局检查、摘要输出和单元测试。Ostool 负责下载与固定版本完整性校验；axbuild 不联网。
+### 固件来源保持单一
 
-### 提交 2：固定 loader profile
+OVMF 的版本选择、下载、缓存和完整性校验继续由 Ostool 负责。Axvisor 测试层只组装当前 guest 所需的 4 MiB 镜像，并打印本次实际输入和输出的摘要，不增加第二套 firmware profile、下载器或 manifest。
 
-增加可选 `firmware_profile`，在 x86 loader 中校验 CODE size、GPA 和 reset vector，并补协议矩阵与错误路径测试。
+### VMX/SVM 只验证 backend 差异
 
-### 提交 3：统一设备访问诊断
+两个用例不通过 Cargo feature 选择 VMX 或 SVM。Axvisor 仍根据运行时 CPUID 选择 backend；测试配置只改变外层 QEMU 的 CPU capability，从而保证结果差异可以归因于 VMX/SVM，而不是不同 guest 配置或固件资产。
 
-在既有 `DeviceRuntime` 真实访问路径记录 device、bus、方向、地址、宽度、值和结果，不新增地址旁路，不改变错误语义。
+### 协议错误尽量在最低层暴露
 
-### 提交 4：嵌套 fw_cfg marker
+端到端 OVMF 用例证明完整启动结果；table-loader 单元测试则直接检查固件将要消费的二进制命令布局。这样在后续回归时，可以区分 ACPI loader 生成错误与固件、虚拟化 backend 或 guest OS 运行错误。
 
-在既有 `FwCfgPioDevice` 首次被嵌套 guest 访问时输出一次 Info marker。marker 只证明 fw_cfg 访问，不能命名为 SEC/BDS success。
+## 验证
 
-### 提交 5：VMX/SVM `ovmf-entry` 用例与 runner 接线
-
-增加 backend-neutral VM 配置、两个宿主能力变体、外层 pflash 注入和嵌套 CODE 嵌入。用例放入 `uefi` 组并保持 non-gating。
-
-### 提交 6：文档同步
-
-记录固件准备、两层 OVMF、`uefi = false`、profile 和 marker 的严格语义。
-
-## 5. 公共与配置表面
-
-- 计划为 `axvmconfig::GuestKernelConfig` 新增可选 `firmware_profile`；
-- profile 只允许配合 `VMBootProtocol::Uefi`；
-- 未配置 profile 的既有 VM 行为不变；
-- CLI 增加 `--firmware-bundle-path` 与 `--allow-unverified-firmware`，只影响 UEFI 诊断用例。
-
-## 6. 验证
-
-### 最小 host 测试
+先确认测试用例能够被 runner 发现：
 
 ```bash
-cargo test -p axbuild --lib
+cargo xtask axvisor test qemu --arch x86_64 --test-group normal --list
 ```
 
-应覆盖：正确目录、CODE/VARS 缺失、尺寸错误、本地文件未 opt-in、本地文件错误尺寸和路径不存在。
+当前分支已完成以下端到端验证：
 
-### 固件准备
+```bash
+cargo xtask axvisor test qemu --arch x86_64 --test-group normal \
+  --test-case smoke-vmx
+cargo xtask axvisor test qemu --arch x86_64 --test-group normal \
+  --test-case smoke-svm
+cargo xtask axvisor test qemu --arch x86_64 --test-group normal \
+  --test-case ovmf-acpi-vmx
+cargo xtask axvisor test qemu --arch x86_64 --test-group normal \
+  --test-case ovmf-acpi-svm
+```
+
+四个用例均通过；两个 OVMF 用例均命中：
+
+```text
+AXVISOR_X86_OVMF_ACPI_PASSED
+```
+
+VMX 用例需要 Intel/VMX KVM 宿主，SVM 用例需要 AMD/SVM KVM 宿主。构建前还可以单独检查 Ostool 当前选择的固件路径：
 
 ```bash
 cargo xtask ovmf --arch x86_64
 ```
 
-缓存目录通常为 `$TMPDIR/ostool/ovmf/x64`，其中包含 `code.fd` 与 `vars.fd`。
+## 已知限制
 
-### AMD/SVM
-
-```bash
-cargo xtask axvisor test qemu --arch x86_64 --test-group uefi \
-  --test-case ovmf-entry-svm --firmware-bundle-path <ostool-cache-dir>
-```
-
-### Intel/VMX
-
-```bash
-cargo xtask axvisor test qemu --arch x86_64 --test-group uefi \
-  --test-case ovmf-entry-vmx --firmware-bundle-path <ostool-cache-dir>
-```
-
-通过条件为日志出现：
+两个 OVMF 用例通过时仍观察到以下日志：
 
 ```text
-Nested OVMF fw_cfg accessed
+vpic wire mode change to LAPIC, unimplemented
+vpic wire mode change to NULL, unimplemented
+VM wire mode should be changed to INTR here, unimplemented
 ```
 
-该条件只证明嵌套固件访问了 fw_cfg。
+这些日志表明 VM 级 legacy PIC 输出在 `INTR`、`LAPIC` 和 `NULL` 之间的路由切换尚未实现。当前单 vCPU 用例仍能通过，是因为现有中断注入路径足以支撑该工作负载；本 PR 因此只能证明当前 OVMF/Linux/ACPI 路径成立，不能证明完整 PIC/IOAPIC/LAPIC 切换、PCI 中断或 SMP 中断语义。
 
-## 7. 已知限制
+该缺口不在本验证 PR 中修复，也不会通过屏蔽 warning、放宽成功条件或扩大 timeout 处理；它进入后续中断完整性与 SMP feature 阶段。
 
-- `uefi` 组计划保持 non-gating；
-- nested guest 没有持久化 VARS flash；
-- 计划 marker 早于 BDS，不证明 ACPI 安装完成；
-- 外层 QEMU 仍需要 host NVMe rootfs，这个磁盘不是嵌套 guest 启动盘；
-- VMX/SVM 需要对应 Intel/AMD KVM 宿主，不能互换运行；
-- 未验证本地固件运行结果不能作为功能通过证据。
+## 不包含
 
-## 8. PR 标题与正文草稿
+- guest PCI 启动设备或 ESP；
+- EFI 应用加载或 Linux EFI stub 磁盘启动；
+- OVMF VARS 持久化；
+- PCI INTx/MSI/MSI-X 完整链路；
+- INIT/SIPI、NMI 或多 vCPU UEFI guest；
+- 将当前 non-gating 用例升级为 CI 门禁。
 
-### 标题
+## 评审重点
 
-```text
-feat(axvisor): add reproducible x86 OVMF entry diagnostics
-```
-
-### 正文
-
-```markdown
-## 解决的问题
-
-Axvisor 的 x86 UEFI 路径缺少固定固件和能够区分 QEMU 外层 OVMF 与嵌套 guest OVMF 的诊断用例，导致不同环境的结果不可复现，通用串口 marker 也可能误命中宿主固件。
-
-## 改了什么
-
-- 使用 Ostool 固定版本的上游 RELEASE OVMF，并校验 CODE/VARS 固定布局；
-- 为 x86 guest loader 增加固定 firmware profile；
-- 增加 VMX/SVM 两个 non-gating `ovmf-entry` 用例；
-- 让 QEMU 外层 pflash 与嵌套 guest 使用同一 CODE；
-- 在 Axvisor fw_cfg PIO 设备首次被访问时输出嵌套专属 marker；
-- 保留显式 opt-in 的未验证本地固件诊断入口。
-
-## 每步的逻辑
-
-Ostool 负责固定版本固件的下载和完整性校验，axbuild 只验证当前运行资产的布局并打印摘要。runner 使用同一 CODE 启动外层 Axvisor host 和嵌套 guest。外层 OVMF 的 fw_cfg 访问发生在 QEMU 内部，不经过 Axvisor，因此 `Nested OVMF fw_cfg accessed` 只可能来自嵌套 guest，避免通用 SEC/BDS 文本误命中。
-
-## 验证
-
-- `cargo test -p axbuild --lib`
-- `cargo xtask ovmf --arch x86_64`
-- `cargo xtask axvisor test qemu --arch x86_64 --test-group uefi --test-case ovmf-entry-svm --firmware-bundle-path <dir>`
-- Intel 主机对应运行 `ovmf-entry-vmx`
-
-该用例只证明嵌套 OVMF 访问 fw_cfg，并保持 non-gating；BDS、启动盘和 Linux EFI 启动不在本 PR 范围。
-```
-
-## 9. 合入检查
-
-- [ ] 分支基于目标 `dev`，PR 描述中的 commit/命令与 head 一致；
-- [ ] `cargo fmt` 与所有修改 crate 的目标 clippy/test 通过；
-- [ ] 至少一个真实 AMD/SVM 或 Intel/VMX 用例在当前 head 通过；
-- [ ] 未验证固件没有被用于声明通过；
-- [ ] 用户文档、设计文档与最终 fw_cfg marker 一致；
-- [ ] PR 标题英文、正文中文，无自推广或工具签名。
+- diff 不应新增产品配置、公共 API 或固件/设备运行语义；
+- VMX/SVM 必须共用 backend-neutral guest baseline，只允许外层 QEMU CPU capability 不同；
+- 固件摘要必须对应最终实际加载的 guest image；
+- table-loader 测试必须覆盖完整命令内容，而不只是检查命令数量或 checksum 初值；
+- 文档不得把当前成功 marker 扩大解释为 PCI 启动、完整中断、SMP 或完整 UEFI 支持。
