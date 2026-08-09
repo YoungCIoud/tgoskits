@@ -1,6 +1,6 @@
 # Axvisor x86_64 Guest UEFI 设计
 
-> 事实基线：`dev@343d47f4e`（2026-08-07，包含 PR #1718 的解析后设备图、PR #1917 的 Ostool OVMF 复用和 PR #1918 的 fw_cfg DMA fault 修复）。
+> 事实基线：`dev@e04a3ca28`（2026-08-09，包含 PR #1718 的解析后设备图、PR #1917 的 Ostool OVMF 复用、PR #1918 的 fw_cfg DMA fault 修复和 PR #1931 的 VMX/SVM OVMF/ACPI 验证）。
 >
 > 风险等级：高风险。后续功能阶段涉及固件协议、客户机物理地址布局、PIO/DMA、ACPI、PCI、中断和 vCPU 启动契约。
 
@@ -22,7 +22,7 @@
 
 #### 1.1 问题
 
-Axvisor x86_64 已经具备 guest UEFI 路径的大部分基础构件，也已经存在一条 OVMF 启动 Linux initramfs 并检查 ACPI 的 VMX 用例，但尚未形成与最终支持声明相匹配的完整证据链。当前需要明确区分：
+Axvisor x86_64 已经具备 guest UEFI 路径的大部分基础构件。PR #1931 已在 `dev` 建立 VMX/SVM 对称的 OVMF -> Linux initramfs/ACPI 验证，并记录实际固件输入和最终 guest image 摘要；当前开发重点已经从“证明既有链路”推进到“增加标准 guest PCI 启动设备”。仍需持续明确区分：
 
 - 仓库中已经实现的机制；
 - 当前测试实际证明的行为；
@@ -85,7 +85,7 @@ reset vector
 
 #### 2.1 已有实现
 
-| 范围 | `dev@343d47f4e` 的所有者与实现 | 能够确认的事实 |
+| 范围 | `dev@e04a3ca28` 的所有者与实现 | 能够确认的事实 |
 | --- | --- | --- |
 | 设备资源 | `DeviceGraphBuilder -> ResolvedDeviceGraph -> ResourceClaimSet/lease -> DeviceRuntime` | graph 是固件与 runtime 的唯一资源事实来源 |
 | x86 平台计划 | `virtualization/axvm/src/arch/x86_64/vm.rs` | 已规划 IOAPIC、fw_cfg、PIT、PIC、CMOS、PCI config 和 ACPI PM timer |
@@ -96,13 +96,14 @@ reset vector
 | PCI 配置 | `X86PciConfigDevice` 的配置机制 #1，当前暴露 host bridge 与 LPC bridge | 只证明最小枚举骨架，不等于已有 guest 启动盘 |
 | PIO string I/O | VMX/SVM 的 `X86PortIoStringExit` 逐元素事务 | 不需要重新增加 REP INS/OUTS 支持 |
 | 固件 payload | `FwCfgPayloadSlot` 在设备 build 前填充 kernel/initrd/cmdline 与 ACPI blob | 不应在 OS 配置层重建第二份 payload |
-| OVMF 资产 | `support::ovmf::OvmfFirmware` 复用 Ostool 资产，`axvisor/test/ovmf.rs` 组装 4 MiB x86 镜像 | 已有受管理 OVMF 获取与嵌套镜像准备路径 |
-| 嵌套 OVMF ACPI 用例 | `test-suit/axvisor/normal/qemu-acpi-ovmf` | 已有 VMX 用例通过 OVMF 启动 Linux initramfs 并执行 guest-side ACPI 断言 |
+| OVMF 资产 | `support::ovmf::OvmfFirmware` 复用 Ostool 资产，`axvisor/test/ovmf.rs` 组装 4 MiB x86 镜像 | 构建记录实际 CODE/VARS 和最终 guest image 的路径、尺寸、SHA-256 及 split/monolithic 布局，并校验最终镜像尺寸 |
+| 嵌套 OVMF ACPI 用例 | `test-suit/axvisor/normal/qemu-acpi-ovmf` | 已有 VMX/SVM 对称用例，共用 guest baseline，只改变外层 QEMU CPU capability；两者均通过 OVMF 启动 Linux initramfs 并执行 guest-side ACPI 断言 |
+| table-loader 证据 | `x86_64/boot/acpi/fw_cfg.rs`、`boot/acpi/loader.rs` 最低层测试 | 解码并验证 allocate、pointer、checksum 的文件、偏移、范围、宽度和顺序，不只检查命令数量 |
 | x86 SMP 固件启动 | `x86_vlapic::inject_nmi` 和 `process_init_sipi` | NMI、INIT/SIPI 仍被明确忽略，不能声明多 vCPU UEFI guest |
 
-#### 2.2 当前自动证据
+#### 2.2 当前自动证据与运行记录
 
-现有 `qemu-acpi-ovmf` 用例比“首次 fw_cfg 访问”更强。它完成以下链路：
+现有 `ovmf-acpi-vmx` 和 `ovmf-acpi-svm` 用例比“首次 fw_cfg 访问”更强。它们使用同一 build config、guest TOML、BusyBox initramfs、OVMF 镜像和成功断言，仅由外层 QEMU 分别暴露 VMX/SVM capability，并完成以下链路：
 
 ```text
 Ostool OVMF
@@ -120,7 +121,9 @@ guest 内的 `run_x86_acpi_check` 只有在以下条件全部满足时才输出�
 - `ttyS0` 存在；
 - Linux 已初始化 IOAPIC。
 
-该 marker 来自嵌套 Linux initramfs，不可能由 QEMU 外层 OVMF 直接产生，因此已经能够证明 VMX 路径上的嵌套固件启动、Linux 进入早期用户态以及 ACPI 被 Linux 接受。它也意味着固件已经越过 BDS 并完成 kernel handoff，但当前没有独立、短窗口的 BDS marker。
+该 marker 来自嵌套 Linux initramfs，不可能由 QEMU 外层 OVMF 直接产生，因此已经能够分别证明 VMX/SVM 路径上的嵌套固件启动、Linux 进入早期用户态以及 ACPI 被 Linux 接受。它也意味着固件已经越过 BDS 并完成 kernel handoff，但当前没有独立、短窗口的 BDS marker。
+
+PR #1931 还让构建日志输出实际 Ostool CODE/VARS 和最终 4 MiB guest image 的路径、尺寸与 SHA-256，并区分 split/monolithic 布局；guest TOML 使用的 `uefi_firmware_path` 指向该最终镜像。当前 head 已人工完成 `smoke-vmx`、`smoke-svm`、`ovmf-acpi-vmx` 和 `ovmf-acpi-svm` 各一次成功运行。该结果完成 V 阶段，但一次成功轮次仍属于 E5，不足以替代 F6 要求的重复运行和 CI 记录 E6。
 
 #### 2.3 证据强度
 
@@ -136,21 +139,20 @@ guest 内的 `run_x86_acpi_check` 只有在以下条件全部满足时才输出�
 | E5 | EFI 应用或 Linux guest marker | guest 启动链已到达对应 payload | SMP、完整中断和长期稳定性 |
 | E6 | VMX/SVM 重复运行与 CI 记录 | backend 对称性和门禁稳定性 | 未纳入用例的 feature |
 
-`AXVISOR_X86_OVMF_ACPI_PASSED` 属于 E5，并包含一组 E4 的 ACPI 断言；当前缺口主要是证据来源摘要、SVM 对称用例、重复性和 CI，而不是重新发明 E3 marker。
+`AXVISOR_X86_OVMF_ACPI_PASSED` 属于 E5，并包含一组 E4 的 ACPI 断言；VMX/SVM 对称用例和证据来源摘要已经补齐。当前证据缺口是跨宿主重复性和 CI，而不是重新发明 E3 marker。
 
 #### 2.4 当前可以声明
 
 - x86 guest 资源由 resolved graph 统一规划；
 - x86 已有 fw_cfg PIO/DMA、ACPI、legacy 平台设备、最小 PCI 配置和 REP string I/O；
-- Ostool OVMF 可以被组装为嵌套 guest 固件镜像；
-- 现有 VMX `qemu-acpi-ovmf` 用例能够通过 OVMF 启动 Linux initramfs；
-- 该 VMX guest 能读取 DSDT/APIC/FACP/SPCR，并观察到 ttyS0 与 IOAPIC；
-- normal `smoke-vmx`/`smoke-svm` 分别验证宿主 VMX/SVM 基线，但不等同于两种 backend 都完成嵌套 UEFI 验证。
+- Ostool OVMF 可以被组装为固定 4 MiB 嵌套 guest 固件镜像，实际输入、输出、布局和 SHA-256 可从构建日志复核；
+- `ovmf-acpi-vmx` 与 `ovmf-acpi-svm` 共用 backend-neutral guest baseline，并均能通过 OVMF 启动 Linux initramfs；
+- 两种 backend 的 guest 均能读取 DSDT/APIC/FACP/SPCR，并观察到 ttyS0、IOAPIC 和单 online CPU；
+- table-loader 的 allocate、pointer 和 checksum 命令布局已有完整最低层测试；
+- normal `smoke-vmx`/`smoke-svm` 与两条 OVMF/ACPI 用例已经在当前 head 完成一轮人工验证。
 
 #### 2.5 当前不能声明
 
-- SVM 已达到与 VMX `qemu-acpi-ovmf` 相同的 guest-side 证据；
-- 每次运行都记录了可复核的 OVMF digest，并证明实际加载镜像与摘要一致；
 - 独立 BDS marker 已建立；现有 Linux marker 只能作为越过 BDS 的更强端到端证据；
 - OVMF VARS 在嵌套 guest 重启后持久化；
 - OVMF 已枚举 Axvisor 提供的标准 PCI guest 启动盘；
@@ -158,15 +160,17 @@ guest 内的 `run_x86_acpi_check` 只有在以下条件全部满足时才输出�
 - Linux 是从 guest PCI 启动盘沿 EFI stub 启动，而不是当前 fw_cfg kernel/initrd payload；
 - guest PCI INTx/MSI/MSI-X 完整可用；
 - INIT/SIPI、NMI 或多 vCPU UEFI guest 可用；
+- VMX/SVM 已具备跨宿主、多轮重复的 E6 稳定性证据；
 - UEFI 路径已经进入 CI gating。
 
 #### 2.6 未验证与确认缺失必须分开
 
 | 类别 | 项目 | 后续处理 |
 | --- | --- | --- |
-| 已有但需补证据 | OVMF 资产摘要、VMX 当前用例复现、SVM 对称验证、BDS/guest 归因说明 | 进入“验证阶段”，不增加产品 feature |
+| 已完成验证 | OVMF 资产摘要、VMX/SVM 对称验证、table-loader 命令、BDS/guest marker 归因 | V 阶段已由 PR #1931 和当前 head 运行记录完成；继续作为后续阶段回归基线 |
 | 已确认缺失 | guest PCI 启动设备、ESP/EFI 应用加载、VARS 持久化、INIT/SIPI/NMI、完整 guest MSI 链 | 进入后续 feature 阶段 |
-| 可能缺失 | SVM 或重复运行中暴露的 MSR/PIO/MMIO/table-loader 语义 | 先由验证阶段定位；确认后进入独立 feature/fix 阶段 |
+| 已知但未阻塞 | vPIC `INTR/LAPIC/NULL` wire-mode transition 尚未实现 | 当前四个用例通过，不进入 F1；保留到 F5，除非 F2 trace 证明其阻塞数据盘 INTx |
+| 仍需补证据 | VMX/SVM 跨宿主、多轮重复性与 CI 记录 | 进入 F6；不能阻塞功能开发，也不能提前声明 gating |
 
 ### 3. 证据与开发约束
 
@@ -224,24 +228,29 @@ guest 内的 `run_x86_acpi_check` 只有在以下条件全部满足时才输出�
 | 把旧“阶段一/阶段二”分别实现 marker 和 BDS | 拒绝 | `dev` 已有更强的 guest Linux/ACPI 证据，重复增加验证 feature |
 | 直接搬运历史 UEFI 分支 | 拒绝 | 早于 resolved graph，容易重复现有能力并制造第二事实源 |
 | 验证与缺口修复放在同一阶段 | 拒绝 | 无法区分现状与新增 feature，也无法证明回归在修复前存在 |
-| 先统一验证当前 `dev`，再按已确认缺口逐阶段加 feature | 采用 | 证据与能力边界清晰，每个 feature 可独立设计、回归和审核 |
+| 先统一验证当前 `dev`，再按已确认缺口逐阶段加 feature | 采用，V 已完成 | 证据与能力边界清晰，每个 feature 可独立设计、回归和审核 |
 
 ## 第二部分：分阶段开发与验证
 
 ### 4. 阶段总览
 
-| 阶段 | 性质 | 目标 | 是否增加产品 feature |
-| --- | --- | --- | --- |
-| V：现状验证 | 验证 | 固定并复核 `dev` 已有 OVMF -> Linux/ACPI 链路，补齐 VMX/SVM 证据 | 否 |
-| F1：固件平台缺口 | 条件 feature/fix | 修复 V 阶段确认且阻塞现有链路的最小语义缺口 | 是；无缺口则跳过 |
-| F2：PCI 启动设备与 EFI 应用 | feature | 让 OVMF 从 Axvisor guest PCI 设备读取 ESP 并运行 EFI 应用 | 是 |
-| F3：Linux EFI 启动与 VARS | feature | 从 guest 启动盘启动 Linux EFI stub，并定义 VARS 生命周期 | 是 |
-| F4：中断完整性与 SMP | feature | 完成 guest INTx/MSI/MSI-X、INIT/SIPI/NMI 和多 vCPU UEFI | 是 |
-| F5：稳定性与 CI 门禁 | 交付 | VMX/SVM 稳定重复并进入 CI gating | 不新增启动语义 |
+| 阶段 | 性质 | 目标 | 状态 | 是否增加产品 feature |
+| --- | --- | --- | --- | --- |
+| V：现状验证 | 验证 | 固定并复核 `dev` 已有 OVMF -> Linux/ACPI 链路，补齐 VMX/SVM 证据 | 已完成：PR #1931，`dev@e04a3ca28` | 否 |
+| F1：固件平台缺口 | 条件 feature/fix | 修复 V 阶段确认且阻塞现有链路的最小语义缺口 | 已跳过：V 未发现阻塞语义缺口 | 是；无缺口则跳过 |
+| F2：PCI 只读数据盘 | feature | 让 direct-boot Linux 枚举标准 PCI virtio-blk、挂载只读数据盘并读取 identity | 当前阶段：先固定 PCI/virtio/数据盘契约 | 是 |
+| F3：PCI 启动盘与 EFI 应用 | 集成 feature/交付 | 让 OVMF 从 F2 的同一标准设备读取 ESP 并运行 EFI 应用 | 未开始 | 条件；F2 已满足全部运行语义时不新增产品代码 |
+| F4：Linux EFI 启动与 VARS | feature | 从 guest 启动盘启动 Linux EFI stub，并定义 VARS 生命周期 | 未开始 | 是 |
+| F5：中断完整性与 SMP | feature | 完成 guest INTx/MSI/MSI-X、INIT/SIPI/NMI 和多 vCPU UEFI | 未开始 | 是 |
+| F6：稳定性与 CI 门禁 | 交付 | VMX/SVM 稳定重复并进入 CI gating | 未开始 | 不新增启动语义 |
 
 阶段必须按顺序推进。前一阶段的退出证据是后一阶段的输入；不得以“后续会补”绕过当前阶段的核心失败路径。
 
+feature/交付阶段必须以独立可用结果结束：F2 交付 direct-boot Linux 可使用的标准只读数据盘，F3 交付可自动运行 EFI payload 的标准启动盘，F4 交付从该盘启动的 Linux 和明确的 VARS 生命周期。PCI root-bus 重构、virtqueue core、x86 planner/image-provider 接线或测试资产准备可以独立提交和审核，但不能单独升级为 feature 阶段，也不能在对应可用结果完成前暴露不可工作的用户配置。
+
 ### 5. 阶段 V：验证当前实现
+
+> 状态：已完成。实现与自动验证由 PR #1931 合入 `dev@e04a3ca28`；当前 head 的四个目标 case 已完成一轮人工运行。
 
 #### 5.1 目标
 
@@ -249,12 +258,12 @@ guest 内的 `run_x86_acpi_check` 只有在以下条件全部满足时才输出�
 
 原设计中的“固定固件与 fw_cfg marker”和“证明 ACPI/BDS”合并在本阶段。fw_cfg 访问只是调查检查点，不能单独成为阶段完成条件；现有 guest Linux/ACPI marker 是更强的最终证据。
 
-#### 5.2 实施顺序
+#### 5.2 已完成的实施顺序
 
-1. 从最新 `dev` 运行并列出 `normal` 组，确认 `qemu-acpi-ovmf` 的 VMX case 被 runner 发现；
+1. 从最新 `dev` 运行并列出 `normal` 组，确认 `ovmf-acpi-vmx` 和 `ovmf-acpi-svm` 均被 runner 发现；
 2. 使用现有 Ostool 获取路径准备 x86_64 OVMF，记录实际 CODE/VARS 路径、尺寸和 digest；
 3. 证明 runner 生成的 4 MiB 镜像就是 Axvisor guest loader 实际使用的镜像；
-4. 运行现有 VMX `ovmf-acpi`，保存完整命令、固件摘要和 guest success marker；
+4. 运行 VMX `ovmf-acpi-vmx`，保存完整命令、固件摘要和 guest success marker；
 5. 增加仅改变外层 QEMU CPU 暴露的 SVM case，复用同一 build config、guest TOML、固件和成功断言；
 6. 在对应 Intel/AMD KVM 宿主分别运行 VMX/SVM；
 7. 复核 table-loader 的 allocate/pointer/checksum 最低层测试，以及 guest 对 DSDT/APIC/FACP/SPCR、ttyS0、IOAPIC 的断言；
@@ -267,38 +276,46 @@ guest 内的 `run_x86_acpi_check` 只有在以下条件全部满足时才输出�
 cargo xtask ovmf --arch x86_64
 cargo xtask axvisor test qemu --arch x86_64 --test-group normal --list
 cargo xtask axvisor test qemu --arch x86_64 --test-group normal \
-  --test-case ovmf-acpi
+  --test-case ovmf-acpi-vmx
+cargo xtask axvisor test qemu --arch x86_64 --test-group normal \
+  --test-case ovmf-acpi-svm
 ```
 
-SVM case 的最终名称由 test-suit 结构确定，但必须与 VMX 共用 backend-neutral guest 配置，不能通过 Cargo feature 选择 backend。
+两条 case 共用 backend-neutral guest 配置，不能通过 Cargo feature 选择 backend；VMX 应在 Intel/VMX KVM 宿主运行，SVM 应在 AMD/SVM KVM 宿主运行。
 
 #### 5.4 退出条件
 
-- [ ] 当前 head 的 VMX case 命中 `AXVISOR_X86_OVMF_ACPI_PASSED`；
-- [ ] 当前 head 的 SVM 对称 case 在 AMD KVM 宿主命中同一 guest marker；
-- [ ] 两次运行记录实际 OVMF 路径、尺寸和 digest；
-- [ ] guest 使用的固件镜像与记录摘要一致；
-- [ ] DSDT/APIC/FACP/SPCR、CPU、ttyS0 和 IOAPIC 断言全部由 guest 执行；
-- [ ] table-loader 和 fw_cfg DMA 的最低层成功/错误测试通过；
-- [ ] normal VMX/SVM smoke 不退化；
-- [ ] diff 中没有新增产品配置、公共 API 或固件/设备运行语义；
-- [ ] 用例保持 non-gating，直到 F5 的稳定性标准满足。
+- [x] 当前 head 的 VMX case 命中 `AXVISOR_X86_OVMF_ACPI_PASSED`；
+- [x] 当前 head 的 SVM 对称 case 命中同一 guest marker；
+- [x] 两次运行记录实际 OVMF 路径、尺寸和 digest；
+- [x] guest 使用的固件镜像与记录摘要一致；
+- [x] DSDT/APIC/FACP/SPCR、CPU、ttyS0 和 IOAPIC 断言全部由 guest 执行；
+- [x] table-loader 和 fw_cfg DMA 的最低层成功/错误测试通过；
+- [x] normal VMX/SVM smoke 不退化；
+- [x] diff 中没有新增产品配置、公共 API 或固件/设备运行语义；
+- [x] 用例保持 non-gating，直到 F6 的稳定性标准满足。
 
-#### 5.5 失败处理
+完成 V 只表示当前 baseline 已被证明，不表示这些用例可以停止回归。F2 及以后阶段必须继续运行四个 case；重复性和 CI gating 仍由 F6 负责。
 
-若 VMX 或 SVM 在当前 `dev` 无法达到 guest marker：
+#### 5.5 后续回归失败处理
+
+若后续 `dev` 的 VMX 或 SVM 无法再达到 guest marker：
 
 1. 保存固定资产摘要、完整命令、最后可靠状态和第一个错误；
-2. 形成最低层、能稳定复现该错误的测试草案，在 F1 的首个提交中先证明修复前失败；
-3. 明确缺口的职责所有者和外部规范依据；
-4. 把修复作为 F1 的独立设计与提交；
-5. F1 完成后重新执行 V 阶段全部验证。
+2. 形成最低层、能稳定复现该错误的测试，并定位首次引入回归的阶段或提交；
+3. 若回归由 F2 及以后 feature 引入，在对应 feature/fix 中恢复 V baseline，不重新定义 V 的完成标准；
+4. 只有证据证明 V 当时漏掉了 baseline 自身的确定语义缺口时，才先修订本文并重新打开 F1；
+5. 修复后重新执行 V 阶段四个用例和对应阶段的新增验证。
 
 ### 6. 阶段 F1：修复验证确认的固件平台缺口
+
+> 状态：已跳过。V 阶段未发现阻塞现有 OVMF/Linux/ACPI 链路的产品语义缺口；PR #1931 的 Rust 改动均为测试和测试编排，不改变设备运行语义。
 
 #### 6.1 进入条件
 
 只有 V 阶段在固定输入下证明现有实现存在确定语义缺口时才进入本阶段。如果 VMX/SVM 均通过 V 阶段，本阶段直接标记为不需要，不为历史分支中的候选改动寻找理由。
+
+当前观察到的 vPIC wire-mode warning 不满足 F1 进入条件：它们没有阻止 VMX/SVM 到达 guest marker。除非 F2 的设备 trace 证明这些 transition 是数据盘 INTx 的第一个确定阻塞点，否则不得重新打开 F1 或把相关修复混入 PCI/virtio 提交。
 
 #### 6.2 范围
 
@@ -315,76 +332,83 @@ SVM case 的最终名称由 test-suit 结构确定，但必须与 VMX 共用 bac
 - direct/BIOS 路径和 normal smoke 不退化；
 - 设计、实现、测试和用户文档对该语义的声明一致。
 
-### 7. 阶段 F2：PCI 启动设备与 EFI 应用
+### 7. 阶段 F2：PCI 只读数据盘
+
+> 状态：当前阶段。V 已完成且 F1 已跳过；下一项工作是固定 PCI/virtio/数据盘契约，并确认现有 direct-boot Linux 包含所需驱动，尚未开始产品代码实现。
 
 #### 7.1 目标
 
-让 OVMF 枚举由 Axvisor 提供的标准 guest PCI 启动设备，从 guest ESP 读取并运行一个确定性的 EFI 应用。该阶段首次增加面向 guest 的启动设备 feature。
+为 Axvisor x86 guest 增加标准、只读的 modern virtio-blk PCI 数据盘。沿用当前 fw_cfg direct-boot Linux 路径，让 Linux 枚举该设备、挂载磁盘并读取固定 identity 文件。
+
+本阶段完成后，用户已经可以给 direct-boot Linux guest 配置确定性的只读 PCI 数据盘；它不是只能枚举的框架半成品，也不依赖尚未实现的 UEFI 启动链。F3 再复用完全相同的产品设备，把可用性推进到 OVMF 启动盘。
 
 本阶段的最小垂直链路是：
 
 ```text
 guest TOML 中的只读磁盘后端
   -> Axvisor 在 VM build 前读取并冻结镜像
-  -> resolved graph 中的 PCI root bus、function、BAR aperture 和 INTx route
+  -> resolved graph 中组合唯一 function 的 PCI root bus
+  -> 4 KiB BAR aperture 和 resolved INTx route
   -> modern virtio-blk PCI transport
-  -> OVMF VirtioPciDeviceDxe / VirtioBlkDxe
-  -> Block I/O -> FAT -> \\EFI\\BOOT\\BOOTX64.EFI
-  -> AXVISOR_X86_UEFI_PCI_APP_PASSED
+  -> direct-boot Linux virtio-pci / virtio-blk
+  -> raw ext4 /dev/vda -> /axvisor/F2-ID.txt
+  -> AXVISOR_X86_PCI_BLOCK_PASSED identity=axvisor-f2-readonly-data-v1
 ```
 
-成功 marker 必须由 ESP 中的 EFI 应用写入 guest console；仅看到 PCI vendor/device、BAR 访问或 OVMF 菜单均不能完成 F2。
+成功 marker 必须由 guest Linux 在核对实际 PCI identity、块设备只读属性和 identity 文件内容后写入 guest console。仅看到 PCI vendor/device、BAR 访问、virtqueue notify 或设备节点均不能完成 F2。
 
 #### 7.2 进入条件和兼容性确认
 
 开始修改产品代码前必须满足：
 
-1. V 阶段的 VMX/SVM `ovmf-acpi` 和 normal smoke 均通过；F1 若无确定缺口则保持跳过；
-2. 固定本阶段使用的 Ostool OVMF 路径和 digest，并从对应 EDK2 build/module 信息确认包含 `VirtioPciDeviceDxe`、`VirtioBlkDxe`、partition、FAT 和 removable-media boot 支持；
-3. 用同一 OVMF 在参考 QEMU 上启动候选 ESP，证明镜像、FAT 和 `BOOTX64.EFI` 自身有效；
-4. 固定 VirtIO 1.2 和 UEFI 2.10 为协议依据，把 OVMF 的实际访问序列作为兼容性证据，而不是改变规范语义的理由；
+1. **已满足**：V 阶段的 `ovmf-acpi-vmx`、`ovmf-acpi-svm`、`smoke-vmx` 和 `smoke-svm` 均通过，F1 保持跳过；
+2. 固定 VirtIO 1.2 和 PCI conventional configuration 为协议依据；
+3. 检查现有 direct-boot Linux kernel/initramfs 是否包含 `virtio_pci`、`virtio_blk` 和 ext4 支持；F2 使用无分区 raw ext4，不依赖 GPT/MBR 扫描；缺少测试侧驱动时先修复测试资产，不能用产品私有协议代替；
+4. 用参考 QEMU 的 `virtio-blk-pci` 把候选镜像作为 `/dev/vda` 直接挂载，证明 raw ext4 和 identity 文件本身有效；
 5. 确认 guest PCI MMIO aperture 不与 RAM、firmware、IOAPIC/LAPIC、fw_cfg 或其他 resolved resources 重叠。
-
-若固定 OVMF 不包含上述驱动，不得静默退回私有 fw_cfg 磁盘、legacy virtio 或把驱动塞入 ESP。应先更新本文，重新评审“更换受管 OVMF”或“选择另一种标准块设备”两种方案。
 
 #### 7.3 方案选择和非目标
 
 | 方案 | 结论 | 原因 |
 | --- | --- | --- |
-| modern non-transitional virtio-blk PCI | 采用 | 标准接口、OVMF 有现成驱动；只需实现本阶段实际使用的最小协议面 |
+| modern non-transitional virtio-blk PCI | 采用 | 标准接口，Linux 和目标 OVMF 均有现成驱动；F2 先以 direct-boot Linux 建立独立可用性 |
+| 单个 root-bus node 组合唯一 disk function | 采用 | 当前只有一个真实 endpoint；避免给 `DeviceBuildContext` 增加无当前调用方的跨节点 service/seal 协议 |
+| root node 与 endpoint node 通过通用 registry 组装 | 推迟 | 只有出现第二种 PCI endpoint 后，才能确定 registry 的真实调用方、生命周期和扩展形状 |
 | transitional/legacy virtio-blk | 拒绝 | 会同时引入 legacy PIO、旧 feature 协商和两套 transport 语义 |
-| fw_cfg 私有块设备或直接传 EFI 文件 | 拒绝 | 不能证明标准 PCI 枚举、Block I/O、partition 和 FAT 启动链 |
+| fw_cfg 私有块设备或直接传文件 | 拒绝 | 不能形成标准 PCI 块设备，也不能被后续 OVMF 启动阶段复用 |
 | AHCI、NVMe 或宿主块设备直通 | 拒绝 | 控制器和安全边界远大于本阶段；宿主 NVMe rootfs 不是 guest 设备 |
 | 可写或宿主文件实时后端 | 推迟 | F2 只需要确定性读取；写入、一致性、flush 和故障恢复进入独立设计 |
 
-F2 明确不包含：Linux EFI stub、VARS 持久化、多队列、packed virtqueue、indirect descriptor、event index、MSI/MSI-X、热插拔、IOMMU、磁盘写入和多 vCPU。这些能力不得以未声明 feature bit、空实现或伪成功形式出现。
+F2 明确只支持每个 VM 一块只读数据盘，并且不包含：OVMF 从盘启动、EFI 应用、Linux EFI stub、VARS 持久化、多盘、多 endpoint registry、多队列、packed virtqueue、indirect descriptor、event index、MSI/MSI-X、热插拔、IOMMU、磁盘写入和多 vCPU。这些能力不得以未声明 feature bit、空实现或伪成功形式出现。
 
 #### 7.4 PCI root bus 与资源所有权
 
-当前 `X86PciConfigDevice` 只有 bus 0 上固定的 host bridge 和 LPC bridge，不能直接承载真实 endpoint；尤其不能把 resolved graph 中的固定 MMIO range 当成可由 OVMF 任意重编程的 BAR。F2 必须在现有设备上扩展为一个 PCI root-bus owner：
+当前 `X86PciConfigDevice` 只有 bus 0 上固定的 host bridge 和 LPC bridge，不能直接承载真实 endpoint；尤其不能把 resolved graph 中的固定 MMIO range 当成可由 guest PCI driver 任意重编程的 BAR。F2 把它扩展为一个组合唯一 virtio-blk function 的 PCI root-bus owner：
 
 - 保留配置机制 #1 的 `0xcf8..=0xcff` 唯一入口，不增加 ECAM/MCFG 或第二条 config 路径；
-- root bus 从 resolved graph 领取一个专用 PCI MMIO aperture，并作为该 aperture 在 `DeviceRuntime` 中的唯一 claim owner；
-- endpoint 在规划期声明 BAR 类型、大小和对齐，root bus 在运行时根据 PCI command/BAR 状态在 aperture 内完成 decode；因此 OVMF 的 size probe、disable、assignment 和 relocation 不需要修改 sealed runtime 路由；
-- aperture 基址/范围同时生成 ACPI `PCI0._CRS`；不得继续让 AML 使用与 runtime 无关的硬编码窗口；
-- endpoint 的 BDF 由 machine planner 分配为 typed identity，避开 `00:00.0` 和 `00:1f.0`，不允许用户在 TOML 指定 bus/device/function；
-- function、BAR specification、INTx pin/route 和 firmware binding 属于同一个 resolved device node；ACPI `_PRT` 从该 node 和既有 swizzle 规则生成；
-- runtime build 依赖 root-bus node，所有 function 在 VM 进入 runnable 状态前注册并 seal；vCPU 热路径不得注册、移除或替换 function；
+- machine planner 固定唯一 endpoint 为 BDF `0000:00:03.0`、INTA 和一个 4 KiB、32-bit、non-prefetchable BAR0；`00:00.0` host bridge 与 `00:1f.0` LPC bridge 保持不变，用户不能配置 BDF、pin 或 BAR 数值；
+- root-bus graph node 同时拥有 config PIO、BAR0 对应的 4 KiB MMIO aperture、唯一 level-triggered exclusive INTx claim、guest-memory 使用声明和只读 block backend；endpoint 不再成为第二个 graph/runtime node；
+- 4 KiB aperture 和 INTx GSI 由现有 resource plan 分配并检查冲突，不硬编码 MMIO base 或 GSI19；root bus 是 aperture 的唯一 `DeviceRuntime` claim 和 dispatch owner；
+- BAR0 reset value 使用 resolved aperture base。guest 写全一执行 size probe；普通赋值按 BAR mask 保存，只有完整落在该 aperture 且 PCI command memory-space enable 打开时才参与 decode。aperture 外赋值不得改变 sealed runtime 路由，也不得命中其他设备；
+- root bus 对 BAR0 的访问继续使用 bus device 的 `DeviceAccess`，并显式持有 guest-memory grant；function 只持有从同一 root-node claim 创建的 `IrqLine`，不能保存裸 GSI、目标 vector 或全局回调；
+- x86 machine plan 保存一份 typed PCI plan，包含 node id、BDF、BAR specification、INTx pin 和资源 slot identity。runtime model 与 ACPI composer 都使用该 plan，并从 resolved graph 查询最终 aperture/GSI；不为 F2 扩展通用 `DeviceFirmwareBinding`；
+- ACPI `PCI0._CRS` 只发布 bus 0 和实际 4 KiB non-prefetchable memory window；不再发布没有 runtime owner 的 PCI I/O/VGA window。`_PRT` 只发布 `00:03.0 INTA` 到 resolved GSI；未配置磁盘时不发布 endpoint route；
 - 不存在的 BDF/config offset 按 PCI 规范返回全一；非法 BAR assignment、aperture 外访问和未开启 memory-space decode 返回明确未命中或保持规范定义的寄存器状态，不能路由到其他设备。
 
-PCI config 最低要求包括 conventional header、command/status、capability list、BAR size probe/assignment、interrupt pin/line 和 reset。BAR 的当前值是 PCI function 的运行状态；aperture、BDF、BAR 约束和中断路由仍来自 resolved graph，二者不能维护重复地址事实。
+PCI config 最低要求包括 conventional header、command/status、capability list、BAR size probe/assignment、interrupt pin/line 和 reset。BAR 当前值是 PCI function 的运行状态；aperture、BAR 约束和中断路由来自同一 x86 machine/resolved plan，不允许 AML、config space 和 runtime 各自硬编码副本。
 
 #### 7.5 modern virtio-blk PCI 协议面
 
-设备使用 VirtIO 1.2 non-transitional PCI 身份：vendor `0x1af4`、virtio block device ID `2` 对应 PCI device `0x1042`，revision 不使用 legacy 值。一个 MMIO BAR 至少承载：
+设备使用 VirtIO 1.2 non-transitional PCI 身份：vendor `0x1af4`、virtio block device ID `2` 对应 PCI device `0x1042`，revision 不使用 legacy 值。4 KiB BAR0 固定承载：
 
-- common configuration capability；
-- notification capability；
-- ISR status capability；
-- block device-specific configuration capability；
-- 规范要求的 PCI configuration access capability。
+- `0x000`：common configuration；
+- `0x100`：queue notification，`notify_off_multiplier = 4`；
+- `0x200`：ISR status；
+- `0x300`：block device-specific configuration，至少包含 64-bit capacity。
 
-本阶段只提供一个 split virtqueue。设备只发布已经完整实现的 feature：`VIRTIO_F_VERSION_1`、`VIRTIO_BLK_F_RO`，以及实现和 OVMF 证明确有需要时的 `VIRTIO_BLK_F_BLK_SIZE`。不发布 MSI-X、packed ring、ring reset、indirect descriptor、event index、flush、discard、write-zeroes、multi-queue 或 topology feature。
+`VIRTIO_PCI_CAP_PCI_CFG` 只是访问上述 BAR region 的可选替代通道，不是 modern virtio PCI device 的必需 capability；F2 不实现也不发布它。只有后续出现独立、可复现且无法通过标准 BAR access 解决的兼容性需求时，才能先修订设计再增加。
+
+本阶段只提供 queue 0，一个 size 为 128 的 split virtqueue。设备只发布 `VIRTIO_F_VERSION_1` 和 `VIRTIO_BLK_F_RO`；不发布 `VIRTIO_BLK_F_BLK_SIZE`、MSI-X、packed ring、ring reset、indirect descriptor、event index、flush、discard、write-zeroes、multi-queue 或 topology feature。capacity 严格等于冻结镜像字节数除以 512。
 
 transport 必须完整实现本阶段可达的状态：
 
@@ -395,7 +419,7 @@ transport 必须完整实现本阶段可达的状态：
 - 未提供 MSI-X 时使用单个 PCI INTx：完成请求先设置 ISR queue bit 和 PCI interrupt-status，再按 resolved route 断言 level IRQ；读取 ISR 清零并撤销断言；
 - PCI interrupt disable、queue notification suppression 和 reset 必须阻止不应产生的中断。
 
-F2 的 INTx 是启动盘所需的窄而完整路径，不代表已经完成任意 PCI endpoint、中断切换、MSI 或 MSI-X；这些泛化仍属于 F4。已观察到的 vPIC wire-mode warning 只有在 trace 证明其阻塞上述 INTx/OVMF 链路时才前移为独立 fix，不能顺带塞入 virtio 提交。
+F2 的 INTx 是单个只读块设备所需的窄而完整路径，不代表已经完成任意 PCI endpoint、中断切换、MSI 或 MSI-X；这些泛化仍属于 F5。已观察到的 vPIC wire-mode warning 只有在 trace 证明其阻塞上述 INTx/Linux 数据盘链路时才前移为独立 fix，不能顺带塞入 virtio 提交。
 
 #### 7.6 virtqueue、DMA 与块请求语义
 
@@ -411,93 +435,145 @@ virtqueue 和 virtio-blk core 放在可复用的 `no_std` 设备层，不依赖 
 
 #### 7.7 镜像后端和配置契约
 
-用户只描述设备意图和后端，不提供资源数值。目标配置形状为：
+用户只描述设备意图和后端，不提供资源数值。每个 VM 最多出现一次该 model，目标配置形状为：
 
 ```toml
 [[devices.virtual]]
-id = "uefi-boot-disk"
+id = "readonly-data-disk"
 model = "virtio-blk-pci"
-backend = { type = "file", path = "/images/uefi-esp.img", read_only = true }
+backend = { type = "file", path = "/guest/axvisor-f2-data.ext4", read_only = true }
 ```
 
-最终字段拼写必须沿用 `axvmconfig` 的 open typed options；不得为了 F2 再建立专用顶层配置。`bdf`、`bar`、`mmio_base`、`irq`、`msi_vector` 等数值字段必须被拒绝。
+最终字段拼写沿用 `axvmconfig` 的 open typed options，不为 F2 建立专用顶层配置；options 使用 `deny_unknown_fields`。`type = "file"`、非空 `path` 和显式 `read_only = true` 都是必需项；`bdf`、`bar`、`mmio_base`、`irq`、`msi_vector` 等数值字段必须被拒绝。第二个 `virtio-blk-pci` 请求在规划期报错，并列出两个 device id。
 
-Axvisor integration layer 在 VM build 前解析并读取文件，检查存在性、非零长度、512 字节对齐和只读要求，然后把不可变内存快照作为窄 `BlockBackend` capability 交给设备。设备热路径不得访问 host path 或 `ax_std::fs`；原文件在 VM 运行期间变化也不得改变 guest 看到的内容。配置了缺失、空、未对齐或 `read_only = false` 的镜像时，VM build 明确失败并带 device id/path 上下文。没有配置该 device 时，现有 fw_cfg/OVMF case 保持原行为。
+x86 device planner 在调用通用 configured-device append 前消费这一个内建 machine model，并把它组合进 `pci-config` root node；它不能同时作为独立 catalog node 再构造一次。其他 configured devices 继续走现有 catalog。在非 x86 架构上，该 model 没有 machine owner，必须按 unsupported/unknown model 拒绝，不能创建一个无 transport 的通用 block node。
 
-#### 7.8 ESP 与 EFI 应用证据
+AxVM 只接收一个由 integration layer 提供的窄 read-only image-provider capability；provider 以 VM id、device id 和 path 为输入，返回冻结的 `Arc<[u8]>`。编译期 VM 配置由 `os/axvisor/build.rs` 解析 backend path、嵌入镜像并按 VM/device identity 提供；运行期配置只在启用 `fs` 时读取 Axvisor 文件系统中的绝对路径并一次性快照。静态镜像优先于 runtime filesystem；两者都不存在时返回 unsupported，不得静默忽略设备或退化为实时文件访问。
 
-测试资产使用可重复生成的 GPT 或 MBR partitioned FAT ESP；分区方案一经选择必须记录生成工具、输入文件清单、镜像尺寸和 digest。ESP 中至少包含：
+provider 在 VM resource planning 前检查存在性、非零长度、512 字节对齐和只读要求，再把不可变快照作为窄 `ReadOnlyBlockBackend` 交给设备。设备热路径不得持有 host path 或依赖 `ax_std::fs`；原文件在 VM 运行期间变化也不得改变 guest 看到的内容。缺失、空、未对齐、路径不合法或 `read_only = false` 时，VM 创建明确失败并带 VM id、device id 和 path 上下文。没有配置该 model 时不创建 image provider 请求，现有 fw_cfg/OVMF 行为保持不变。
+
+#### 7.8 数据盘与 Linux 证据
+
+测试资产固定为 8 MiB raw ext4 镜像，没有 MBR/GPT 或分区表，guest 直接挂载 `/dev/vda`。host 工具以固定 UUID、固定 `E2FSPROGS_FAKE_TIME`、固定文件 mode/mtime，并关闭 lazy inode/journal 初始化的 `mke2fs` 参数生成镜像；生成流程先验证所需 e2fsprogs 能力，再连续生成两次并要求 SHA-256 相同。生成物放在 `tmp/axbuild`，不提交二进制镜像。镜像只包含本测试需要的最小目录和 identity：
 
 ```text
-\\EFI\\BOOT\\BOOTX64.EFI
-\\AXVISOR\\F2-ID.TXT
+/axvisor/F2-ID.txt = axvisor-f2-readonly-data-v1\n
 ```
 
-EFI 应用通过其 `LoadedImage` device handle 打开同一 Simple File System，读取固定 identity 文件并校验内容，然后向 guest console 输出包含该 identity 的 `AXVISOR_X86_UEFI_PCI_APP_PASSED`。这样成功同时证明：
+参考 QEMU 使用 `disable-legacy=on` 的 `virtio-blk-pci` 和 read-only raw drive，把同一镜像作为 `/dev/vda` 挂载并读取 identity；这只证明资产和 Linux driver 兼容，不替代 Axvisor E2E。
 
-1. OVMF 枚举 PCI function 并绑定 virtio PCI/block 驱动；
-2. Block I/O、partition 和 FAT 路径可用；
-3. 应用来自 guest ESP，而不是 fw_cfg kernel/initrd 或外层 QEMU OVMF；
-4. 应用还能从自己的启动设备继续读取数据。
+direct-boot Linux initramfs 必须完成以下检查后，才向 guest console 输出 `AXVISOR_X86_PCI_BLOCK_PASSED identity=axvisor-f2-readonly-data-v1`：
 
-使用 UEFI removable-media fallback `\\EFI\\BOOT\\BOOTX64.EFI`，F2 不依赖可持久化 Boot#### 或共享 VARS。EFI 应用保持最小，不引入 shell、网络、Linux、ACPI 全量探测或历史 `uefi_probe` 的大范围代码。
+1. `/sys/bus/pci/devices/0000:00:03.0` 报告 `1af4:1042`，BAR0 已分配且 memory-space decode 已启用；
+2. Linux 已绑定 `virtio_pci`/`virtio_blk`，从该 PCI function 的 sysfs `irq` 取得 Linux IRQ number，并在挂载前记录 `/proc/interrupts` completion count；
+3. `/sys/block/vda/ro` 为 `1`，以 `dd` 对 `/dev/vda` 发起的 512-byte 写入确定失败；设备层另以最低层测试证明 `VIRTIO_BLK_T_OUT -> VIRTIO_BLK_S_IOERR`，不能把 Linux block-layer 的提前拒绝当作设备收到 OUT 的证据；
+4. 以 `mount -t ext4 -o ro /dev/vda` 直接挂载 raw filesystem，读取并严格匹配 `F2-ID.txt`；
+5. 挂载和读取后的同一 IRQ completion count 大于初始值，证明请求经过真实 INTx completion；
+6. runner 在 VMX/SVM 运行前后计算源镜像 SHA-256，摘要必须不变，VMX/SVM backend 使用同一 digest。
+
+内核、initramfs 和 cmdline 仍由已有 fw_cfg direct-boot 路径提供，因此该 marker 只声明“标准 PCI 只读数据盘可用”，不声明 OVMF 或 EFI 启动。F3 将复用同一个 `virtio-blk-pci` 产品模型和 backend 契约，不再实现第二套磁盘设备。
 
 #### 7.9 实施单元与提交顺序
 
-F2 是一个 feature 阶段，可以拆成多个可独立审核的 PR，但只有完成最后一个垂直链路 PR 后才能声明 F2 完成。推荐按以下顺序提交，每个提交都必须编译并通过当时适用的测试：
+F2 是第一个可用 feature 阶段。PCI root-bus 重构、virtqueue core 或 x86 planner/image-provider 接线都只是阶段内实施单元，单独完成时不能声明一个新 feature。推荐按以下顺序提交，每个提交都必须编译并通过当时适用的测试：
 
-1. `docs(uefi): define the F2 PCI boot-device contract`：只修改本文，固定选择、非目标、接口和证据；
-2. `refactor(axdevice): generalize the x86 PCI root bus`：在不增加用户可见设备的前提下，把固定 config state 重整为 sealed function registry、BAR aperture/decode 抽象和 typed BDF；新接口先保持 crate-private，现有 machine plan 暂不启用 endpoint/aperture，并以 host/LPC 与 ACPI 行为测试证明等价；
-3. `feat(axdevice): add a read-only virtio block PCI device`：加入 modern transport、单 split queue、同步只读 block core、INTx 和最低层成功/错误测试；不接 host 文件路径；
-4. `feat(axvisor): register the virtio block PCI model`：接入 catalog、resolved graph、ACPI root aperture/`_PRT` 和 VM-build-time immutable file backend，并增加配置/资源集成测试；
-5. `test(axvisor): boot an EFI app from the guest PCI disk`：加入可重复 ESP/EFI app 资产、VMX/SVM case、reference-QEMU 资产检查和 guest marker；
-6. `docs(uefi): record F2 validation evidence`：记录最终 head、OVMF/ESP digest、命令、两种 backend 结果和已知限制，同步派生 PR 文档。
+1. `docs(uefi): finalize the F2 read-only PCI disk contract`：只修改本文，固定单节点、单盘、raw ext4、资源、配置和证据；
+2. `refactor(axdevice): prepare the x86 PCI root bus for one function`：在不增加用户可见设备的前提下，把固定 config state 重整为组合 function、typed BDF、BAR probe/decode 和可选 aperture；所有接口保持最小可见性，以 host/LPC、absent function 和 ACPI 行为测试证明等价；
+3. `feat(axvisor): add an x86 read-only virtio PCI block disk`：同一提交加入 split virtqueue/block core、modern PCI function、INTx、x86 planner、resolved resources、ACPI、配置解析和 immutable image provider，并配齐最低层及配置/资源集成测试；
+4. `test(axvisor): validate the PCI data disk from Linux`：加入确定性 raw ext4 生成、reference-QEMU 检查、VMX/SVM E2E 和专属 marker；
+5. `docs(uefi): record F2 validation evidence`：记录最终 head、数据盘 digest、命令、VMX/SVM backend 结果和已知限制，同步派生 PR 文档。
 
-第 2 项可作为独立、行为保持的前置 PR；第 3、4 项不得分别合入为对用户可配置但不可启动的半成品，原则上放在同一个 feature PR 中按 commit 审核。不得先暴露空模型、未使用公共 trait 或声称支持但只能枚举的设备。
+第 2 项可作为独立、行为保持的前置 PR。产品 feature 的 core、配置和集成统一放在第 3 项，确保新公共 capability 在同一提交有真实调用方，避免先合入只能枚举、没有 backend 或无法运行的半成品。第 4 项增加交付证据但不能补写产品主语义；若 E2E 暴露标准协议缺口，应先回到第 3 项补最低层回归和实现。
 
 #### 7.10 分层验证
 
 | 层级 | 必须覆盖的成功路径 | 必须覆盖的失败/边界 |
 | --- | --- | --- |
-| PCI config/root bus | BDF 枚举、header/capability chain、BAR probe/assignment、command decode、reset | absent function 全一、越界 config、错位 BAR、aperture 外 assignment、重叠 function |
+| PCI config/root bus | `00:03.0` 枚举、header/capability chain、BAR probe/assignment、command decode、reset | absent function 全一、越界 config、错位 BAR、aperture 外 assignment、第二个 disk function |
 | virtio PCI transport | feature/status 顺序、queue 配置/enable/notify、ISR/INTx assert-read-deassert | 不支持 feature、错宽度/越界 capability、未 ready notify、reset 清理 |
 | split virtqueue/DMA | 单 descriptor 和 scatter read、used-ring completion | descriptor 环、bad next、错方向、guest-memory fault、地址/长度溢出、缺 status |
 | virtio block | capacity、512-byte sector、只读 IN 请求 | 越界 sector、非整扇区、OUT=IOERR、未知类型=UNSUPP、空/未对齐 backend |
-| graph/firmware/config | 自动 BDF/aperture/INTx、root `_CRS` 与 `_PRT` 同源、catalog build | 用户数值资源、资源冲突、缺失镜像、重复 id/model |
-| 资产 | reference QEMU 加载 `BOOTX64.EFI` 并读取 identity | digest 不一致、缺 fallback 文件、损坏 FAT/identity |
-| Axvisor E2E | VMX/SVM 同一 guest TOML 命中 EFI marker | 未命中 marker 时保留首个失败、设备 trace 和资产摘要 |
+| graph/firmware/config | 固定 typed BDF、自动 aperture/INTx、root `_CRS` 与 `_PRT` 同源、静态/runtime image provider | 用户数值资源、资源冲突、缺失/空/未对齐镜像、`read_only=false`、重复 model |
+| 资产 | 两次生成 digest 相同，reference QEMU 直接挂载 raw ext4 并读取 identity | e2fsprogs 能力不符、digest 不一致、损坏 filesystem/identity、只读属性丢失 |
+| Axvisor E2E | VMX/SVM 同一 guest TOML 命中 Linux 数据盘 marker | 未命中 marker 时保留首个失败、设备 trace 和资产摘要 |
 
-Rust 改动执行 `cargo fmt`、受影响 crate 的 `cargo xtask clippy --package <crate>` 和最低层测试；Axvisor case 使用 `cargo xtask axvisor test`。E2E case 在 F5 前保持 non-gating，并继续回归 V 阶段的 `smoke-vmx`、`smoke-svm`、`ovmf-acpi-vmx` 和 `ovmf-acpi-svm`。
+Rust 改动执行 `cargo fmt`、受影响 crate 的 `cargo xtask clippy --package <crate>` 和最低层测试；Axvisor case 使用 `cargo xtask axvisor test`。E2E case 在 F6 前保持 non-gating，并继续回归 V 阶段的 `smoke-vmx`、`smoke-svm`、`ovmf-acpi-vmx` 和 `ovmf-acpi-svm`。
 
 #### 7.11 退出条件
 
-- [ ] 固定 OVMF 的 virtio PCI/block、partition、FAT 驱动兼容性有可复核证据；
-- [ ] OVMF 枚举到 `1af4:1042` function，完成 BAR probe/assignment 并启用 memory decode；
-- [ ] PCI aperture、BDF、INTx route、ACPI `_CRS`/`_PRT` 和 runtime 均能追溯到同一 resolved plan；
-- [ ] guest 通过只读 virtio-blk 读取 partition、FAT、EFI 应用和 identity 文件；
-- [ ] EFI 应用输出含正确 identity 的 guest 专属 marker；
+- [ ] 现有 direct-boot Linux 的 virtio PCI/block 和 ext4 驱动兼容性有可复核证据；
+- [ ] Linux 枚举到 `1af4:1042` function，BAR 已分配并启用 memory decode；
+- [ ] PCI aperture、typed BDF plan、INTx route、ACPI `_CRS`/`_PRT` 和 runtime 均能追溯到同一 machine/resolved plan；
+- [ ] guest 通过只读 virtio-blk 直接挂载 raw ext4，并读取 identity 文件；
+- [ ] guest 验证只读属性、写入失败和 INTx completion 增长，runner 证明镜像摘要不变，并输出含正确 identity 的专属 marker；
 - [ ] PCI、transport、virtqueue、DMA、block、backend 和 reset 的最低层成功/错误测试全部通过；
-- [ ] VMX/SVM 使用同一 guest 配置和同一 OVMF/ESP digest 通过；
+- [ ] VMX/SVM 使用同一 guest 配置和同一数据盘 digest 通过；
 - [ ] V 阶段四个 case 不退化，F2 case 保持 non-gating；
-- [ ] 没有新增 legacy transport、磁盘写入、MSI/MSI-X、Linux、VARS 或 SMP 的隐式支持声明。
+- [ ] 没有新增 legacy transport、磁盘写入、MSI/MSI-X、OVMF 启动、VARS 或 SMP 的隐式支持声明。
 
-F2 尚不以 Linux shell、多 vCPU、VARS 持久化或任意 PCI 设备通用性为完成条件。任何一项核心退出条件失败时，不得以延长 timeout、放宽 regex、手工选择 OVMF 菜单或改用 fw_cfg payload 代替。
+F2 尚不以 OVMF/EFI 启动、多 vCPU、VARS 持久化、多盘或任意 PCI 设备通用性为完成条件。任何一项核心退出条件失败时，不得以延长 timeout、放宽 regex、测试侧直接读取 host image 或私有 fw_cfg 块协议代替。
 
-### 8. 阶段 F3：Linux EFI 启动与 VARS 生命周期
+### 8. 阶段 F3：PCI 启动盘与 EFI 应用
 
 #### 8.1 目标
 
+复用 F2 已交付的 `virtio-blk-pci` 产品设备，让 OVMF 从 partitioned FAT ESP 加载一个确定性的 EFI 应用。F3 不再修改 PCI、virtqueue 或 block 协议来制造第二条启动专用路径；若 OVMF 暴露 F2 未覆盖的标准访问序列，应先为同一设备补最低层回归。
+
+```text
+F2 的只读 virtio-blk-pci
+  -> OVMF VirtioPciDeviceDxe / VirtioBlkDxe
+  -> Block I/O -> partition -> FAT
+  -> \\EFI\\BOOT\\BOOTX64.EFI
+  -> 应用读取同一 ESP 的 \\AXVISOR\\F3-ID.TXT
+  -> AXVISOR_X86_UEFI_PCI_APP_PASSED
+```
+
+完成 F3 后，用户可以配置标准只读 guest PCI 启动盘，并通过 removable-media fallback 启动 EFI payload；不需要 Boot#### 持久化、Linux EFI stub 或手工进入 OVMF 菜单。
+
+#### 8.2 进入条件和兼容性确认
+
+- F2 的 VMX/SVM 数据盘用例和 V 阶段四个基线用例全部通过；
+- 固定本阶段使用的 Ostool OVMF 路径、布局和 digest，并从对应 EDK2 build/module 信息确认包含 `VirtioPciDeviceDxe`、`VirtioBlkDxe`、partition、FAT 和 removable-media boot 支持；
+- 用同一 OVMF 在参考 QEMU 上启动候选 ESP，证明分区、FAT、`BOOTX64.EFI` 和 identity 文件自身有效；
+- 固定 UEFI 2.10 为固件接口依据，并记录 OVMF 的实际 PCI/virtio 访问序列；该序列只能发现标准兼容性缺口，不能成为偏离 VirtIO 1.2 的理由。
+
+若固定 OVMF 不包含所需驱动，不得静默退回 legacy virtio、私有 fw_cfg 磁盘或把额外块驱动塞入 ESP。必须先修订本文并重新评审“更换受管 OVMF”或“选择另一种标准块设备”。
+
+#### 8.3 范围和证据
+
+- ESP 使用可重复生成的 GPT 或 MBR partitioned FAT；记录生成工具、输入文件清单、镜像尺寸和 digest；
+- ESP 至少包含 `\\EFI\\BOOT\\BOOTX64.EFI` 和 `\\AXVISOR\\F3-ID.TXT`；
+- EFI 应用通过 `LoadedImage` device handle 打开同一 Simple File System，读取并校验 identity，再向 guest console 输出包含该 identity 的 marker；
+- VMX/SVM 共用同一 guest TOML、OVMF 和 ESP digest；
+- 保留 F2 direct-boot Linux 数据盘用例，固件启动不能成为设备协议的唯一证据。
+
+F3 不包含 Linux EFI stub、VARS 持久化、磁盘写入、MSI/MSI-X、多队列或多 vCPU。除修复 OVMF 首次暴露且符合规范的同设备缺口外，F3 的增量应主要位于 boot policy、测试资产、用户配置示例和 runner 接线；不得重新实现 PCI root bus 或 virtio block core。若 F2 的标准设备在固定 OVMF 下无需产品代码修改即可完成本阶段链路，F3 应如实标为集成交付，不得为了把它包装成“新增 feature”而制造启动开关、专用协议或空公共接口。
+
+#### 8.4 退出条件
+
+- [ ] 固定 OVMF 的 virtio PCI/block、partition、FAT 和 removable-media boot 兼容性有可复核证据；
+- [ ] OVMF 枚举 F2 的 `1af4:1042` function，并从同一只读设备读取 ESP；
+- [ ] EFI 应用由 `\\EFI\\BOOT\\BOOTX64.EFI` 自动加载，不依赖持久化 Boot#### 或人工菜单；
+- [ ] EFI 应用从自身启动设备读取正确 identity，并输出 `AXVISOR_X86_UEFI_PCI_APP_PASSED`；
+- [ ] VMX/SVM 使用同一 guest 配置和同一 OVMF/ESP digest 通过；
+- [ ] F2 数据盘用例和 V 阶段四个 case 不退化，F3 case 保持 non-gating；
+- [ ] 没有引入启动专用设备旁路、legacy transport、Linux、VARS、磁盘写入或 SMP 的隐式支持声明。
+
+### 9. 阶段 F4：Linux EFI 启动与 VARS 生命周期
+
+#### 9.1 目标
+
 把当前通过 fw_cfg 提供 kernel/initrd 的 Linux 证据推进为标准 guest 启动盘路径：OVMF 从 ESP 加载 Linux EFI stub，Linux 进入 initramfs 或 shell。同时明确嵌套 OVMF VARS 的创建、隔离、重启和清理语义。
 
-#### 8.2 设计边界
+#### 9.2 设计边界
 
 - Linux kernel、initrd 和 cmdline 的来源必须在测试配置中显式；
 - 每个 case 使用隔离的 VARS，不得修改共享缓存模板；
 - 若声明持久化，必须定义 VM 重启、测试重跑和失败清理后的状态；
 - EFI stub 与 initramfs marker 必须来自 guest console；
-- 保留 F2 的独立 EFI 应用用例，Linux 不能成为唯一的设备协议测试。
+- 保留 F2 的 direct-boot Linux 数据盘用例和 F3 的独立 EFI 应用用例，Linux EFI 启动不能成为唯一的设备协议或固件证据。
 
-#### 8.3 退出条件
+#### 9.3 退出条件
 
 - OVMF 从 guest ESP 加载 Linux EFI stub；
 - Linux 到达确定的 initramfs/shell marker；
@@ -505,34 +581,34 @@ F2 尚不以 Linux shell、多 vCPU、VARS 持久化或任意 PCI 设备通用�
 - VARS 隔离和约定的持久化/非持久化行为有自动测试；
 - VMX/SVM 使用同一 guest baseline 通过。
 
-### 9. 阶段 F4：中断完整性与 SMP
+### 10. 阶段 F5：中断完整性与 SMP
 
-#### 9.1 范围
+#### 10.1 范围
 
-- 在 F2 启动盘的单设备 INTx 基线上，完成任意 PCI endpoint 的 controller-owned INTx 路由并增加 MSI/MSI-X；
+- 在 F2 数据盘和 F3 启动盘的单设备 INTx 基线上，完成任意 PCI endpoint 的 controller-owned INTx 路由并增加 MSI/MSI-X；
 - 实现 INIT/SIPI，保持 firmware APIC ID 与逻辑 vCPU ID 映射明确；
 - 实现 NMI，或对尚不支持的调用返回明确错误，不能继续静默忽略；
 - level IRQ 的 pending/active/route/EOI 状态只由 PIC/IOAPIC/LAPIC 所有；
 - 使用至少两个 vCPU 的 UEFI guest 验证 AP 启动、timer、IPI 和设备中断。
 
-#### 9.2 退出条件
+#### 10.2 退出条件
 
 - 两个及以上 vCPU 被 Linux 报告为 online；
 - INIT/SIPI 顺序、重复 SIPI、无效 APIC ID 和 reset 有确定回归；
 - 启动设备的 INTx 回归保持通过，并至少用一个实际设备覆盖 MSI/MSI-X 新路径；
 - VMX/SVM 的 SMP guest 均通过；
-- 单 vCPU F2/F3 用例不退化。
+- 单 vCPU F2/F3/F4 用例不退化。
 
-### 10. 阶段 F5：稳定性与 CI 门禁
+### 11. 阶段 F6：稳定性与 CI 门禁
 
-#### 10.1 进入条件
+#### 11.1 进入条件
 
-- F2/F3 的 VMX/SVM 单 vCPU 用例稳定；
-- F4 的多 vCPU 用例达到约定稳定性；
+- F2/F3/F4 的 VMX/SVM 单 vCPU 用例稳定；
+- F5 的多 vCPU 用例达到约定稳定性；
 - 固件获取、guest 资产准备和结果归因完全自动化；
 - 不依赖人工日志判断、超长跨行 regex 或扩大 timeout 掩盖波动。
 
-#### 10.2 交付
+#### 11.2 交付
 
 - 为 Intel/VMX 与 AMD/SVM 保留独立 self-hosted case；
 - 两者使用同一 backend-neutral guest baseline；
@@ -540,7 +616,7 @@ F2 尚不以 Linux shell、多 vCPU、VARS 持久化或任意 PCI 设备通用�
 - `cache_key` 在 self-hosted CI matrix 中保持空字符串；
 - 记录重复运行次数、失败率和已知宿主限制后再启用 gating。
 
-### 11. 跨阶段验证矩阵
+### 12. 跨阶段验证矩阵
 
 | 声明或风险 | 最低层验证 | 运行验证 | 首次要求阶段 |
 | --- | --- | --- | --- |
@@ -549,14 +625,15 @@ F2 尚不以 Linux shell、多 vCPU、VARS 持久化或任意 PCI 设备通用�
 | resolved graph 一致性 | resource planning/firmware plan 测试 | guest tty/IOAPIC/ACPI | V |
 | 当前 OVMF/Linux 链路可复现 | runner discovery/build 测试 | `AXVISOR_X86_OVMF_ACPI_PASSED` | V |
 | 已确认平台缺口被正确修复 | 修复前失败回归 | V 阶段全量复跑 | F1（条件） |
-| PCI 启动设备协议完整 | config/BAR/DMA/reset/error 测试 | EFI 应用 marker | F2 |
-| Linux 从 guest ESP 启动 | EFI/磁盘/VARS 测试 | Linux initramfs/shell marker | F3 |
-| 中断与 SMP 完整 | APIC/INIT/SIPI/IRQ 状态测试 | 多 vCPU Linux marker | F4 |
-| backend 与稳定性 | 同一 guest config 校验 | VMX/SVM 重复与 CI | F5 |
+| PCI 只读数据盘协议完整 | config/BAR/DMA/reset/error 测试 | direct-boot Linux 数据盘 marker | F2 |
+| OVMF 从 PCI ESP 启动 EFI 应用 | OVMF/ESP 资产与同设备回归 | EFI 应用 marker | F3 |
+| Linux 从 guest ESP 启动 | EFI/磁盘/VARS 测试 | Linux initramfs/shell marker | F4 |
+| 中断与 SMP 完整 | APIC/INIT/SIPI/IRQ 状态测试 | 多 vCPU Linux marker | F5 |
+| backend 与稳定性 | 同一 guest config 校验 | VMX/SVM 重复与 CI | F6 |
 
 每次修改 Rust 逻辑仍须运行 `cargo fmt`、目标 `cargo xtask clippy --package <crate>` 和对应最低层测试；Axvisor 构建与运行优先使用 `cargo xtask`。
 
-### 12. 错误、资源与回滚规则
+### 13. 错误、资源与回滚规则
 
 - 固件和设备图在 VM 可运行前完成规划与 build，不在 vCPU 热路径动态注册设备；
 - fw_cfg selector/DMA 状态使用既有非睡眠同步，锁内不执行外部 I/O 或回调其他设备；
@@ -565,13 +642,13 @@ F2 尚不以 Linux shell、多 vCPU、VARS 持久化或任意 PCI 设备通用�
 - 固件窗口、RAM、ACPI image、PCI BAR 和 device hole 由单一规划负责并检查溢出/重叠；
 - 测试资产必须隔离、可清理；共享 OVMF VARS 模板不得被原地修改；
 - 每个 feature 阶段可以独立回滚，回滚时同步移除配置、runner 接线、测试和文档声明；
-- V 阶段保持 non-gating，F5 之前不改变现有 CI 默认行为。
+- V/F2/F3/F4/F5 的新增用例保持 non-gating，F6 之前不改变现有 CI 默认行为。
 
-### 13. 派生文档规则
+### 14. 派生文档规则
 
 后续维护 `pr1.md`、`pr2.md` 或新的 PR 计划时：
 
-1. 先声明它对应本文的 V、F1、F2、F3、F4 或 F5；
+1. 先声明它对应本文的 V、F1、F2、F3、F4、F5 或 F6；
 2. 只展开该阶段的提交拆分、负责人、运行记录和 PR 文案；
 3. 不重新定义目标、现状、证据强度、架构不变量或跨阶段边界；
 4. 如果实施发现本文事实错误，先以当前 `dev` 证据修订本文，再更新派生文档；
