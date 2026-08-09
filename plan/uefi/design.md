@@ -357,6 +357,8 @@ guest TOML 中的只读磁盘后端
 
 成功 marker 必须由 guest Linux 在核对实际 PCI identity、块设备只读属性和 identity 文件内容后写入 guest console。仅看到 PCI vendor/device、BAR 访问、virtqueue notify 或设备节点均不能完成 F2。
 
+> marker 输出格式：guest 先单独输出一行裸 marker `AXVISOR_X86_PCI_BLOCK_PASSED`，再输出 identity 键值行（如 `identity=axvisor-f2-readonly-data-v1`）。成功 marker 与 identity 是两行输出：success_regex 以 `(?m)^AXVISOR_X86_PCI_BLOCK_PASSED\s*$` 行尾锚定匹配裸 marker 行，identity 由 runner 单独核对。此格式沿用现有 `ovmf-acpi` case 的 `echo $success_marker` 模式，避免 regex 与带 identity 的单行输出互相矛盾。
+
 #### 7.2 进入条件和兼容性确认
 
 开始修改产品代码前必须满足：
@@ -462,7 +464,7 @@ provider 在 VM resource planning 前检查存在性、非零长度、512 字节
 
 参考 QEMU 使用 `disable-legacy=on` 的 `virtio-blk-pci` 和 read-only raw drive，把同一镜像作为 `/dev/vda` 挂载并读取 identity；这只证明资产和 Linux driver 兼容，不替代 Axvisor E2E。
 
-direct-boot Linux initramfs 必须完成以下检查后，才向 guest console 输出 `AXVISOR_X86_PCI_BLOCK_PASSED identity=axvisor-f2-readonly-data-v1`：
+direct-boot Linux initramfs 必须完成以下检查后，才向 guest console 先输出一行裸 marker `AXVISOR_X86_PCI_BLOCK_PASSED`、再输出 identity 键值行 `identity=axvisor-f2-readonly-data-v1`：
 
 1. `/sys/bus/pci/devices/0000:00:03.0` 报告 `1af4:1042`，BAR0 已分配且 memory-space decode 已启用；
 2. Linux 已绑定 `virtio_pci`/`virtio_blk`，从该 PCI function 的 sysfs `irq` 取得 Linux IRQ number，并在挂载前记录 `/proc/interrupts` completion count；
@@ -480,7 +482,7 @@ F2 是第一个可用 feature 阶段。PCI root-bus 重构、virtqueue core 或 
 1. `docs(uefi): finalize the F2 read-only PCI disk contract`：只修改本文，固定单节点、单盘、raw ext4、资源、配置和证据；
 2. `refactor(axdevice): prepare the x86 PCI root bus for one function`：在不增加用户可见设备的前提下，把固定 config state 重整为组合 function、typed BDF、BAR probe/decode 和可选 aperture；所有接口保持最小可见性，以 host/LPC、absent function 和 ACPI 行为测试证明等价；
 3. `feat(axvisor): add an x86 read-only virtio PCI block disk`：同一提交加入 split virtqueue/block core、modern PCI function、INTx、x86 planner、resolved resources、ACPI、配置解析和 immutable image provider，并配齐最低层及配置/资源集成测试；
-4. `test(axvisor): validate the PCI data disk from Linux`：加入确定性 raw ext4 生成、reference-QEMU 检查、VMX/SVM E2E 和专属 marker；
+4. `test(axvisor): validate the PCI data disk from Linux`：加入确定性 raw ext4 生成、reference-QEMU 检查、VMX/SVM E2E 和专属 marker。E2E 的 qemu TOML 沿用现有 x86_64 case 的 `uefi = true` + `to_bin = true`（x86_64 Axvisor hypervisor 是 PE/COFF EFI 应用，外层 QEMU 必须经 ostool UEFI pflash+ESP 流程启动，`uefi = false` 会让 ostool 回退 `-kernel` 直启而无法进入 long-mode）；“不依赖嵌套 OVMF”的落点是 guest 配置 `enable_bios = false`、`boot_protocol = direct`，以及 build TOML 不设置 `AXVISOR_TEST_X86_OVMF_OUTPUT`，而非关闭外层 UEFI 标志；
 5. `docs(uefi): record F2 validation evidence`：记录最终 head、数据盘 digest、命令、VMX/SVM backend 结果和已知限制，同步派生 PR 文档。
 
 第 2 项可作为独立、行为保持的前置 PR。产品 feature 的 core、配置和集成统一放在第 3 项，确保新公共 capability 在同一提交有真实调用方，避免先合入只能枚举、没有 backend 或无法运行的半成品。第 4 项增加交付证据但不能补写产品主语义；若 E2E 暴露标准协议缺口，应先回到第 3 项补最低层回归和实现。
