@@ -477,15 +477,22 @@ direct-boot Linux initramfs 必须完成以下检查后，才向 guest console �
 
 #### 7.9 实施单元与提交顺序
 
-F2 是第一个可用 feature 阶段。PCI root-bus 重构、virtqueue core 或 x86 planner/image-provider 接线都只是阶段内实施单元，单独完成时不能声明一个新 feature。推荐按以下顺序提交，每个提交都必须编译并通过当时适用的测试：
+F2 是第一个可用 feature 阶段。PCI root-bus 重构、virtqueue core、x86 planner/image-provider 接线和测试资产都只是阶段内实施单元，单独完成时不能声明一个新 feature。以下顺序把行为保持重构、协议 core、设备 transport、machine plan、应用后端和 E2E 分开；每个提交都必须可构建、通过对应最低层测试，并在修改 Rust crate 时通过该 crate 的 targeted clippy：
 
-1. `docs(uefi): finalize the F2 read-only PCI disk contract`：只修改本文，固定单节点、单盘、raw ext4、资源、配置和证据；
-2. `refactor(axdevice): prepare the x86 PCI root bus for one function`：在不增加用户可见设备的前提下，把固定 config state 重整为组合 function、typed BDF、BAR probe/decode 和可选 aperture；所有接口保持最小可见性，以 host/LPC、absent function 和 ACPI 行为测试证明等价；
-3. `feat(axvisor): add an x86 read-only virtio PCI block disk`：同一提交加入 split virtqueue/block core、modern PCI function、INTx、x86 planner、resolved resources、ACPI、配置解析和 immutable image provider，并配齐最低层及配置/资源集成测试；
-4. `test(axvisor): validate the PCI data disk from Linux`：加入确定性 raw ext4 生成、reference-QEMU 检查、VMX/SVM E2E 和专属 marker。E2E 的 qemu TOML 沿用现有 x86_64 case 的 `uefi = true` + `to_bin = true`（x86_64 Axvisor hypervisor 是 PE/COFF EFI 应用，外层 QEMU 必须经 ostool UEFI pflash+ESP 流程启动，`uefi = false` 会让 ostool 回退 `-kernel` 直启而无法进入 long-mode）；“不依赖嵌套 OVMF”的落点是 guest 配置 `enable_bios = false`、`boot_protocol = direct`，以及 build TOML 不设置 `AXVISOR_TEST_X86_OVMF_OUTPUT`，而非关闭外层 UEFI 标志；
-5. `docs(uefi): record F2 validation evidence`：记录最终 head、数据盘 digest、命令、VMX/SVM backend 结果和已知限制，同步派生 PR 文档。
+1. **已完成** `docs(uefi): finalize the F2 read-only PCI disk contract`：只修改本文，固定单节点、单盘、raw ext4、资源、配置和证据；实现分支不重复携带 `plan/` 文档；
+2. `refactor(axdevice): make x86 PCI functions table-driven`：只把当前 host bridge/LPC 的 BDF、config lookup 和 absent-function 行为改为 typed、表驱动表示，不增加 BAR aperture、INTx 或用户可见 endpoint；现有 config-space 行为测试前后等价；
+3. `feat(axdevice): add one MMIO PCI function slot`：在 root bus 内加入唯一可选 function、4 KiB BAR probe/assignment/decode、PCI command/status 和 reset；使用 synthetic function 覆盖正常/非法访问，但不加入 VirtIO、guest-memory 或用户配置；
+4. `feat(axdevice): add a checked split virtqueue`：加入 queue 0 所需的 descriptor/ring 状态、checked guest-memory walker、used completion 和 reset；成功、环、bad next、错方向、地址/长度溢出及 DMA fault 都在本提交最低层测试，不依赖 PCI transport；
+5. `feat(axdevice): add a read-only virtio block PCI function`：用第 3、4 项组合 modern capability chain、feature/status 状态机、同步 `VIRTIO_BLK_T_IN`、只读错误语义、ISR 和 level INTx；以 synthetic guest memory/backend 完成一次真实 read completion，并覆盖 reset 与 assert-read-deassert。至此设备协议完整，但尚不接受用户 TOML；
+6. `feat(axvm): plan an x86 virtio block PCI disk`：x86 planner 消费至多一个 `virtio-blk-pci` 请求，建立 typed BDF plan、4 KiB aperture、guest-memory grant 和 wired IRQ claim，并让 ACPI `_CRS`/`_PRT` 与 runtime 同源；使用 fake immutable image provider 做 graph/firmware/config 集成测试，不接 `ax_std::fs`；
+7. `feat(axvisor): load immutable virtio block images`：实现编译期静态镜像和启用 `fs` 时的 runtime 文件快照，校验 path、非空、512 字节对齐和 `read_only=true`，把 provider 接入 VM 配置。该提交结束后用户配置形成可用产品 feature，缺失 provider 或非法镜像明确失败；
+8. `test(axbuild): prepare a deterministic Axvisor block image`：生成 8 MiB raw ext4、固定 identity/metadata，验证连续两次生成 SHA-256 相同，并完成 reference-QEMU 资产兼容性检查；不修改产品设备语义；
+9. `test(axvisor): read the PCI data disk from Linux`：加入 initramfs 检查、VMX/SVM case、INTx completion、只读写失败、identity 和前后 digest 证据。E2E 的 qemu TOML 沿用现有 x86_64 case 的 `uefi = true` + `to_bin = true`（x86_64 Axvisor hypervisor 是 PE/COFF EFI 应用，外层 QEMU 必须经 ostool UEFI pflash+ESP 流程启动，`uefi = false` 会让 ostool 回退 `-kernel` 直启而无法进入 long-mode）；“不依赖嵌套 OVMF”的落点是 guest 配置 `enable_bios = false`、`boot_protocol = direct`，以及 build TOML 不设置 `AXVISOR_TEST_X86_OVMF_OUTPUT`，而非关闭外层 UEFI 标志；
+10. `docs(uefi): record F2 validation evidence`：在实现合入后回到 `plan` 分支，记录最终 head、数据盘 digest、命令、VMX/SVM backend 结果和已知限制，同步派生 PR 文档。
 
-第 2 项可作为独立、行为保持的前置 PR。产品 feature 的 core、配置和集成统一放在第 3 项，确保新公共 capability 在同一提交有真实调用方，避免先合入只能枚举、没有 backend 或无法运行的半成品。第 4 项增加交付证据但不能补写产品主语义；若 E2E 暴露标准协议缺口，应先回到第 3 项补最低层回归和实现。
+第 2 项可以作为独立、行为保持的前置 PR；第 3～7 项原则上组成同一个 feature PR，但保留上述提交边界供逐层审核和定位回归。第 4 项新增的 queue API 必须保持最小可见性，并在同一 PR 的第 5 项获得真实产品调用方；不得单独合入长期闲置的公共抽象。第 7 项是首次暴露用户配置的提交，此前不得注册空 model、接受但忽略 backend，或声明磁盘可用。
+
+实施中若任一提交预计超过约 1,500 行非测试代码、同时修改两个以上状态所有者，或必须依赖后续提交才能解释错误/资源生命周期，应在写入代码前继续拆分并先修订本文。第 8、9 项只能增加资产和交付证据，不能借 E2E 之名补产品主语义；若 E2E 暴露标准协议缺口，必须回到拥有该语义的第 3～7 项增加最低层回归和修复。
 
 #### 7.10 分层验证
 
