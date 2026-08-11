@@ -383,6 +383,35 @@ guest TOML 中的只读磁盘后端
 
 F2 明确只支持每个 VM 一块只读数据盘，并且不包含：OVMF 从盘启动、EFI 应用、Linux EFI stub、VARS 持久化、多盘、多 endpoint registry、多队列、packed virtqueue、indirect descriptor、event index、MSI/MSI-X、热插拔、IOMMU、磁盘写入和多 vCPU。这些能力不得以未声明 feature bit、空实现或伪成功形式出现。
 
+#### 7.3.1 参照实现对照
+
+Cloud Hypervisor 的 virtio-devices crate 是成熟的 modern virtio-blk PCI 参考实现，其 Linux 与 OVMF `VirtioBlkDxe` 双驱动已验证；F2 以下契约细节与 CH 对齐，作为语义正确性的参照基准。CH 是活跃演进代码库，本表钉住核对时的 checkout：`1af93ac7035cda77cd87b0c18b1134ebb0928052`（2026-08-11，UTC）；后续复核应以该 commit 为基准，如需引用新基线先在本表更新并重核逐项结论。
+
+| 细节 | CH 实现 | F2 对齐点 |
+| --- | --- | --- |
+| capability 结构布局 | 单 BAR 承载 common/notify/ISR/device config 各结构，`cap_len = size_of(VirtioPciCap) + VIRTIO_PCI_CAP_OFFSET(2)`，`length` 填各结构实际字节数（notify 为 `NOTIFICATION_SIZE = MAX_QUEUES(0x400) × multiplier(4) = 4096` 字节，见 7.5 的排布说明） | 7.5 的 `cap_len`/`length` 语义与排布 |
+| common config 寄存器集 | `VirtioPciCommonConfig` 完整实现 0x00–0x34 各寄存器，64-bit 地址寄存器支持 32-bit 高低半与 64-bit 写入 | 7.5 的完整寄存器表 |
+| queue enable 翻译 | `queue_enable` 写 1 时按三个 ring 结构大小逐一 `translate_gva`，失败置回未 ready | 7.6 的 queue-enable 地址布局校验；失败不置 ready 且不写 device_status |
+| 只读强制 | 只读后端发布 `VIRTIO_BLK_F_RO`，且 activate 时无条件把 RO 计入 acked features（即使 guest 未 ack） | F2 只发布 VERSION_1+RO；RO 语义按 7.5/7.6 强制生效 |
+| ISR | ISR 读清零（`swap(0)`），ISR 写按位清除 | 7.5 的 ISR 读清零与写按位清除 |
+| INTx 断言与 PCI command INTx-disable 解耦 | CH 无对应路径：中断全部走 MSI-X，`interrupt_status` 只被 ISR 读/写触碰，无任何代码置位 ISR bit 或断言/撤销 INTx | F2 设计，参照 VirtIO 1.2 §4.1.4.5.1（ISR status capability：ISR bit 置位与读后清除即 INTx 断言/去断言；config-change 的 ISR 通知语义见 §4.1.5.4）及 PCI conventional 的 INTx disable 语义；与 CH 无关，见 7.6 |
+| config_generation | device config 读路径先 `consume_config_change()` 再返回数据 | 7.5 的 config_generation 消费语义 |
+
+F2 裁剪清单——以下能力 CH 为通用虚拟化场景提供，F2 明确不做，原因一行说明：
+
+| 裁剪项 | 裁剪原因 |
+| --- | --- |
+| MSI-X 全套（msix_config/queue_msix_vector、MSI-X table/PBA、vector 触发） | F2 单盘 INTx 已够用，MSI-X 属于 F5 |
+| `VIRTIO_PCI_CAP_PCI_CFG` 间接 BAR 访问 capability | 显式偏离 VirtIO 1.2 §4.1.4.9.1 的 MUST；F2 的 4 KiB BAR 可直接映射，无早期 config 访问需求，F3 固定 OVMF 访问序列时复核 |
+| 异步 worker/ioeventfd/eventfd 通知 | F2 同步 notify，热路径不产生后台请求 |
+| rate limiter | 单只读盘无节流需求 |
+| `VIRTIO_F_ACCESS_PLATFORM` | 未引入 IOMMU，DMA 按物理地址直通 |
+| 多队列（`VIRTIO_BLK_F_MQ`） | F2 单 queue |
+| sector0 写保护（`disable_sector0_writes`） | 只读盘写入一律 IOERR，无需单独保护 sector 0 |
+| `VIRTIO_BLK_F_WRITE_ZEROES`/`VIRTIO_BLK_F_DISCARD`/`VIRTIO_BLK_F_FLUSH` 及 config 中对应字段 | 只读盘无写路径，不发布这些 feature |
+
+CH 与 F2 的架构选择可以不同（CH 使用大型单 BAR、MSI-X 为主、异步 worker；F2 固定 4 KiB BAR、INTx、同步处理），文档只对齐上述协议细节，不把 CH 的架构选择列为 F2 要求。
+
 #### 7.4 PCI root bus 与资源所有权
 
 当前 `X86PciConfigDevice` 只有 bus 0 上固定的 host bridge 和 LPC bridge，不能直接承载真实 endpoint；尤其不能把 resolved graph 中的固定 MMIO range 当成可由 guest PCI driver 任意重编程的 BAR。F2 把它扩展为一个组合唯一 virtio-blk function 的 PCI root-bus owner：
@@ -401,14 +430,43 @@ PCI config 最低要求包括 conventional header、command/status、capability 
 
 #### 7.5 modern virtio-blk PCI 协议面
 
-设备使用 VirtIO 1.2 non-transitional PCI 身份：vendor `0x1af4`、virtio block device ID `2` 对应 PCI device `0x1042`，revision 不使用 legacy 值。4 KiB BAR0 固定承载：
+设备使用 VirtIO 1.2 non-transitional PCI 身份：vendor `0x1af4`、virtio block device ID `2` 对应 PCI device `0x1042`，revision 不使用 legacy 值，PCI header 的 class/subclass 为 `0x01`/`0x80`（Mass Storage / Mass Storage controller，与参照实现 CH 的 block PCI 设备一致）。4 KiB BAR0 固定承载：
 
 - `0x000`：common configuration；
 - `0x100`：queue notification，`notify_off_multiplier = 4`；
 - `0x200`：ISR status；
 - `0x300`：block device-specific configuration，至少包含 64-bit capacity。
 
-`VIRTIO_PCI_CAP_PCI_CFG` 只是访问上述 BAR region 的可选替代通道，不是 modern virtio PCI device 的必需 capability；F2 不实现也不发布它。只有后续出现独立、可复现且无法通过标准 BAR access 解决的兼容性需求时，才能先修订设计再增加。
+`VIRTIO_PCI_CAP_PCI_CFG` 是驱动通过 config space 访问上述 BAR region 的替代通道；但 VirtIO 1.2 §4.1.4.9.1 规定设备 MUST 至少发布一个该 capability，因此 F2 不实现它是显式规范偏离（对照实现 CH 实现了该 cap 并用于早期 config 访问）。F2 的 4 KiB BAR 全程可直接映射、早期固件不依赖该通道，所以偏离成立，但必须记录并复核两点：其一，OVMF `VirtioPciDxe` 的访问序列是否依赖 PCI_CFG 通道，若依赖则 F3 进入条件必须把该 gap 显式列入并先修订本文（F3 固定 OVMF 的访问序列时复核，见 8.2）；其二，只在后续出现独立、可复现且无法通过标准 BAR access 解决的兼容性需求时，才按 CH 方式实现该 capability，同样先修订设计再增加。
+
+capability 结构中的 `cap_len` 与 `length` 是两个独立长度字段，语义不同（与参照实现 CH 的 `VirtioPciCap` 一致）：
+
+- `cap_len` 是 capability 结构自身的总字节数，不含由 capability list 机制管理的 `cap_vndr`/`cap_next` 两个字节；CH 用 `VIRTIO_PCI_CAP_OFFSET = 2` 表达这两个字节，`cap_len = size_of(VirtioPciCap) + 2`；
+- `length` 是各结构体在 BAR 内的实际字节数，不是整个 BAR region 的大小：common config 完整结构为 56 字节；notify 为 4 字节（`cap.length = 4` 是 F2 单队列自选的 length，满足 VirtIO 1.2 §4.1.4.2.1 的 MUST；CH 的 notify cap 为 `NOTIFICATION_SIZE = MAX_QUEUES(0x400) × multiplier(4) = 4096` 字节，其多队列槽位预留不是 F2 的约束；`notify_off_multiplier = 4`，一个 32-bit 槽位，queue 0 槽位 offset 0，notify region 在 F2 中即 `0x100..0x104`）；ISR 为 1；device config 至少 8（F2 为 64-bit capacity）；
+- 各结构在 BAR 内的排布：CH 在自己的大型 BAR 中按 8 KiB 对齐放置每个结构（PCI 规范对同 BAR 共享 MSI-X/非 MSI-X 结构时的推荐对齐）；F2 的 4 KiB BAR 按 `0x100` 粒度紧凑排布，`offset`/`length` 精确描述实际位置，两种排布都符合规范。
+
+common configuration 是 56 字节的完整寄存器集，偏移与读写属性与参照实现 CH 的 `VirtioPciCommonConfig` 一致：
+
+| 偏移 | 寄存器 | 宽度 | 访问 | F2 语义 |
+| --- | --- | --- | --- | --- |
+| `0x00` | device_feature_select | 32 | RW | 选择读取 64-bit feature 的哪个 32 位半区 |
+| `0x04` | device_feature | 32 | RO | 按 select 返回已发布 feature 的对应半区；select ≥ 2 返回 0 |
+| `0x08` | driver_feature_select | 32 | RW | 选择写入 64-bit feature 的哪个 32 位半区 |
+| `0x0c` | driver_feature | 32 | WO | 只接受已发布位的子集，未发布位静默忽略 |
+| `0x10` | msix_config | 16 | RW | F2 无 MSI-X：读返回 `0xFFFF`，写不生效 |
+| `0x12` | num_queues | 16 | RO | 固定 `1` |
+| `0x14` | device_status | 8 | RW | `ACKNOWLEDGE -> DRIVER -> FEATURES_OK -> DRIVER_OK` 与 `FAILED`；写 0 触发 reset |
+| `0x15` | config_generation | 8 | RO | device config 读路径的消费语义见下文 |
+| `0x16` | queue_select | 16 | RW | F2 只有 queue 0，选中即固定 0 |
+| `0x18` | queue_size | 16 | RW | 0（未配置）或 2 的幂，最大 128 |
+| `0x1a` | queue_msix_vector | 16 | RW | F2 无 MSI-X：读返回 `0xFFFF`，写不生效 |
+| `0x1c` | queue_enable | 16 | RW | 写 1 前先校验三个 ring 地址布局（见 7.6）；写 0 恢复未 ready；读返回当前 ready 状态（1 为 enabled，0 为 disabled；reset 后为 0，对齐 CH 的读返回 `q.ready()` 与 VirtIO 1.2 §4.1.4.3.1） |
+| `0x1e` | queue_notify_off | 16 | RO | 固定 `0`（notify region 中 queue 0 的槽位） |
+| `0x20` / `0x24` | queue_desc 低/高 32 位 | 64 | RW | 支持 32-bit 高低半独立写，也可 64-bit 一次写；读返回 0（与参照实现 CH 一致，CH 的 `read_common_config_qword`/dword 读均返回 0） |
+| `0x28` / `0x2c` | queue_avail 低/高 32 位 | 64 | RW | 同上 |
+| `0x30` / `0x34` | queue_used 低/高 32 位 | 64 | RW | 同上 |
+
+`config_generation` 采用与参照实现 CH 相同的消费语义：device config region 的每次读访问先检查 config-change 事件位，若自上次读后该事件被置位，则在本次读前递增 `config_generation`（u8 循环回绕）并清除事件位，然后才返回 capacity。F2 的只读设备 config 从不变化，`config_generation` 实际保持恒定；该机制是标准版本检测路径，保留它是为后续阶段 config 实际变化时提供规范检测基础（VirtIO 1.2 §4.1.4.3.1 是 config_generation 的设备侧要求），也便于与 OVMF `VirtioBlkDxe` 的访问序列对齐。
 
 本阶段只提供 queue 0，一个 size 为 128 的 split virtqueue。设备只发布 `VIRTIO_F_VERSION_1` 和 `VIRTIO_BLK_F_RO`；不发布 `VIRTIO_BLK_F_BLK_SIZE`、MSI-X、packed ring、ring reset、indirect descriptor、event index、flush、discard、write-zeroes、multi-queue 或 topology feature。capacity 严格等于冻结镜像字节数除以 512。
 
@@ -418,7 +476,8 @@ transport 必须完整实现本阶段可达的状态：
 - 未提供 feature 的协商不能保留 `FEATURES_OK`；`device_status = 0` 同步恢复 transport、queue、ISR 和 block request 状态；
 - queue select/size、descriptor/available/used 地址、enable、notify 和 used-ring 更新；queue 未 enable 或 device 未 `DRIVER_OK` 时不得读取 descriptor；
 - common、notify、ISR、device config 的访问宽度、对齐和越界检查；
-- 未提供 MSI-X 时使用单个 PCI INTx：完成请求先设置 ISR queue bit 和 PCI interrupt-status，再按 resolved route 断言 level IRQ；读取 ISR 清零并撤销断言；
+- 未提供 MSI-X 时使用单个 PCI INTx：完成请求先设置 ISR queue bit 和 PCI interrupt-status，再按 resolved route 断言 level IRQ；读取 ISR 清零并撤销断言；ISR status 的写操作按位清除对应位（对齐 CH 的 `fetch_and(!v)` 语义与 PCI ISR 规范）；
+- PCI command 寄存器 INTx-disable 位打开时，中断事件仍按正常顺序设置 ISR queue bit 与 interrupt-status，但不断言 INTx 电平；后续 driver 读取 ISR 时仍能观察到并清零这些位。这与 PCI 规范的 INTx disable 语义一致，保证关闭 INTx 期间不丢失中断事件（F2 设计，见 7.3.1；CH 无 INTx 路径）；
 - PCI interrupt disable、queue notification suppression 和 reset 必须阻止不应产生的中断。
 
 F2 的 INTx 是单个只读块设备所需的窄而完整路径，不代表已经完成任意 PCI endpoint、中断切换、MSI 或 MSI-X；这些泛化仍属于 F5。已观察到的 vPIC wire-mode warning 只有在 trace 证明其阻塞上述 INTx/Linux 数据盘链路时才前移为独立 fix，不能顺带塞入 virtio 提交。
@@ -433,6 +492,7 @@ virtqueue 和 virtio-blk core 放在可复用的 `no_std` 设备层，不依赖 
 - status/used ring 只有在请求结果确定后提交；DMA fault 不得报告成功，只有能够安全写入 status/used 时才提交 error completion，否则保持 queue 可 reset 并记录明确 fault；
 - used length、sector 到 byte offset 的换算和多 descriptor 总长度使用 checked arithmetic；
 - 初版同步处理 notify，不在持锁状态调用外部 I/O、调度器或其他设备；因此 reset 完成时不存在后台请求，queue/ISR/IRQ 能原子回到初始状态；
+- `queue_enable` 写 1 时对 descriptor table、available ring、used ring 三个地址做布局校验：地址非零、按各自元素大小对齐、`地址 + 布局所需字节数` 不溢出且完整落在 guest 地址空间内（与参照实现 CH 的 `translate_gva` 路径一致：在 `queue_enable` 写 1 时按 `get_vring_size` 计算三个区域各自所需字节数并逐一翻译校验）。校验失败时不得置 ready、不得读取该 ring，并记录明确错误，地址翻译失败不得被忽略后按原地址继续；`queue_enable` 写 0 恢复未 ready。该失败不写 device_status：`FAILED` 由 driver 在感知到队列未 ready 后自行置位（VirtIO 1.2 §2.1.1），设备侧对无法满足的协商只有拒绝 `FEATURES_OK` 与 `DEVICE_NEEDS_RESET` 两条标准信号，F2 不使用后者；
 - 如果后续引入异步 backend，必须先独立设计 request ownership、取消、reset barrier 和 completion lifetime，不能扩展 F2 的同步实现假装支持。
 
 #### 7.7 镜像后端和配置契约
@@ -498,9 +558,10 @@ F2 是第一个可用 feature 阶段。PCI root-bus 重构、virtqueue core、x8
 | 层级 | 必须覆盖的成功路径 | 必须覆盖的失败/边界 |
 | --- | --- | --- |
 | PCI config/root bus | `00:03.0` 枚举、header/capability chain、BAR probe/assignment、command decode、reset | absent function 全一、越界 config、错位 BAR、aperture 外 assignment、第二个 disk function |
-| virtio PCI transport | feature/status 顺序、queue 配置/enable/notify、ISR/INTx assert-read-deassert | 不支持 feature、错宽度/越界 capability、未 ready notify、reset 清理 |
-| split virtqueue/DMA | 单 descriptor 和 scatter read、used-ring completion | descriptor 环、bad next、错方向、guest-memory fault、地址/长度溢出、缺 status |
+| virtio PCI transport | feature/status 顺序、queue 配置/enable/notify、ISR/INTx assert-read-deassert | 不支持 feature、错宽度/越界 capability、未 ready notify、queue enable 地址翻译失败不置 ready、reset 清理 |
+| split virtqueue/DMA | 单 descriptor 和 scatter read、used-ring completion | descriptor 环、bad next、错方向、indirect descriptor、metadata/data overlap、guest-memory fault、地址/长度溢出、缺 status、DMA fault 不提交 used |
 | virtio block | capacity、512-byte sector、只读 IN 请求 | 越界 sector、非整扇区、OUT=IOERR、未知类型=UNSUPP、空/未对齐 backend |
+| 并发与调用边界 | 单 outstanding chain 的 serialized 处理 | guest-memory、backend 和 IRQ 调用不在设备状态锁内发生；reset 期间无后台请求 |
 | graph/firmware/config | 固定 typed BDF、自动 aperture/INTx、root `_CRS` 与 `_PRT` 同源、静态/runtime image provider | 用户数值资源、资源冲突、缺失/空/未对齐镜像、`read_only=false`、重复 model |
 | 资产 | 两次生成 digest 相同，reference QEMU 直接挂载 raw ext4 并读取 identity | e2fsprogs 能力不符、digest 不一致、损坏 filesystem/identity、只读属性丢失 |
 | Axvisor E2E | VMX/SVM 同一 guest TOML 命中 Linux 数据盘 marker | 未命中 marker 时保留首个失败、设备 trace 和资产摘要 |
