@@ -367,13 +367,13 @@ guest TOML 中的只读磁盘后端
   -> modern virtio-blk PCI transport
   -> axvirtio-common split queue + axvirtio-blk shared request core
   -> direct-boot Linux virtio-pci / virtio-blk
-  -> raw ext4 /dev/vda -> /axvisor/F2-ID.txt
-  -> AXVISOR_X86_PCI_BLOCK_PASSED identity=axvisor-f2-readonly-data-v1
+  -> raw ext4 /dev/vda -> /axvisor/identity.txt
+  -> AXVISOR_X86_PCI_BLOCK_PASSED identity=axvisor-readonly-data-v1
 ```
 
 成功 marker 必须由 guest Linux 在核对实际 PCI identity、块设备只读属性和 identity 文件内容后写入 guest console。仅看到 PCI vendor/device、BAR 访问、virtqueue notify 或设备节点均不能完成 F2。
 
-> marker 输出格式：guest 先单独输出一行裸 marker `AXVISOR_X86_PCI_BLOCK_PASSED`，再输出 identity 键值行（如 `identity=axvisor-f2-readonly-data-v1`）。成功 marker 与 identity 是两行输出：success_regex 以 `(?m)^AXVISOR_X86_PCI_BLOCK_PASSED\s*$` 行尾锚定匹配裸 marker 行，identity 由 runner 单独核对。此格式沿用现有 `ovmf-acpi` case 的 `echo $success_marker` 模式，避免 regex 与带 identity 的单行输出互相矛盾。
+> marker 输出格式：guest 先单独输出一行裸 marker `AXVISOR_X86_PCI_BLOCK_PASSED`，再输出 identity 键值行（如 `identity=axvisor-readonly-data-v1`）。成功 marker 与 identity 是两行输出：success_regex 以 `(?m)^AXVISOR_X86_PCI_BLOCK_PASSED\s*$` 行尾锚定匹配裸 marker 行，identity 由 runner 单独核对。此格式沿用现有 `ovmf-acpi` case 的 `echo $success_marker` 模式，避免 regex 与带 identity 的单行输出互相矛盾。
 
 #### 7.2 进入条件和兼容性确认
 
@@ -538,7 +538,7 @@ virtqueue 继续由现有 `no_std` `axvirtio-common` 所有；从 `VirtioMmioBlo
 id = "readonly-data-disk"
 model = "virtio-blk-pci"
 backend = "file"
-path = "/guest/axvisor-f2-data.ext4"
+path = "/guest/axvisor-readonly-data.ext4"
 read_only = true
 ```
 
@@ -555,17 +555,17 @@ provider 在 VM resource planning 前检查存在性、非零长度、512 字节
 测试资产固定为 8 MiB raw ext4 镜像，没有 MBR/GPT 或分区表，guest 直接挂载 `/dev/vda`。host 工具以固定 UUID、固定 `E2FSPROGS_FAKE_TIME`、固定文件 mode/mtime，并关闭 lazy inode/journal 初始化的 `mke2fs` 参数生成镜像；生成流程先验证所需 e2fsprogs 能力，再连续生成两次并要求 SHA-256 相同。生成物放在 `tmp/axbuild`，不提交二进制镜像。镜像只包含本测试需要的最小目录和 identity：
 
 ```text
-/axvisor/F2-ID.txt = axvisor-f2-readonly-data-v1\n
+/axvisor/identity.txt = axvisor-readonly-data-v1\n
 ```
 
 参考 QEMU 使用 `disable-legacy=on` 的 `virtio-blk-pci` 和 read-only raw drive，把同一镜像作为 `/dev/vda` 挂载并读取 identity；这只证明资产和 Linux driver 兼容，不替代 Axvisor E2E。
 
-direct-boot Linux initramfs 必须完成以下检查后，才向 guest console 先输出一行裸 marker `AXVISOR_X86_PCI_BLOCK_PASSED`、再输出 identity 键值行 `identity=axvisor-f2-readonly-data-v1`：
+direct-boot Linux initramfs 必须完成以下检查后，才向 guest console 先输出一行裸 marker `AXVISOR_X86_PCI_BLOCK_PASSED`、再输出 identity 键值行 `identity=axvisor-readonly-data-v1`：
 
 1. `/sys/bus/pci/devices/0000:00:03.0` 报告 `1af4:1042`，BAR0 已分配且 memory-space decode 已启用；
 2. Linux 已绑定 `virtio_pci`/`virtio_blk`，从该 PCI function 的 sysfs `irq` 取得 Linux IRQ number，并在挂载前记录 `/proc/interrupts` completion count；
 3. `/sys/block/vda/ro` 为 `1`，以 `dd` 对 `/dev/vda` 发起的 512-byte 写入确定失败；设备层另以最低层测试证明 `VIRTIO_BLK_T_OUT -> VIRTIO_BLK_S_IOERR`，不能把 Linux block-layer 的提前拒绝当作设备收到 OUT 的证据；
-4. 以 `mount -t ext4 -o ro /dev/vda` 直接挂载 raw filesystem，读取并严格匹配 `F2-ID.txt`；
+4. 以 `mount -t ext4 -o ro /dev/vda` 直接挂载 raw filesystem，读取并严格匹配 `identity.txt`；
 5. 挂载和读取后的同一 IRQ completion count 大于初始值，证明请求经过真实 INTx completion；
 6. runner 在 VMX/SVM 运行前后计算源镜像 SHA-256，摘要必须不变，VMX/SVM backend 使用同一 digest。
 
