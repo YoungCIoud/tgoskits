@@ -511,7 +511,19 @@ jobs:
             use_container: false
             runs_on: '["self-hosted","linux","qcs"]'
             self_hosted_owner: rcore-os
-            command: cargo xtask axvisor test qemu --arch aarch64 --test-group normal --test-case qemu-ivc
+            # TEMPORARY(quick-iteration): patch the qemu-ivc rootfs with
+            # prebuilt Message V1 artifacts committed under test-suit/. This
+            # avoids building the vendored Linux kernel driver on the CI runner
+            # (the runner has no guest kernel source tree). Remove this
+            # pre-step and the prebuilt artifacts once tgosimages ships the
+            # matching Message V1 image; the long-term driver source remains in
+            # arceos-hypervisor/axvisor-tools.
+            command: |
+              cargo xtask image pull rootfs-aarch64-alpine.img
+              export TGOS_IMAGE_LOCAL_STORAGE="$PWD/tmp/axbuild-local/rootfs"
+              export IVC_E2E_PREBUILT_DIR="$PWD/test-suit/axvisor/normal/qemu-ivc/prebuilt"
+              scripts/ivc-local-e2e.sh --no-run
+              cargo xtask axvisor test qemu --arch aarch64 --test-group normal --test-case qemu-ivc
             cache_key: ""
             container_image: base
             limit_to_owner: ""
