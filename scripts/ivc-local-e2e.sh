@@ -151,6 +151,7 @@ if [ "$BUILD_ARCEOS" = 1 ]; then
         log "skipping ArceOS guest build (IVC_E2E_SKIP_GUEST_BUILD=1)"
     else
         log "building ArceOS guest apps from apps/arceos"
+        mkdir -p "$RUN_DIR"
         cat > "$ARCEOS_BUILD_CONFIG" <<'EOF'
 features = ["arceos", "ax-std/std-compat", "ax-std/tls"]
 log = "Info"
