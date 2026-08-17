@@ -221,6 +221,38 @@ impl X86AccessWidth {
             Self::Qword => 0..64,
         }
     }
+
+    /// Returns the memory-operand width encoded by a MOV opcode plus its
+    /// operand-size and REX prefixes.
+    pub(crate) fn for_mov_opcode(
+        opcode: u8,
+        operand_size_override: bool,
+        rex_w: bool,
+    ) -> Option<Self> {
+        match opcode {
+            0x88 | 0x8a | 0xc6 => Some(Self::Byte),
+            0x89 | 0x8b | 0xc7 => {
+                if rex_w {
+                    Some(Self::Qword)
+                } else if operand_size_override {
+                    Some(Self::Word)
+                } else {
+                    Some(Self::Dword)
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Masks a value down to this width.
+    pub(crate) fn mask_value(self, value: u64) -> u64 {
+        match self {
+            Self::Byte => value & 0xff,
+            Self::Word => value & 0xffff,
+            Self::Dword => value & 0xffff_ffff,
+            Self::Qword => value,
+        }
+    }
 }
 
 impl TryFrom<usize> for X86AccessWidth {
@@ -388,4 +420,85 @@ pub enum X86VmExit {
     },
     /// The exit was handled inside the x86 core.
     Nothing,
+}
+
+/// Builds an [`X86VmExit::MmioWrite`] for a decoded MOV register-to-memory
+/// device MMIO instruction.
+pub(crate) fn mov_mmio_write_exit(
+    addr: X86GuestPhysAddr,
+    opcode: u8,
+    operand_size_override: bool,
+    rex_w: bool,
+    data: u64,
+) -> Option<X86VmExit> {
+    let width = X86AccessWidth::for_mov_opcode(opcode, operand_size_override, rex_w)?;
+    match opcode {
+        0x88 | 0x89 => Some(X86VmExit::MmioWrite {
+            addr,
+            width,
+            data: width.mask_value(data),
+        }),
+        _ => None,
+    }
+}
+
+/// Decoded instruction context for the LAPIC/IOAPIC MMIO fast path.
+pub(crate) struct X86ApicMmioDecode {
+    pub(crate) start: X86GuestVirtAddr,
+    pub(crate) rip: X86GuestVirtAddr,
+    pub(crate) modrm: u8,
+    pub(crate) rex: u8,
+    pub(crate) opcode: u8,
+    pub(crate) addr: X86GuestPhysAddr,
+    pub(crate) write: bool,
+    pub(crate) local_apic: bool,
+}
+
+/// Returns the encoded immediate size of a MOV memory-store instruction.
+pub(crate) fn mov_immediate_size(width: X86AccessWidth) -> usize {
+    match width {
+        X86AccessWidth::Byte => core::mem::size_of::<u8>(),
+        X86AccessWidth::Word => core::mem::size_of::<u16>(),
+        // C7 with REX.W still encodes a 32-bit immediate.
+        X86AccessWidth::Dword | X86AccessWidth::Qword => core::mem::size_of::<u32>(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mov_mmio_write_exit_decodes_byte_word_dword_widths() {
+        let addr = X86GuestPhysAddr::from_usize(0x8000_0014);
+        let cases: [(u8, bool, bool, X86AccessWidth, u64); 3] = [
+            (0x88, false, false, X86AccessWidth::Byte, 0x5a),
+            (0x89, true, false, X86AccessWidth::Word, 0x5678),
+            (0x89, false, false, X86AccessWidth::Dword, 0x1234_5678),
+        ];
+
+        for (opcode, operand_size_override, rex_w, width, expected_data) in cases {
+            let data = match width {
+                X86AccessWidth::Byte => 0x1234_5678_5a,
+                X86AccessWidth::Word => 0x1234_5678,
+                X86AccessWidth::Dword => 0x1234_5678,
+                X86AccessWidth::Qword => unreachable!(),
+            };
+            let exit =
+                mov_mmio_write_exit(addr, opcode, operand_size_override, rex_w, data).unwrap();
+
+            match exit {
+                X86VmExit::MmioWrite {
+                    addr: actual_addr,
+                    width: actual_width,
+                    data: actual_data,
+                } => {
+                    assert_eq!(actual_addr, addr);
+                    assert_eq!(actual_width, width);
+                    assert_eq!(actual_data, expected_data);
+                }
+                other => panic!("unexpected MMIO exit: {other:?}"),
+            }
+        }
+    }
 }
