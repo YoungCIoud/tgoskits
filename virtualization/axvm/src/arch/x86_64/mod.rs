@@ -123,17 +123,29 @@ impl ArchOps for X86_64Arch {
                 reg,
                 reg_width,
                 signed_ext,
-            } => super::handle_mmio_read(
-                vm,
-                vcpu,
-                MmioReadExit {
-                    addr: x86_guest_phys_addr_to_ax(addr),
-                    width: x86_access_width_to_ax(width),
-                    reg,
-                    reg_width: x86_access_width_to_ax(reg_width),
-                    signed_ext,
-                },
-            ),
+                byte_reg,
+            } => {
+                let ax_addr = x86_guest_phys_addr_to_ax(addr);
+                let ax_width = x86_access_width_to_ax(width);
+                if let Some(byte_reg) = byte_reg {
+                    let raw = super::read_mmio_value(vm, vcpu, ax_addr, ax_width)?;
+                    let value = (raw & crate::vm::width_mask(ax_width)) as u8;
+                    vcpu.get_arch_vcpu().set_gpr_byte(byte_reg, value);
+                    Ok(BoundVcpuExit::Continue)
+                } else {
+                    super::handle_mmio_read(
+                        vm,
+                        vcpu,
+                        MmioReadExit {
+                            addr: ax_addr,
+                            width: ax_width,
+                            reg,
+                            reg_width: x86_access_width_to_ax(reg_width),
+                            signed_ext,
+                        },
+                    )
+                }
+            }
             X86VmExit::MmioWrite { addr, width, data } => super::handle_mmio_write::<Self>(
                 vm,
                 vcpu,
@@ -388,6 +400,10 @@ impl AxvmX86Vcpu {
     fn complete_port_io_string(&mut self, exit: X86PortIoStringExit) -> AxVmResult {
         x86_result(self.0.complete_port_io_string(exit))
             .map_err(|error| crate::vcpu::map_vcpu_backend_error("complete x86 string I/O", error))
+    }
+
+    fn set_gpr_byte(&mut self, reg: X86ByteRegister, value: u8) {
+        self.0.set_gpr_byte(reg, value);
     }
 }
 

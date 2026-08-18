@@ -275,6 +275,62 @@ impl From<X86AccessWidth> for usize {
     }
 }
 
+/// Byte register selected by a ModRM.reg field for byte MOV instructions.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct X86ByteRegister {
+    /// General-purpose register index in the vCPU register file.
+    pub(crate) gpr: u8,
+    /// When true, the access targets the high byte (AH/CH/DH/BH).
+    pub(crate) high: bool,
+}
+
+/// Decodes the byte register referenced by `modrm_reg` and a REX prefix byte.
+///
+/// Without REX, `modrm_reg` 0..3 selects AL/CL/DL/BL and 4..7 selects
+/// AH/CH/DH/BH. With REX, `modrm_reg` plus REX.R selects the low byte of the
+/// corresponding 64-bit general-purpose register, including SPL/BPL/SIL/DIL.
+pub(crate) fn x86_byte_register(modrm_reg: u8, rex: u8) -> Option<X86ByteRegister> {
+    if modrm_reg > 7 {
+        return None;
+    }
+    if rex == 0 {
+        Some(if modrm_reg < 4 {
+            X86ByteRegister {
+                gpr: modrm_reg,
+                high: false,
+            }
+        } else {
+            X86ByteRegister {
+                gpr: modrm_reg - 4,
+                high: true,
+            }
+        })
+    } else {
+        Some(X86ByteRegister {
+            gpr: modrm_reg | ((rex & 0x4) << 1),
+            high: false,
+        })
+    }
+}
+
+/// Extracts the byte selected by `byte_reg` from a full GPR value.
+pub(crate) fn x86_byte_register_value(gpr_value: u64, byte_reg: X86ByteRegister) -> u8 {
+    if byte_reg.high {
+        (gpr_value >> 8) as u8
+    } else {
+        gpr_value as u8
+    }
+}
+
+/// Merges a byte into a full GPR value without disturbing adjacent bytes.
+pub(crate) fn x86_byte_register_merge(gpr_value: u64, byte_reg: X86ByteRegister, value: u8) -> u64 {
+    if byte_reg.high {
+        (gpr_value & !0xff00) | (u64::from(value) << 8)
+    } else {
+        (gpr_value & !0xff) | u64::from(value)
+    }
+}
+
 bitflags! {
     /// Access flags reported for a nested page fault.
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -368,6 +424,8 @@ pub enum X86VmExit {
         reg_width: X86AccessWidth,
         /// Whether the value should be sign-extended.
         signed_ext: bool,
+        /// Byte-register destination for byte-width MOV reads.
+        byte_reg: Option<X86ByteRegister>,
     },
     /// The guest performed an MMIO write.
     MmioWrite {
@@ -467,6 +525,110 @@ pub(crate) fn mov_immediate_size(width: X86AccessWidth) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn byte_register_decodes_high_bytes_without_rex() {
+        assert_eq!(
+            x86_byte_register(0, 0),
+            Some(X86ByteRegister {
+                gpr: 0,
+                high: false
+            })
+        );
+        assert_eq!(
+            x86_byte_register(3, 0),
+            Some(X86ByteRegister {
+                gpr: 3,
+                high: false
+            })
+        );
+        assert_eq!(
+            x86_byte_register(4, 0),
+            Some(X86ByteRegister { gpr: 0, high: true })
+        );
+        assert_eq!(
+            x86_byte_register(5, 0),
+            Some(X86ByteRegister { gpr: 1, high: true })
+        );
+        assert_eq!(
+            x86_byte_register(6, 0),
+            Some(X86ByteRegister { gpr: 2, high: true })
+        );
+        assert_eq!(
+            x86_byte_register(7, 0),
+            Some(X86ByteRegister { gpr: 3, high: true })
+        );
+    }
+
+    #[test]
+    fn byte_register_decodes_rex_low_bytes_including_spl() {
+        assert_eq!(
+            x86_byte_register(4, 0x40),
+            Some(X86ByteRegister {
+                gpr: 4,
+                high: false
+            })
+        );
+        assert_eq!(
+            x86_byte_register(4, 0x44),
+            Some(X86ByteRegister {
+                gpr: 12,
+                high: false
+            })
+        );
+        assert_eq!(
+            x86_byte_register(5, 0x41),
+            Some(X86ByteRegister {
+                gpr: 5,
+                high: false
+            })
+        );
+        assert_eq!(
+            x86_byte_register(1, 0x44),
+            Some(X86ByteRegister {
+                gpr: 9,
+                high: false
+            })
+        );
+    }
+
+    #[test]
+    fn byte_register_value_extracts_high_and_low_bytes() {
+        let ah = X86ByteRegister { gpr: 0, high: true };
+        assert_eq!(x86_byte_register_value(0x1234_5678_9abc_def0, ah), 0xde);
+        let al = X86ByteRegister {
+            gpr: 0,
+            high: false,
+        };
+        assert_eq!(x86_byte_register_value(0x1234_5678_9abc_def0, al), 0xf0);
+        let ch = X86ByteRegister { gpr: 1, high: true };
+        assert_eq!(x86_byte_register_value(0x1234_5678_9abc_def0, ch), 0xde);
+    }
+
+    #[test]
+    fn byte_register_merge_preserves_adjacent_bytes() {
+        let ah = X86ByteRegister { gpr: 0, high: true };
+        assert_eq!(
+            x86_byte_register_merge(0x1234_5678_9abc_def0, ah, 0x11),
+            0x1234_5678_9abc_11f0
+        );
+        let al = X86ByteRegister {
+            gpr: 0,
+            high: false,
+        };
+        assert_eq!(
+            x86_byte_register_merge(0x1234_5678_9abc_def0, al, 0x11),
+            0x1234_5678_9abc_de11
+        );
+        let bpl = X86ByteRegister {
+            gpr: 5,
+            high: false,
+        };
+        assert_eq!(
+            x86_byte_register_merge(0x1234_5678_9abc_def0, bpl, 0x11),
+            0x1234_5678_9abc_de11
+        );
+    }
 
     #[test]
     fn mov_mmio_write_exit_decodes_byte_word_dword_widths() {

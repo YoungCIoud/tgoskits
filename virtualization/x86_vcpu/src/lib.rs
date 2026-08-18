@@ -40,9 +40,9 @@ pub use runtime::{
     selected_nested_paging_format,
 };
 pub use types::{
-    X86AccessFlags, X86AccessWidth, X86GuestPhysAddr, X86GuestVirtAddr, X86HostPhysAddr,
-    X86HostVirtAddr, X86MsrAddr, X86NestedPageFaultInfo, X86NestedPagingConfig, X86Port,
-    X86VcpuError, X86VcpuResult, X86VmExit,
+    X86AccessFlags, X86AccessWidth, X86ByteRegister, X86GuestPhysAddr, X86GuestVirtAddr,
+    X86HostPhysAddr, X86HostVirtAddr, X86MsrAddr, X86NestedPageFaultInfo, X86NestedPagingConfig,
+    X86Port, X86VcpuError, X86VcpuResult, X86VmExit,
 };
 
 macro_rules! x86_err {

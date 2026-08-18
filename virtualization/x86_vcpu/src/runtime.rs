@@ -218,6 +218,11 @@ impl<H: X86HostOps> X86Vcpu<H> {
         dispatch_vcpu!(self, set_gpr, reg, value)
     }
 
+    /// Set one byte-encoded guest register while preserving adjacent bytes.
+    pub fn set_gpr_byte(&mut self, reg: X86ByteRegister, value: u8) {
+        dispatch_vcpu!(self, set_gpr_byte, reg, value)
+    }
+
     /// Commits one string-I/O element after the VMM completed its memory and device access.
     ///
     /// # Errors

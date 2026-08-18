@@ -1097,7 +1097,20 @@ impl<H: X86HostOps> VmxVcpu<H> {
 
         let rex_w = rex & 0x8 != 0;
         match (write, opcode) {
-            (true, 0x88 | 0x89) => {
+            (true, 0x88) => {
+                let byte_reg = crate::types::x86_byte_register((modrm >> 3) & 0x7, rex)?;
+                let end = self.skip_modrm_memory_operand(rip, modrm, rex).ok()?;
+                let data = self.read_byte_register(byte_reg)?;
+                let exit = crate::types::mov_mmio_write_exit(
+                    addr,
+                    opcode,
+                    operand_size_override,
+                    rex_w,
+                    data,
+                )?;
+                Some((exit, (end.as_usize() - start.as_usize()) as u8))
+            }
+            (true, 0x89) => {
                 let reg = ((modrm >> 3) & 0x7) | ((rex & 0x4) << 1);
                 if reg == 4 {
                     debug!("EPT MMIO write used RSP as source register");
@@ -1122,7 +1135,20 @@ impl<H: X86HostOps> VmxVcpu<H> {
                     - start.as_usize();
                 Some((exit, instr_len as u8))
             }
-            (false, 0x8a | 0x8b) => {
+            (false, 0x8a) => {
+                let byte_reg = crate::types::x86_byte_register((modrm >> 3) & 0x7, rex)?;
+                let end = self.skip_modrm_memory_operand(rip, modrm, rex).ok()?;
+                let exit = X86VmExit::MmioRead {
+                    addr,
+                    width: X86AccessWidth::Byte,
+                    reg: byte_reg.gpr as usize,
+                    reg_width: X86AccessWidth::Byte,
+                    signed_ext: false,
+                    byte_reg: Some(byte_reg),
+                };
+                Some((exit, (end.as_usize() - start.as_usize()) as u8))
+            }
+            (false, 0x8b) => {
                 let width = X86AccessWidth::for_mov_opcode(opcode, operand_size_override, rex_w)?;
                 let reg = (((modrm >> 3) & 0x7) | ((rex & 0x4) << 1)) as usize;
                 if reg == 4 {
@@ -1136,6 +1162,7 @@ impl<H: X86HostOps> VmxVcpu<H> {
                     reg,
                     reg_width: width,
                     signed_ext: false,
+                    byte_reg: None,
                 };
                 Some((exit, (end.as_usize() - start.as_usize()) as u8))
             }
@@ -1212,6 +1239,7 @@ impl<H: X86HostOps> VmxVcpu<H> {
                         reg,
                         reg_width: X86AccessWidth::Dword,
                         signed_ext: false,
+                        byte_reg: None,
                     }
                 };
                 Some((exit, (end.as_usize() - start.as_usize()) as u8))
@@ -1254,6 +1282,29 @@ impl<H: X86HostOps> VmxVcpu<H> {
                 Ok((imm as i32) as i64 as u64)
             }
         }
+    }
+
+    fn read_byte_register(&self, byte_reg: X86ByteRegister) -> Option<u64> {
+        if byte_reg.gpr == 4 {
+            return Some((VmcsGuestNW::RSP.read().ok()? as u64) & 0xff);
+        }
+        let value = self.guest_regs.get_reg_of_index(byte_reg.gpr);
+        Some(u64::from(crate::types::x86_byte_register_value(
+            value, byte_reg,
+        )))
+    }
+
+    fn write_byte_register(&mut self, byte_reg: X86ByteRegister, value: u8) -> X86VcpuResult {
+        if byte_reg.gpr == 4 {
+            let old = VmcsGuestNW::RSP.read()?;
+            VmcsGuestNW::RSP.write((old & !0xff) | usize::from(value))?;
+            return Ok(());
+        }
+        let gpr = byte_reg.gpr;
+        let old = self.guest_regs.get_reg_of_index(gpr);
+        let new = crate::types::x86_byte_register_merge(old, byte_reg, value);
+        self.regs_mut().set_reg_of_index(gpr, new);
+        Ok(())
     }
 
     fn handle_decoded_ept_mmio_write(
@@ -1964,6 +2015,13 @@ impl<H: X86HostOps> VmxVcpu<H> {
 
     pub fn set_gpr(&mut self, reg: usize, val: usize) {
         self.regs_mut().set_reg_of_index(reg as u8, val as u64);
+    }
+
+    /// Sets one byte-encoded guest register while preserving adjacent bytes.
+    pub fn set_gpr_byte(&mut self, reg: X86ByteRegister, value: u8) {
+        if let Err(err) = self.write_byte_register(reg, value) {
+            warn!("failed to write VMX byte register: {err:?}");
+        }
     }
 
     pub fn inject_interrupt(&mut self, vector: usize) -> X86VcpuResult {
