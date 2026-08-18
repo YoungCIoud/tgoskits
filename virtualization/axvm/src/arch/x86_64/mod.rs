@@ -133,12 +133,12 @@ impl ArchOps for X86_64Arch {
                     vcpu.get_arch_vcpu().set_gpr_byte(byte_reg, value);
                     Ok(BoundVcpuExit::Continue)
                 } else if reg == 4 {
-                    let raw = super::read_mmio_value(vm, ax_addr, ax_width)?;
+                    let raw = super::read_mmio_value(vm, vcpu, ax_addr, ax_width)?;
                     let value = raw & crate::vm::width_mask(ax_width);
                     vcpu.get_arch_vcpu().set_gpr_rsp(width, value as u64);
                     Ok(BoundVcpuExit::Continue)
                 } else if ax_width == AccessWidth::Word {
-                    let raw = super::read_mmio_value(vm, ax_addr, ax_width)?;
+                    let raw = super::read_mmio_value(vm, vcpu, ax_addr, ax_width)?;
                     let value = (raw & crate::vm::width_mask(ax_width)) as u16;
                     vcpu.get_arch_vcpu().set_gpr_word(reg, value);
                     Ok(BoundVcpuExit::Continue)
