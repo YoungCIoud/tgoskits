@@ -1083,7 +1083,7 @@ impl<H: X86HostOps> VmxVcpu<H> {
         }
 
         if local_apic || ioapic {
-            return self.decode_ept_apic_mmio_access(crate::types::X86ApicMmioDecode {
+            return self.decode_ept_apic_mmio_access(crate::decode::X86ApicMmioDecode {
                 start,
                 rip,
                 modrm,
@@ -1098,10 +1098,10 @@ impl<H: X86HostOps> VmxVcpu<H> {
         let rex_w = rex & 0x8 != 0;
         match (write, opcode) {
             (true, 0x88) => {
-                let byte_reg = crate::types::x86_byte_register((modrm >> 3) & 0x7, rex)?;
+                let byte_reg = crate::decode::x86_byte_register((modrm >> 3) & 0x7, rex)?;
                 let end = self.skip_modrm_memory_operand(rip, modrm, rex).ok()?;
                 let data = self.read_byte_register(byte_reg)?;
-                let exit = crate::types::mov_mmio_write_exit(
+                let exit = crate::decode::mov_mmio_write_exit(
                     addr,
                     opcode,
                     operand_size_override,
@@ -1117,7 +1117,7 @@ impl<H: X86HostOps> VmxVcpu<H> {
                     return None;
                 }
                 let end = self.skip_modrm_memory_operand(rip, modrm, rex).ok()?;
-                let exit = crate::types::mov_mmio_write_exit(
+                let exit = crate::decode::mov_mmio_write_exit(
                     addr,
                     opcode,
                     operand_size_override,
@@ -1131,12 +1131,12 @@ impl<H: X86HostOps> VmxVcpu<H> {
                 let imm_addr = self.skip_modrm_memory_operand(rip, modrm, rex).ok()?;
                 let data = self.read_mmio_immediate(imm_addr, width).ok()?;
                 let exit = self.handle_decoded_ept_mmio_write(addr, data, false, width)?;
-                let instr_len = imm_addr.as_usize() + crate::types::mov_immediate_size(width)
+                let instr_len = imm_addr.as_usize() + crate::decode::mov_immediate_size(width)
                     - start.as_usize();
                 Some((exit, instr_len as u8))
             }
             (false, 0x8a) => {
-                let byte_reg = crate::types::x86_byte_register((modrm >> 3) & 0x7, rex)?;
+                let byte_reg = crate::decode::x86_byte_register((modrm >> 3) & 0x7, rex)?;
                 let end = self.skip_modrm_memory_operand(rip, modrm, rex).ok()?;
                 let exit = X86VmExit::MmioRead {
                     addr,
@@ -1175,9 +1175,9 @@ impl<H: X86HostOps> VmxVcpu<H> {
 
     fn decode_ept_apic_mmio_access(
         &mut self,
-        decode: crate::types::X86ApicMmioDecode,
+        decode: crate::decode::X86ApicMmioDecode,
     ) -> Option<(X86VmExit, u8)> {
-        let crate::types::X86ApicMmioDecode {
+        let crate::decode::X86ApicMmioDecode {
             start,
             rip,
             modrm,
@@ -1289,7 +1289,7 @@ impl<H: X86HostOps> VmxVcpu<H> {
             return Some((VmcsGuestNW::RSP.read().ok()? as u64) & 0xff);
         }
         let value = self.guest_regs.get_reg_of_index(byte_reg.gpr);
-        Some(u64::from(crate::types::x86_byte_register_value(
+        Some(u64::from(crate::decode::x86_byte_register_value(
             value, byte_reg,
         )))
     }
@@ -1302,7 +1302,7 @@ impl<H: X86HostOps> VmxVcpu<H> {
         }
         let gpr = byte_reg.gpr;
         let old = self.guest_regs.get_reg_of_index(gpr);
-        let new = crate::types::x86_byte_register_merge(old, byte_reg, value);
+        let new = crate::decode::x86_byte_register_merge(old, byte_reg, value);
         self.regs_mut().set_reg_of_index(gpr, new);
         Ok(())
     }
@@ -1343,7 +1343,7 @@ impl<H: X86HostOps> VmxVcpu<H> {
     ) -> X86VcpuResult {
         loop {
             let byte = self.read_guest_u8(*rip)?;
-            if crate::types::x86_simple_prefix_update(byte, rex, operand_size_override) {
+            if crate::decode::x86_simple_prefix_update(byte, rex, operand_size_override) {
                 *rip += 1;
             } else {
                 return Ok(());
@@ -1366,7 +1366,7 @@ impl<H: X86HostOps> VmxVcpu<H> {
             sib = Some(byte);
         }
 
-        let disp_size = crate::types::x86_modrm_displacement_size(modrm, sib, rex)
+        let disp_size = crate::decode::x86_modrm_displacement_size(modrm, sib, rex)
             .ok_or_else(|| x86_err_type!(InvalidInput, "ModRM register operand is not memory"))?;
         cursor += disp_size;
 

@@ -29,10 +29,12 @@ mod test_utils;
 #[cfg(test)]
 mod world_switch_tests;
 
+mod decode;
 mod port_io;
 mod runtime;
 mod types;
 
+pub use decode::X86ByteRegister;
 pub use port_io::{X86PortIoDirection, X86PortIoStringExit};
 pub use runtime::{
     X86NestedPagingFormat, X86PerCpuState, X86Vcpu, apic_access_page_addr, apic_access_page_gpa,
@@ -40,9 +42,9 @@ pub use runtime::{
     selected_nested_paging_format,
 };
 pub use types::{
-    X86AccessFlags, X86AccessWidth, X86ByteRegister, X86GuestPhysAddr, X86GuestVirtAddr,
-    X86HostPhysAddr, X86HostVirtAddr, X86MsrAddr, X86NestedPageFaultInfo, X86NestedPagingConfig,
-    X86Port, X86VcpuError, X86VcpuResult, X86VmExit,
+    X86AccessFlags, X86AccessWidth, X86GuestPhysAddr, X86GuestVirtAddr, X86HostPhysAddr,
+    X86HostVirtAddr, X86MsrAddr, X86NestedPageFaultInfo, X86NestedPagingConfig, X86Port,
+    X86VcpuError, X86VcpuResult, X86VmExit,
 };
 
 macro_rules! x86_err {
