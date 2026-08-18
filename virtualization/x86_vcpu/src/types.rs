@@ -331,6 +331,56 @@ pub(crate) fn x86_byte_register_merge(gpr_value: u64, byte_reg: X86ByteRegister,
     }
 }
 
+/// Applies one x86 instruction-prefix byte to decoder state.
+///
+/// Returns true when `byte` is a supported prefix. Legacy prefixes after a REX
+/// prefix invalidate that REX, matching the x86 rule that only the last REX
+/// immediately preceding the opcode is effective.
+pub(crate) fn x86_simple_prefix_update(
+    byte: u8,
+    rex: &mut u8,
+    operand_size_override: &mut bool,
+) -> bool {
+    if byte == 0x66 {
+        *operand_size_override = true;
+        *rex = 0;
+        true
+    } else if (0x40..=0x4f).contains(&byte) {
+        *rex = byte;
+        true
+    } else {
+        false
+    }
+}
+
+/// Returns the displacement size encoded by a memory-operand ModRM byte.
+pub(crate) fn x86_modrm_displacement_size(modrm: u8, sib: Option<u8>, rex: u8) -> Option<usize> {
+    let mode = modrm >> 6;
+    let rm = modrm & 0x7;
+    if mode == 0b11 {
+        return None;
+    }
+
+    Some(match mode {
+        0 => {
+            let is_rip_relative = if rm == 0b100 {
+                let sib = sib?;
+                (sib & 0x7) == 0b101
+            } else {
+                rm == 0b101
+            };
+            if is_rip_relative && rex & 0x1 == 0 {
+                4
+            } else {
+                0
+            }
+        }
+        1 => 1,
+        2 => 4,
+        _ => return None,
+    })
+}
+
 bitflags! {
     /// Access flags reported for a nested page fault.
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -628,6 +678,64 @@ mod tests {
             x86_byte_register_merge(0x1234_5678_9abc_def0, bpl, 0x11),
             0x1234_5678_9abc_de11
         );
+    }
+
+    #[test]
+    fn simple_prefix_update_clears_rex_after_operand_size_override() {
+        let mut rex = 0x40;
+        let mut operand_size_override = false;
+
+        assert!(x86_simple_prefix_update(
+            0x66,
+            &mut rex,
+            &mut operand_size_override
+        ));
+        assert_eq!(rex, 0);
+        assert!(operand_size_override);
+
+        assert!(x86_simple_prefix_update(
+            0x40,
+            &mut rex,
+            &mut operand_size_override
+        ));
+        assert_eq!(rex, 0x40);
+        assert!(operand_size_override);
+    }
+
+    #[test]
+    fn simple_prefix_update_keeps_last_rex_before_opcode() {
+        let mut rex = 0;
+        let mut operand_size_override = false;
+
+        assert!(x86_simple_prefix_update(
+            0x66,
+            &mut rex,
+            &mut operand_size_override
+        ));
+        assert!(x86_simple_prefix_update(
+            0x48,
+            &mut rex,
+            &mut operand_size_override
+        ));
+        assert_eq!(rex, 0x48);
+
+        assert!(x86_simple_prefix_update(
+            0x66,
+            &mut rex,
+            &mut operand_size_override
+        ));
+        assert_eq!(rex, 0);
+    }
+
+    #[test]
+    fn modrm_displacement_size_handles_sib_rip_relative_and_r13() {
+        assert_eq!(x86_modrm_displacement_size(0x04, Some(0x25), 0), Some(4));
+        assert_eq!(x86_modrm_displacement_size(0x04, Some(0x25), 1), Some(0));
+        assert_eq!(x86_modrm_displacement_size(0x05, None, 0), Some(4));
+        assert_eq!(x86_modrm_displacement_size(0x05, None, 1), Some(0));
+        assert_eq!(x86_modrm_displacement_size(0x40, None, 0), Some(1));
+        assert_eq!(x86_modrm_displacement_size(0x80, None, 0), Some(4));
+        assert_eq!(x86_modrm_displacement_size(0xc0, None, 0), None);
     }
 
     #[test]
