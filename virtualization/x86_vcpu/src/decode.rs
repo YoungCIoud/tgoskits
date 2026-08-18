@@ -76,6 +76,24 @@ pub(crate) fn x86_word_register_merge(gpr_value: u64, value: u16) -> u64 {
     (gpr_value & !0xffff) | u64::from(value)
 }
 
+/// Merges an MMIO read result into the architectural RSP according to the
+/// destination-operand width.
+pub(crate) fn x86_rsp_merge(old_rsp: u64, width: X86AccessWidth, value: u64) -> u64 {
+    match width {
+        X86AccessWidth::Byte => x86_byte_register_merge(
+            old_rsp,
+            X86ByteRegister {
+                gpr: 4,
+                high: false,
+            },
+            value as u8,
+        ),
+        X86AccessWidth::Word => x86_word_register_merge(old_rsp, value as u16),
+        X86AccessWidth::Dword => u64::from(value as u32),
+        X86AccessWidth::Qword => value,
+    }
+}
+
 /// Applies one x86 instruction-prefix byte to decoder state.
 ///
 /// Returns true when `byte` is a supported prefix. Legacy prefixes after a REX
@@ -273,6 +291,30 @@ mod tests {
         assert_eq!(
             x86_byte_register_merge(0x1234_5678_9abc_def0, bpl, 0x11),
             0x1234_5678_9abc_de11
+        );
+    }
+
+    #[test]
+    fn rsp_merge_obeys_destination_width() {
+        assert_eq!(
+            x86_rsp_merge(0x1234_5678_9abc_def0, X86AccessWidth::Byte, 0x11),
+            0x1234_5678_9abc_de11
+        );
+        assert_eq!(
+            x86_rsp_merge(0x1234_5678_9abc_def0, X86AccessWidth::Word, 0x1111),
+            0x1234_5678_9abc_1111
+        );
+        assert_eq!(
+            x86_rsp_merge(0x1234_5678_9abc_def0, X86AccessWidth::Dword, 0x1111_1111),
+            0x1111_1111
+        );
+        assert_eq!(
+            x86_rsp_merge(
+                0x1234_5678_9abc_def0,
+                X86AccessWidth::Qword,
+                0x1111_1111_2222_2222
+            ),
+            0x1111_1111_2222_2222
         );
     }
 

@@ -228,6 +228,11 @@ impl<H: X86HostOps> X86Vcpu<H> {
         dispatch_vcpu!(self, set_gpr_word, reg, value)
     }
 
+    /// Set the architectural RSP according to the destination-operand width.
+    pub fn set_gpr_rsp(&mut self, width: X86AccessWidth, value: u64) {
+        dispatch_vcpu!(self, set_gpr_rsp, width, value)
+    }
+
     /// Commits one string-I/O element after the VMM completed its memory and device access.
     ///
     /// # Errors

@@ -1112,17 +1112,18 @@ impl<H: X86HostOps> VmxVcpu<H> {
             }
             (true, 0x89) => {
                 let reg = ((modrm >> 3) & 0x7) | ((rex & 0x4) << 1);
-                if reg == 4 {
-                    debug!("EPT MMIO write used RSP as source register");
-                    return None;
-                }
                 let end = self.skip_modrm_memory_operand(rip, modrm, rex).ok()?;
+                let data = if reg == 4 {
+                    self.read_rsp()?
+                } else {
+                    self.guest_regs.get_reg_of_index(reg)
+                };
                 let exit = crate::decode::mov_mmio_write_exit(
                     addr,
                     opcode,
                     operand_size_override,
                     rex_w,
-                    self.guest_regs.get_reg_of_index(reg),
+                    data,
                 )?;
                 Some((exit, (end.as_usize() - start.as_usize()) as u8))
             }
@@ -1151,10 +1152,6 @@ impl<H: X86HostOps> VmxVcpu<H> {
             (false, 0x8b) => {
                 let width = X86AccessWidth::for_mov_opcode(opcode, operand_size_override, rex_w)?;
                 let reg = (((modrm >> 3) & 0x7) | ((rex & 0x4) << 1)) as usize;
-                if reg == 4 {
-                    debug!("EPT MMIO read used RSP as destination register");
-                    return None;
-                }
                 let end = self.skip_modrm_memory_operand(rip, modrm, rex).ok()?;
                 let exit = X86VmExit::MmioRead {
                     addr,
@@ -1292,6 +1289,14 @@ impl<H: X86HostOps> VmxVcpu<H> {
         Some(u64::from(crate::decode::x86_byte_register_value(
             value, byte_reg,
         )))
+    }
+
+    fn read_rsp(&self) -> Option<u64> {
+        Some(VmcsGuestNW::RSP.read().ok()? as u64)
+    }
+
+    fn write_rsp(&mut self, value: u64) -> X86VcpuResult {
+        VmcsGuestNW::RSP.write(value as usize)
     }
 
     fn write_byte_register(&mut self, byte_reg: X86ByteRegister, value: u8) -> X86VcpuResult {
@@ -2029,6 +2034,17 @@ impl<H: X86HostOps> VmxVcpu<H> {
     pub fn set_gpr_word(&mut self, reg: usize, value: u16) {
         if let Err(err) = self.write_word_register(reg, value) {
             warn!("failed to write VMX word register: {err:?}");
+        }
+    }
+
+    /// Sets the architectural RSP according to the destination-operand width.
+    pub fn set_gpr_rsp(&mut self, width: X86AccessWidth, value: u64) {
+        let Some(old) = self.read_rsp() else {
+            warn!("failed to read VMX RSP for MMIO read");
+            return;
+        };
+        if let Err(err) = self.write_rsp(crate::decode::x86_rsp_merge(old, width, value)) {
+            warn!("failed to write VMX RSP: {err:?}");
         }
     }
 

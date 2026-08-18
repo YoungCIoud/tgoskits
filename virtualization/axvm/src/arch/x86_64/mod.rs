@@ -132,6 +132,11 @@ impl ArchOps for X86_64Arch {
                     let value = (raw & crate::vm::width_mask(ax_width)) as u8;
                     vcpu.get_arch_vcpu().set_gpr_byte(byte_reg, value);
                     Ok(BoundVcpuExit::Continue)
+                } else if reg == 4 {
+                    let raw = super::read_mmio_value(vm, ax_addr, ax_width)?;
+                    let value = raw & crate::vm::width_mask(ax_width);
+                    vcpu.get_arch_vcpu().set_gpr_rsp(width, value as u64);
+                    Ok(BoundVcpuExit::Continue)
                 } else if ax_width == AccessWidth::Word {
                     let raw = super::read_mmio_value(vm, ax_addr, ax_width)?;
                     let value = (raw & crate::vm::width_mask(ax_width)) as u16;
@@ -413,6 +418,10 @@ impl AxvmX86Vcpu {
 
     fn set_gpr_word(&mut self, reg: usize, value: u16) {
         self.0.set_gpr_word(reg, value);
+    }
+
+    fn set_gpr_rsp(&mut self, width: X86AccessWidth, value: u64) {
+        self.0.set_gpr_rsp(width, value);
     }
 }
 

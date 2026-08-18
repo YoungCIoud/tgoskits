@@ -1303,17 +1303,18 @@ impl<H: X86HostOps> SvmVcpu<H> {
             }
             (true, 0x89) => {
                 let reg = ((modrm >> 3) & 0x7) | ((rex & 0x4) << 1);
-                if reg == 4 {
-                    debug!("SVM NPF MMIO write used RSP as source register");
-                    return Ok(None);
-                }
                 let end = self.skip_modrm_memory_operand(rip, modrm, rex)?;
+                let data = if reg == 4 {
+                    self.read_rsp()
+                } else {
+                    self.world_switch.guest_regs.get_reg_of_index(reg)
+                };
                 let exit = crate::decode::mov_mmio_write_exit(
                     addr,
                     opcode,
                     operand_size_override,
                     rex_w,
-                    self.world_switch.guest_regs.get_reg_of_index(reg),
+                    data,
                 )
                 .ok_or(X86VcpuError::InvalidData)?;
                 Ok(Some((exit, (end.as_usize() - start.as_usize()) as u8)))
@@ -1346,10 +1347,6 @@ impl<H: X86HostOps> SvmVcpu<H> {
                 let width = X86AccessWidth::for_mov_opcode(opcode, operand_size_override, rex_w)
                     .ok_or(X86VcpuError::InvalidData)?;
                 let reg = (((modrm >> 3) & 0x7) | ((rex & 0x4) << 1)) as usize;
-                if reg == 4 {
-                    debug!("SVM NPF MMIO read used RSP as destination register");
-                    return Ok(None);
-                }
                 let end = self.skip_modrm_memory_operand(rip, modrm, rex)?;
                 let exit = X86VmExit::MmioRead {
                     addr,
@@ -1490,6 +1487,18 @@ impl<H: X86HostOps> SvmVcpu<H> {
         }
         let value = self.world_switch.guest_regs.get_reg_of_index(byte_reg.gpr);
         u64::from(crate::decode::x86_byte_register_value(value, byte_reg))
+    }
+
+    fn read_rsp(&self) -> u64 {
+        // SAFETY: `vmcb` is the unique guest VMCB owned by this vCPU and
+        // remains mapped for the duration of the borrow.
+        unsafe { self.vmcb.as_vmcb_ref().state.rsp.get() }
+    }
+
+    fn write_rsp(&mut self, value: u64) {
+        // SAFETY: `vmcb` is the unique guest VMCB owned by this vCPU and
+        // remains mapped for the duration of the mutable borrow.
+        unsafe { self.vmcb.as_vmcb().state.rsp.set(value) };
     }
 
     fn write_byte_register(&mut self, byte_reg: X86ByteRegister, value: u8) {
@@ -1967,6 +1976,12 @@ impl<H: X86HostOps> SvmVcpu<H> {
     /// Sets one 16-bit guest register while preserving adjacent bytes.
     pub fn set_gpr_word(&mut self, reg: usize, value: u16) {
         self.write_word_register(reg, value);
+    }
+
+    /// Sets the architectural RSP according to the destination-operand width.
+    pub fn set_gpr_rsp(&mut self, width: X86AccessWidth, value: u64) {
+        let old = self.read_rsp();
+        self.write_rsp(crate::decode::x86_rsp_merge(old, width, value));
     }
 
     pub fn inject_interrupt(&mut self, vector: usize) -> X86VcpuResult {
