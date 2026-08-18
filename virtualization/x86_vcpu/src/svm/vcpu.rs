@@ -1507,6 +1507,22 @@ impl<H: X86HostOps> SvmVcpu<H> {
         self.regs_mut().set_reg_of_index(gpr, new);
     }
 
+    fn write_word_register(&mut self, reg: usize, value: u16) {
+        if reg == 4 {
+            // SAFETY: `vmcb` is the unique guest VMCB owned by this vCPU and
+            // remains mapped for the duration of the mutable borrow.
+            let vmcb = unsafe { self.vmcb.as_vmcb() };
+            let old = vmcb.state.rsp.get();
+            vmcb.state
+                .rsp
+                .set(crate::decode::x86_word_register_merge(old, value));
+            return;
+        }
+        let old = self.world_switch.guest_regs.get_reg_of_index(reg as u8);
+        let new = crate::decode::x86_word_register_merge(old, value);
+        self.regs_mut().set_reg_of_index(reg as u8, new);
+    }
+
     fn handle_decoded_npt_mmio_write(
         &mut self,
         addr: X86GuestPhysAddr,
@@ -1946,6 +1962,11 @@ impl<H: X86HostOps> SvmVcpu<H> {
     /// Sets one byte-encoded guest register while preserving adjacent bytes.
     pub fn set_gpr_byte(&mut self, reg: X86ByteRegister, value: u8) {
         self.write_byte_register(reg, value);
+    }
+
+    /// Sets one 16-bit guest register while preserving adjacent bytes.
+    pub fn set_gpr_word(&mut self, reg: usize, value: u16) {
+        self.write_word_register(reg, value);
     }
 
     pub fn inject_interrupt(&mut self, vector: usize) -> X86VcpuResult {

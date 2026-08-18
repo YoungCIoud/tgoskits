@@ -1307,6 +1307,19 @@ impl<H: X86HostOps> VmxVcpu<H> {
         Ok(())
     }
 
+    fn write_word_register(&mut self, reg: usize, value: u16) -> X86VcpuResult {
+        if reg == 4 {
+            let old = VmcsGuestNW::RSP.read()?;
+            let merged = crate::decode::x86_word_register_merge(old as u64, value);
+            VmcsGuestNW::RSP.write(merged as usize)?;
+            return Ok(());
+        }
+        let old = self.guest_regs.get_reg_of_index(reg as u8);
+        let new = crate::decode::x86_word_register_merge(old, value);
+        self.regs_mut().set_reg_of_index(reg as u8, new);
+        Ok(())
+    }
+
     fn handle_decoded_ept_mmio_write(
         &mut self,
         addr: X86GuestPhysAddr,
@@ -2009,6 +2022,13 @@ impl<H: X86HostOps> VmxVcpu<H> {
     pub fn set_gpr_byte(&mut self, reg: X86ByteRegister, value: u8) {
         if let Err(err) = self.write_byte_register(reg, value) {
             warn!("failed to write VMX byte register: {err:?}");
+        }
+    }
+
+    /// Sets one 16-bit guest register while preserving adjacent bytes.
+    pub fn set_gpr_word(&mut self, reg: usize, value: u16) {
+        if let Err(err) = self.write_word_register(reg, value) {
+            warn!("failed to write VMX word register: {err:?}");
         }
     }
 

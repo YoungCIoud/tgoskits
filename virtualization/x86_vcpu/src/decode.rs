@@ -70,6 +70,12 @@ pub(crate) fn x86_byte_register_merge(gpr_value: u64, byte_reg: X86ByteRegister,
     }
 }
 
+/// Merges a 16-bit value into a full GPR value while preserving the upper
+/// bits, matching the x86 `mov r16, m16` write semantics.
+pub(crate) fn x86_word_register_merge(gpr_value: u64, value: u16) -> u64 {
+    (gpr_value & !0xffff) | u64::from(value)
+}
+
 /// Applies one x86 instruction-prefix byte to decoder state.
 ///
 /// Returns true when `byte` is a supported prefix. Legacy prefixes after a REX
@@ -267,6 +273,14 @@ mod tests {
         assert_eq!(
             x86_byte_register_merge(0x1234_5678_9abc_def0, bpl, 0x11),
             0x1234_5678_9abc_de11
+        );
+    }
+
+    #[test]
+    fn word_register_merge_preserves_upper_bits() {
+        assert_eq!(
+            x86_word_register_merge(0x1234_5678_9abc_def0, 0x1111),
+            0x1234_5678_9abc_1111
         );
     }
 
