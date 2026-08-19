@@ -349,7 +349,7 @@ cargo xtask axvisor test qemu --arch x86_64 --test-group normal \
 
 ### 7. 阶段 F2：PCI 只读数据盘
 
-> 状态：当前阶段。V 已完成且 F1 已跳过。`dev` 已有可运行的 virtio-mmio block 产品路径，但 x86 PCI/只读路径尚未开始；下一项工作是先固定现有 queue/block 的复用与行为保持边界，再实现 PCI transport、root-bus 组合和只读镜像。
+> 状态：**已实现并通过 E2E**。V 已完成且 F1 已跳过。F2 的 17 个 commit 已 rebase 到最新 `dev`（`8618959d2`），该 dev 已合入此前作为前置阻塞的 x86_vcpu 通用 MMIO 解码修复；virtio-blk-pci 只读数据盘在 SVM/VMX 真机 KVM 上命中 `AXVISOR_X86_PCI_BLOCK_PASSED` + `identity=axvisor-readonly-data-v1`。实现相对本节的计划有三处偏差：(1) `queue_size` 复位上报最大值 128 而非 0（见 7.5）；(2) 上游把 `Device::access`/`BusResponse` 迁移为 `Device::read`/`write` + `DeviceAccess`/`DeviceContext`，F2 的 axdevice/axvm 测试侧已适配（见 7.9 末尾）；(3) MP PCI INTx 路由与 `_PRT` 对齐随实现补入，成为独立提交 `fix(axvm): align MP PCI routing with the resolved endpoint`。
 
 #### 7.1 目标
 
@@ -490,7 +490,7 @@ common configuration 是 56 字节的完整寄存器集，偏移与读写属性�
 | `0x14` | device_status | 8 | RW | `ACKNOWLEDGE -> DRIVER -> FEATURES_OK -> DRIVER_OK` 与 `FAILED`；写 0 触发 reset |
 | `0x15` | config_generation | 8 | RO | device config 读路径的消费语义见下文 |
 | `0x16` | queue_select | 16 | RW | F2 只有 queue 0，选中即固定 0 |
-| `0x18` | queue_size | 16 | RW | 0（未配置）或 2 的幂，最大 128 |
+| `0x18` | queue_size | 16 | RW | 复位上报最大值 128；guest 可写 2 的幂（≤128）缩小；写 0 或非 2 的幂被拒绝（VirtIO 1.2 §4.1.4.3.1：复位时该字段是设备支持的最大 queue size，0 表示队列不可用；F2 固定 queue 0 存在，故上报 128） |
 | `0x1a` | queue_msix_vector | 16 | RW | F2 无 MSI-X：读返回 `0xFFFF`，写不生效 |
 | `0x1c` | queue_enable | 16 | RW | 写 1 前先校验三个 ring 地址布局（见 7.6）；写 0 恢复未 ready；读返回当前 ready 状态（1 为 enabled，0 为 disabled；reset 后为 0，对齐 CH 的读返回 `q.ready()` 与 VirtIO 1.2 §4.1.4.3.1） |
 | `0x1e` | queue_notify_off | 16 | RO | 固定 `0`（notify region 中 queue 0 的槽位） |
@@ -589,6 +589,30 @@ F2 是第一个可用 feature 阶段。PCI root-bus 重构、现有 block core �
 
 文件按变化原因组织：`axvirtio-common` 继续拥有 queue，`axvirtio-blk` 分开 shared request core 与 MMIO adapter，`axdevice/x86` 分开 PCI config/root bus 与 virtio PCI function，`axvm` 只做 machine plan/firmware glue，`os/axvisor` 只做 image provider。任一文件达到工程规范的大文件触发线时按职责拆分或给出单一职责说明，不能以重新复制 queue/block 为拆分手段。第 7、8 项只能增加资产和交付证据；若 E2E 暴露标准协议缺口，必须回到拥有该语义的第 3～6 项增加最低层回归和修复。
 
+#### 7.9.1 实际提交顺序（已落地，17 个 commit）
+
+上述 9 个计划单元最终落为 `uefi/f2-0814` 上相对 `dev@8618959d2` 的 17 个 commit（时间序）：
+
+1. `refactor(axdevice): make x86 PCI functions table-driven`（计划 2）
+2. `feat(axdevice): add one MMIO PCI function slot`（计划 4 拆分）
+3. `refactor(axvirtio-blk): separate block requests from MMIO transport`（计划 3）
+4. `feat(axdevice): add a read-only virtio block PCI function`（计划 4）
+5. `fix(axdevice): harden virtio block PCI transport`（计划 4 加固）
+6. `feat(axvm): plan an x86 virtio block PCI disk`（计划 5）
+7. `fix(axvm): align MP PCI routing with the resolved endpoint`（计划 5 补充：`_PRT`/MP INTx 同源）
+8. `feat(axvisor): load immutable virtio block images`（计划 6）
+9. `test(axvisor): compile and run the generated block image table`（计划 8 拆分）
+10. `test(axbuild): prepare a deterministic Axvisor block image`（计划 7）
+11. `fix(axdevice): align virtio block PCI transport with the design contract`（计划 4 对齐）
+12. `refactor(axbuild): drop the F2 stage label from the block-image tooling`（新增）
+13. `test(axbuild): add the x86 virtio-blk-pci data-disk E2E case`（计划 8）
+14. `fix(axbuild): install resolved VM configs without O_TMPFILE`（E2E 落地时新增）
+15. `fix(axbuild): detach reference QEMU stdin from the terminal`（E2E 落地时新增）
+16. `fix(axdevice): advertise maximum queue size on virtio-blk reset`（E2E 暴露 `virtio_blk probe failed with error -2` 后新增，对应 7.5 的 queue_size 修正）
+17. `fix(axdevice,axvm): adapt tests to the read/write device access API`（rebase 到最新 dev 后适配 `Device::read`/`write`）
+
+相对计划的三处实质偏差：计划 4 拆成「MMIO 槽位 + function + 加固 + 对齐」四个 commit；计划 8 拆成「编译运行镜像表 + E2E case」；并新增三个 axbuild 修复、一个 queue_size 修复和一个 read/write API 测试适配。计划 9「记录 F2 validation evidence」即本节与 7.11 的更新。
+
 #### 7.10 分层验证
 
 | 层级 | 必须覆盖的成功路径 | 必须覆盖的失败/边界 |
@@ -607,17 +631,17 @@ Rust 改动执行 `cargo fmt`、受影响 crate 的 `cargo xtask clippy --packag
 
 #### 7.11 退出条件
 
-- [ ] 现有 direct-boot Linux 的 virtio PCI/block 和 ext4 驱动兼容性有可复核证据；
-- [ ] Linux 枚举到 `1af4:1042` function，BAR 已分配并启用 memory decode；
-- [ ] capability chain 包含并正确实现 common/notify/ISR/device/PCI_CFG，直接 BAR 与 PCI_CFG 访问落到同一 transport 状态；
-- [ ] PCI aperture、typed BDF plan、INTx route、ACPI `_CRS`/`_PRT` 和 runtime 均能追溯到同一 machine/resolved plan；
-- [ ] guest 通过只读 virtio-blk 直接挂载 raw ext4，并读取 identity 文件；
-- [ ] guest 验证只读属性、写入失败和 INTx completion 增长，runner 证明镜像摘要不变，并输出含正确 identity 的专属 marker；
-- [ ] PCI、transport、virtqueue、DMA、block、backend 和 reset 的最低层成功/错误测试全部通过；
-- [ ] VMX/SVM 使用同一 guest 配置和同一数据盘 digest 通过；
-- [ ] PR #1935 的 `axvirtio-common`/`axvirtio-blk` 最低层测试和 AArch64 virtio-mmio block guest 不退化；
-- [ ] V 阶段四个 case 不退化，F2 case 保持 non-gating；
-- [ ] 没有新增 legacy transport、磁盘写入、MSI/MSI-X、OVMF 启动、VARS 或 SMP 的隐式支持声明。
+- [x] 现有 direct-boot Linux 的 virtio PCI/block 和 ext4 驱动兼容性有可复核证据（guest 日志：`virtio_blk virtio0: [vda] 16384 512-byte logical blocks` + `EXT4-fs (vda): mounted filesystem ... ro`）；
+- [x] Linux 枚举到 `1af4:1042` function，BAR 已分配并启用 memory decode（`pci 0000:00:03.0: [1af4:1042]`、`BAR 0 [mem 0x80000000-0x80000fff]`、`enabling device (0000 -> 0002)`）；
+- [x] capability chain 包含并正确实现 common/notify/ISR/device/PCI_CFG，直接 BAR 与 PCI_CFG 访问落到同一 transport 状态（`cargo test -p axdevice` 的 `virtio_block_pci` integration 覆盖）；
+- [x] PCI aperture、typed BDF plan、INTx route、ACPI `_CRS`/`_PRT` 和 runtime 均能追溯到同一 machine/resolved plan（axvm planner + `fix(axvm): align MP PCI routing with the resolved endpoint`）；
+- [x] guest 通过只读 virtio-blk 直接挂载 raw ext4，并读取 identity 文件（`identity=axvisor-readonly-data-v1`）；
+- [x] guest 验证只读属性、写入失败和 INTx completion 增长，runner 证明镜像摘要不变，并输出含正确 identity 的专属 marker（`AXVISOR_X86_PCI_BLOCK_PASSED`，两行输出格式）；
+- [x] PCI、transport、virtqueue、DMA、block、backend 和 reset 的最低层成功/错误测试全部通过（`cargo test -p axdevice` 23/23）；
+- [x] VMX/SVM 使用同一 guest 配置和同一数据盘 digest 通过（`pci-block-svm`/`pci-block-vmx` 均 `PASS`）；
+- [x] PR #1935 的 `axvirtio-common`/`axvirtio-blk` 最低层测试和 AArch64 virtio-mmio block guest 不退化（CI 全绿）；
+- [x] V 阶段四个 case 不退化，F2 case 保持 non-gating（F2 case 尚未接入 CI matrix，待 F6 接入）；
+- [x] 没有新增 legacy transport、磁盘写入、MSI/MSI-X、OVMF 启动、VARS 或 SMP 的隐式支持声明（feature mask 仅 `VIRTIO_F_VERSION_1` + `VIRTIO_BLK_F_RO`，单 queue INTx）。
 
 F2 尚不以 OVMF/EFI 启动、多 vCPU、VARS 持久化、多盘或任意 PCI 设备通用性为完成条件。任何一项核心退出条件失败时，不得以延长 timeout、放宽 regex、测试侧直接读取 host image 或私有 fw_cfg 块协议代替。
 
