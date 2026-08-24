@@ -3,7 +3,6 @@
 use core::ops::Range;
 use std::{format, vec::Vec};
 
-use axdevice::PciHostBridgeConfig;
 use fdt_edit::{Fdt, Node, Property};
 
 use super::tree::{FdtTree, prop_string};
@@ -13,10 +12,10 @@ const MEMORY32_SPACE: u32 = 0x0200_0000;
 
 /// Passive firmware view derived from one resolved PCI bus.
 ///
-/// The view is constructed only from an already-validated
-/// [`PciHostBridgeConfig`], so host invariants (1 MiB ECAM, sub-4 GiB
-/// aperture, no ECAM/aperture overlap) are enforced once by axdevice and are
-/// intentionally not re-validated here.
+/// The view is constructed only from already-validated ECAM and memory
+/// windows, so host invariants (1 MiB ECAM, sub-4 GiB aperture, no
+/// ECAM/aperture overlap) are enforced once by axdevice and are intentionally
+/// not re-validated here.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct GuestPciHost {
     ecam_base: u64,
@@ -26,12 +25,11 @@ pub(crate) struct GuestPciHost {
 }
 
 impl GuestPciHost {
-    /// Captures the firmware-visible apertures of one resolved host bridge.
-    pub(crate) fn from_host_bridge(host: &PciHostBridgeConfig) -> Self {
-        let memory = host.memory_aperture();
+    /// Captures the firmware-visible windows of one resolved PCI bus.
+    pub(crate) fn from_windows(ecam: Range<u64>, memory: Range<u64>) -> Self {
         Self {
-            ecam_base: host.ecam_base(),
-            ecam_size: host.ecam_size(),
+            ecam_base: ecam.start,
+            ecam_size: ecam.end - ecam.start,
             memory_base: memory.start,
             memory_size: memory.end - memory.start,
         }
@@ -201,7 +199,6 @@ fn ranges_overlap(left: &Range<u64>, right: &Range<u64>) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use axdevice::PciHostBridgeConfig;
     use fdt_edit::{Fdt, Node, NodeType, PciRange, PciSpace, Property};
     use fdt_raw::RegInfo;
 
@@ -224,8 +221,7 @@ mod tests {
     }
 
     fn host() -> GuestPciHost {
-        let host = PciHostBridgeConfig::new(0x0b00_0000, 0x0c00_0000..0x1000_0000).unwrap();
-        GuestPciHost::from_host_bridge(&host)
+        GuestPciHost::from_windows(0x0b00_0000..0x0b10_0000, 0x0c00_0000..0x1000_0000)
     }
 
     #[test]

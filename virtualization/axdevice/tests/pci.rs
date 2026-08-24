@@ -1,4 +1,7 @@
-use std::sync::{Arc, Mutex};
+use std::{
+    ops::Range,
+    sync::{Arc, Mutex},
+};
 
 use axdevice::*;
 use axdevice_base::*;
@@ -6,6 +9,10 @@ use axdevice_base::*;
 const ECAM_BASE: u64 = 0x1000_0000;
 const APERTURE_BASE: u64 = 0x2000_0000;
 const APERTURE_END: u64 = 0x2010_0000;
+
+fn ecam_window(base: u64) -> Range<u64> {
+    base..base + 0x10_0000
+}
 
 type RecordedAccess = (PciBdf, PciBarIndex, u64, bool, u64);
 
@@ -348,7 +355,7 @@ fn topology_rejects_duplicate_bdfs_bar_slots_and_orphan_functions() {
             .add_function(bare_function("same").with_bdf(ResourceRequest::Fixed(replacement_bdf)))
             .is_err()
     );
-    let duplicate_id = duplicate_id.resolve(host_config()).unwrap();
+    let duplicate_id = duplicate_id.resolve(APERTURE_BASE..APERTURE_END).unwrap();
     assert_eq!(
         duplicate_id.function(&function_id("same")).unwrap().bdf(),
         original_bdf
@@ -390,9 +397,17 @@ fn topology_rejects_duplicate_bdfs_bar_slots_and_orphan_functions() {
 
 #[test]
 fn host_and_config_access_validation_rejects_invalid_ranges_and_widths() {
-    assert!(PciHostBridgeConfig::new(ECAM_BASE + 0x1000, APERTURE_BASE..APERTURE_END).is_err());
-    assert!(PciHostBridgeConfig::new(ECAM_BASE, APERTURE_BASE..APERTURE_BASE).is_err());
-    assert!(PciHostBridgeConfig::new(ECAM_BASE, APERTURE_BASE..0x1_0000_1000).is_err());
+    assert!(
+        validate_host_windows(ecam_window(ECAM_BASE + 0x1000), APERTURE_BASE..APERTURE_END)
+            .is_err()
+    );
+    assert!(validate_host_windows(ecam_window(ECAM_BASE), APERTURE_BASE..APERTURE_BASE).is_err());
+    assert!(validate_host_windows(ecam_window(ECAM_BASE), APERTURE_BASE..0x1_0000_1000).is_err());
+    // Overlapping windows must also be rejected before any runtime device is
+    // published.
+    assert!(
+        validate_host_windows(ecam_window(APERTURE_BASE), APERTURE_BASE..APERTURE_END).is_err()
+    );
 
     let bdf = PciBdf::new(PciSegment::new(0), 0, 0, 0).unwrap();
     let (_, runtime) = build_pci(
@@ -419,8 +434,7 @@ fn topology_reports_bar_and_capability_aperture_exhaustion() {
     );
     assert!(resolve_topology([invalid_identity]).is_err());
 
-    let tiny_host =
-        PciHostBridgeConfig::new(ECAM_BASE, APERTURE_BASE..APERTURE_BASE + 0x1000).unwrap();
+    let tiny_host = APERTURE_BASE..APERTURE_BASE + 0x1000;
     let bar = PciMemoryBar::new(
         PciBarIndex::new(0).unwrap(),
         0x2000,
@@ -451,7 +465,7 @@ fn automatic_topology_assignment_is_stable_and_reset_restores_power_on_state() {
     first
         .add_function(auto_bar_function("alpha", 0x1000))
         .unwrap();
-    let first = Arc::new(first.resolve(host_config()).unwrap());
+    let first = Arc::new(first.resolve(APERTURE_BASE..APERTURE_END).unwrap());
 
     let mut second = PciTopologyBuilder::new();
     second
@@ -460,7 +474,7 @@ fn automatic_topology_assignment_is_stable_and_reset_restores_power_on_state() {
     second
         .add_function(auto_bar_function("beta", 0x2000))
         .unwrap();
-    let second = second.resolve(host_config()).unwrap();
+    let second = second.resolve(APERTURE_BASE..APERTURE_END).unwrap();
 
     assert_eq!(
         first.function(&function_id("alpha")).unwrap().bdf(),
@@ -508,8 +522,12 @@ fn automatic_topology_assignment_is_stable_and_reset_restores_power_on_state() {
     assert_eq!(read_config(&runtime, alpha, 4, AccessWidth::Word), 0);
 }
 
-fn host_config() -> PciHostBridgeConfig {
-    PciHostBridgeConfig::new(ECAM_BASE, APERTURE_BASE..APERTURE_END).unwrap()
+fn resolve_topology<const N: usize>(specs: [PciFunctionSpec; N]) -> PciResult<ResolvedPciTopology> {
+    let mut builder = PciTopologyBuilder::new();
+    for spec in specs {
+        builder.add_function(spec)?;
+    }
+    builder.resolve(APERTURE_BASE..APERTURE_END)
 }
 
 fn function_id(value: &str) -> DeviceNodeId {
@@ -546,14 +564,6 @@ fn fixed_bar_function(id: &str, bdf: PciBdf, address: u64) -> PciFunctionSpec {
         .with_bdf(ResourceRequest::Fixed(bdf))
         .with_bar(bar)
         .unwrap()
-}
-
-fn resolve_topology<const N: usize>(specs: [PciFunctionSpec; N]) -> PciResult<ResolvedPciTopology> {
-    let mut builder = PciTopologyBuilder::new();
-    for spec in specs {
-        builder.add_function(spec)?;
-    }
-    builder.resolve(host_config())
 }
 
 fn build_pci<const N: usize>(

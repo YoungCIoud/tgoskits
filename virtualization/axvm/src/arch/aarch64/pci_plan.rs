@@ -53,7 +53,7 @@ impl Aarch64PciPlanBuilder {
 
     pub(super) fn resolve(self, graph: &ResolvedDeviceGraph) -> AxVmResult<Aarch64PciPlan> {
         let bus = self.bus.resolve(graph)?;
-        let firmware = GuestPciHost::from_host_bridge(bus.topology().host());
+        let firmware = GuestPciHost::from_windows(bus.ecam_window(), bus.memory_aperture());
         Ok(Aarch64PciPlan {
             _bus: bus,
             firmware,

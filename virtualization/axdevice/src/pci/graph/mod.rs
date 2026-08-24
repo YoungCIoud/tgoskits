@@ -3,13 +3,14 @@
 mod runtime;
 
 use alloc::{collections::BTreeMap, format, string::ToString, sync::Arc};
-use core::fmt;
+use core::{fmt, ops::Range};
 
 use runtime::{PciBusShared, PciEndpointGraphModel, PciHostModel};
 
 use super::{
-    FOUR_GIB, PciError, PciFunction, PciFunctionSpec, PciHostBridgeConfig, PciResult,
-    PciTopologyBuilder, ResolvedPciTopology, ecam::ECAM_SIZE,
+    FOUR_GIB, PciError, PciFunction, PciFunctionSpec, PciResult, PciTopologyBuilder,
+    ResolvedPciTopology,
+    ecam::{ECAM_SIZE, validate_host_windows},
 };
 use crate::{
     DeviceBuildContext, DeviceBundle, DeviceManagerError, DeviceManagerResult, DeviceModel,
@@ -161,25 +162,32 @@ impl PciBusGraphBuilder {
         let ecam = resources.mmio(&ResourceSlot::new(ECAM_SLOT)?)?;
         let memory = resources.mmio(&ResourceSlot::new(MEMORY_SLOT)?)?;
         self.validate_resolved_sizes(ecam, memory)?;
+        let ecam_end = ecam.0.checked_add(ecam.1).ok_or_else(|| {
+            graph_integration_error("resolve PCI host resources", "ECAM window overflows u64")
+        })?;
         let memory_end = memory.0.checked_add(memory.1).ok_or_else(|| {
             graph_integration_error(
                 "resolve PCI host resources",
                 "memory aperture overflows u64",
             )
         })?;
-        let host = PciHostBridgeConfig::new(ecam.0, memory.0..memory_end)
+        validate_host_windows(ecam.0..ecam_end, memory.0..memory_end)
             .map_err(|error| pci_config_error("resolve PCI host resources", error))?;
         let topology = Arc::new(
             self.topology
-                .resolve(host)
+                .resolve(memory.0..memory_end)
                 .map_err(|error| pci_config_error("resolve PCI topology", error))?,
         );
+        let plan = Arc::new(PciHostPlan {
+            topology: topology.clone(),
+            ecam_window: ecam.0..ecam_end,
+        });
         self.shared
-            .publish_topology(topology.clone())
+            .publish_plan(plan.clone())
             .map_err(|error| pci_build_error("publish PCI topology", error))?;
         Ok(ResolvedPciBus {
             host_id: self.host_id,
-            topology,
+            plan,
             _shared: self.shared,
         })
     }
@@ -215,10 +223,21 @@ impl PciBusGraphBuilder {
     }
 }
 
+/// One resolved set of PCI host facts shared by firmware and runtime plans.
+///
+/// The topology owns the memory aperture; the ECAM window is a frontend fact
+/// and lives only here. Publishing one plan keeps the two windows from
+/// drifting apart after resolution.
+#[derive(Debug)]
+pub(crate) struct PciHostPlan {
+    pub(super) topology: Arc<ResolvedPciTopology>,
+    pub(super) ecam_window: Range<u64>,
+}
+
 /// Immutable PCI bus view shared by architecture firmware and runtime plans.
 pub struct ResolvedPciBus {
     host_id: DeviceNodeId,
-    topology: Arc<ResolvedPciTopology>,
+    plan: Arc<PciHostPlan>,
     _shared: Arc<PciBusShared>,
 }
 
@@ -227,7 +246,7 @@ impl fmt::Debug for ResolvedPciBus {
         formatter
             .debug_struct("ResolvedPciBus")
             .field("host_id", &self.host_id)
-            .field("topology", &self.topology)
+            .field("plan", &self.plan)
             .finish()
     }
 }
@@ -240,7 +259,17 @@ impl ResolvedPciBus {
 
     /// Returns the single topology consumed by firmware and runtime creation.
     pub fn topology(&self) -> &ResolvedPciTopology {
-        &self.topology
+        &self.plan.topology
+    }
+
+    /// Returns the resolved 1 MiB ECAM window of this bus.
+    pub fn ecam_window(&self) -> Range<u64> {
+        self.plan.ecam_window.clone()
+    }
+
+    /// Returns the resolved CPU-visible PCI memory aperture of this bus.
+    pub fn memory_aperture(&self) -> Range<u64> {
+        self.plan.topology.memory_aperture().clone()
     }
 }
 

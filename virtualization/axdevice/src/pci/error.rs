@@ -35,6 +35,16 @@ pub enum PciError {
         /// Diagnostic reason.
         detail: &'static str,
     },
+    /// A direct root-level config access violates width or range rules.
+    #[error("invalid direct PCI config access at offset {offset:#x} with size {size}: {detail}")]
+    InvalidDirectConfigAccess {
+        /// Byte offset into one function's config space.
+        offset: usize,
+        /// Requested access size in bytes.
+        size: usize,
+        /// Diagnostic reason.
+        detail: &'static str,
+    },
     /// The root-complex ECAM or memory aperture is malformed.
     #[error("invalid PCI host aperture: {detail}")]
     InvalidHostAperture {

@@ -204,15 +204,15 @@ mod tests {
                 .unwrap();
         }
         let runtime = runtime_builder.finish(graph.resource_plan()).unwrap();
-        let host = pci.topology().host();
+        let ecam_base = pci.ecam_window().start;
         let function = pci.topology().function(&endpoint_id).unwrap();
         let bdf = function.bdf();
         let bar = function
             .bar(PciBarIndex::new(SHARED_MEMORY_BAR_INDEX).unwrap())
             .unwrap();
 
-        assert_eq!(read_config(&runtime, host, bdf, 0), 0x1110_1af4);
-        write_config(&runtime, host, bdf, 4, 2);
+        assert_eq!(read_config(&runtime, ecam_base, bdf, 0), 0x1110_1af4);
+        write_config(&runtime, ecam_base, bdf, 4, 2);
         let bar_access = mmio_access(bar.address() + 0x20, AccessWidth::Qword);
         assert!(
             runtime
@@ -229,33 +229,22 @@ mod tests {
         DeviceAccess::new(DeviceVcpuId::new(0), BusKind::Mmio, address, width)
     }
 
-    fn read_config(
-        runtime: &DeviceRuntime,
-        host: &PciHostBridgeConfig,
-        bdf: PciBdf,
-        offset: u16,
-    ) -> u64 {
+    fn read_config(runtime: &DeviceRuntime, ecam_base: u64, bdf: PciBdf, offset: u16) -> u64 {
         runtime
             .try_read(&mmio_access(
-                host.ecam_base() + bdf.ecam_offset() + u64::from(offset),
+                ecam_base + bdf.ecam_offset() + u64::from(offset),
                 AccessWidth::Dword,
             ))
             .unwrap()
             .unwrap()
     }
 
-    fn write_config(
-        runtime: &DeviceRuntime,
-        host: &PciHostBridgeConfig,
-        bdf: PciBdf,
-        offset: u16,
-        value: u64,
-    ) {
+    fn write_config(runtime: &DeviceRuntime, ecam_base: u64, bdf: PciBdf, offset: u16, value: u64) {
         assert!(
             runtime
                 .try_write(
                     &mmio_access(
-                        host.ecam_base() + bdf.ecam_offset() + u64::from(offset),
+                        ecam_base + bdf.ecam_offset() + u64::from(offset),
                         AccessWidth::Dword,
                     ),
                     value,

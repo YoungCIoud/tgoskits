@@ -207,15 +207,15 @@ fn graph_resources_freeze_one_topology_before_host_and_endpoint_build() {
     );
 
     let pci = pci.resolve(&graph).unwrap();
-    let host = pci.topology().host();
+    let ecam_window = pci.ecam_window();
     let host_resources = graph.resources_for(&host_id).unwrap();
     assert_eq!(
         host_resources
             .mmio(&ResourceSlot::new("ecam").unwrap())
             .unwrap(),
-        (host.ecam_base(), host.ecam_size())
+        (ecam_window.start, ecam_window.end - ecam_window.start)
     );
-    let aperture = host.memory_aperture();
+    let aperture = pci.memory_aperture();
     assert_eq!(
         host_resources
             .mmio(&ResourceSlot::new("memory").unwrap())
@@ -233,8 +233,11 @@ fn graph_resources_freeze_one_topology_before_host_and_endpoint_build() {
     let bdf = resolved_function.bdf();
     let bar = resolved_function.bar(PciBarIndex::new(0).unwrap()).unwrap();
 
-    assert_eq!(read_config(&runtime, host, bdf, 0), 0x4106_110a);
-    write_config(&runtime, host, bdf, 4, 2);
+    assert_eq!(
+        read_config(&runtime, ecam_window.start, bdf, 0),
+        0x4106_110a
+    );
+    write_config(&runtime, ecam_window.start, bdf, 4, 2);
     assert_eq!(read_mmio(&runtime, bar.address() + 0x20), 0xcafe_0020);
     assert_eq!(
         function.accesses(),
@@ -259,7 +262,7 @@ fn host_bundle_registration_failure_releases_root_and_resource_claims_for_retry(
         .unwrap();
     let graph = resolve_graph(graph);
     let pci = pci.resolve(&graph).unwrap();
-    let ecam = pci.topology().host().ecam_base();
+    let ecam = pci.ecam_window().start;
     let host_node = graph.nodes().find(|node| node.id() == &host_id).unwrap();
 
     let mut conflicting_builder = DeviceRuntimeBuilder::new(RuntimeAccessPorts::new());
@@ -344,10 +347,10 @@ fn unfinished_endpoint_claim_releases_function_binding_for_retry() {
     let runtime = runtime_builder.finish(graph.resource_plan()).unwrap();
 
     let resolved_function = pci.topology().function(&endpoint_id).unwrap();
-    let host = pci.topology().host();
+    let ecam_base = pci.ecam_window().start;
     let bdf = resolved_function.bdf();
     let bar = resolved_function.bar(PciBarIndex::new(0).unwrap()).unwrap();
-    write_config(&runtime, host, bdf, 4, 2);
+    write_config(&runtime, ecam_base, bdf, 4, 2);
     assert_eq!(read_mmio(&runtime, bar.address()), 0xcafe_0000);
 }
 
@@ -389,10 +392,10 @@ fn endpoint_bundle_registration_failure_releases_function_binding_for_retry() {
     let runtime = runtime_builder.finish(graph.resource_plan()).unwrap();
 
     let resolved_function = pci.topology().function(&endpoint_id).unwrap();
-    let host = pci.topology().host();
+    let ecam_base = pci.ecam_window().start;
     let bdf = resolved_function.bdf();
     let bar = resolved_function.bar(PciBarIndex::new(0).unwrap()).unwrap();
-    write_config(&runtime, host, bdf, 4, 2);
+    write_config(&runtime, ecam_base, bdf, 4, 2);
     assert_eq!(read_mmio(&runtime, bar.address()), 0xcafe_0000);
 }
 
@@ -430,31 +433,20 @@ fn mmio_access(address: u64) -> DeviceAccess {
     )
 }
 
-fn read_config(
-    runtime: &DeviceRuntime,
-    host: &PciHostBridgeConfig,
-    bdf: PciBdf,
-    offset: u16,
-) -> u64 {
+fn read_config(runtime: &DeviceRuntime, ecam_base: u64, bdf: PciBdf, offset: u16) -> u64 {
     runtime
         .try_read(&mmio_access(
-            host.ecam_base() + bdf.ecam_offset() + u64::from(offset),
+            ecam_base + bdf.ecam_offset() + u64::from(offset),
         ))
         .unwrap()
         .unwrap()
 }
 
-fn write_config(
-    runtime: &DeviceRuntime,
-    host: &PciHostBridgeConfig,
-    bdf: PciBdf,
-    offset: u16,
-    value: u64,
-) {
+fn write_config(runtime: &DeviceRuntime, ecam_base: u64, bdf: PciBdf, offset: u16, value: u64) {
     assert!(
         runtime
             .try_write(
-                &mmio_access(host.ecam_base() + bdf.ecam_offset() + u64::from(offset)),
+                &mmio_access(ecam_base + bdf.ecam_offset() + u64::from(offset)),
                 value,
                 None,
             )

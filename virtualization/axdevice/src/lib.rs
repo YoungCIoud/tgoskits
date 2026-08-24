@@ -83,9 +83,9 @@ pub use model::{
 pub use pci::{
     ConfigOffset, PciBarAccess, PciBarIndex, PciBdf, PciBusGraphBuilder, PciCapability, PciClass,
     PciEndpointBundle, PciEndpointIdentity, PciEndpointModel, PciError, PciFunction,
-    PciFunctionSpec, PciHostBridgeConfig, PciHostResourceRequirements, PciMemoryBar,
-    PciMemoryBarWidth, PciResult, PciSegment, PciTopologyBuilder, ResolvedPciBar, ResolvedPciBus,
-    ResolvedPciFunction, ResolvedPciTopology,
+    PciFunctionSpec, PciHostResourceRequirements, PciMemoryBar, PciMemoryBarWidth, PciResult,
+    PciSegment, PciTopologyBuilder, ResolvedPciBar, ResolvedPciBus, ResolvedPciFunction,
+    ResolvedPciTopology, validate_host_windows,
 };
 pub use registration::{
     DeviceBundle, DeviceLifecycle, DeviceRegistration, DmaPollableDeviceOps, PollableDeviceOps,

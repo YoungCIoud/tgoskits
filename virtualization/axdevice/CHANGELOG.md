@@ -10,6 +10,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - Add a typed virtual PCI Type-0/ECAM foundation with deterministic BDF/BAR planning and transactional resolved-device-graph integration.
+- Add root-level direct config access validation for supported widths and function-boundary checks.
+
+### Changed
+
+- *(breaking)* Split the PCI root state from the ECAM frontend: config images, BAR decode, bindings, and reset now live in one shared root state behind separate ECAM and memory-aperture runtime devices.
+
+### Removed
+
+- Remove `PciHostBridgeConfig`; resolved ECAM and memory windows are exposed through `ResolvedPciBus` and validated by `validate_host_windows`.
 
 ## [0.6.0](https://github.com/rcore-os/tgoskits/compare/axdevice-v0.5.7...axdevice-v0.6.0) - 2026-08-20
 
