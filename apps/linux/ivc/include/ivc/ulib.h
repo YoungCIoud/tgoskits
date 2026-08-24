@@ -32,6 +32,7 @@ int ivc_subscriber_write(ivc_subscriber_p subscriber, const void *buf, size_t co
 // Message-oriented device writes must complete in one syscall; short writes fail.
 // Empty messages are not supported by the POSIX read/write adapter.
 int ivc_subscriber_write_all(ivc_subscriber_p subscriber, const void *buf, size_t count);
+// Always consumes subscriber and attempts both local close and manager cleanup.
 int ivc_unsubscribe(ivc_subscriber_p subscriber);
 
 
@@ -49,6 +50,7 @@ int ivc_write(ivc_publisher_p publisher, const void *buf, size_t count);
 // Message-oriented device writes must complete in one syscall; short writes fail.
 // Empty messages are not supported by the POSIX read/write adapter.
 int ivc_write_all(ivc_publisher_p publisher, const void *buf, size_t count);
+// Always consumes publisher and attempts both local close and manager cleanup.
 int ivc_unpublish(ivc_publisher_p publisher);
 
 #ifdef __cplusplus

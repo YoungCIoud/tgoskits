@@ -99,6 +99,15 @@ run_host_tests() {
         "${script_dir}/lib/ivc.c"
     "${test_out_dir}/ivc-open-failure-rolls-back"
 
+    "${host_cc}" \
+        -I"${script_dir}/include" \
+        -std=c11 -Wall -Wextra -Werror -O0 -g \
+        -Wl,--wrap=close -Wl,--wrap=ioctl -Wl,--wrap=free \
+        -o "${test_out_dir}/ivc-teardown-best-effort" \
+        "${script_dir}/tests/ivc_teardown_best_effort.c" \
+        "${script_dir}/lib/ivc.c"
+    "${test_out_dir}/ivc-teardown-best-effort"
+
     echo "AXVISOR_IVC_TEST_OUT_DIR=${test_out_dir}"
 }
 

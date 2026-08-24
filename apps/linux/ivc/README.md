@@ -9,11 +9,10 @@ IVC QEMU test:
 - `subscriber/`: Linux subscriber program used by the ArceOS-to-Linux test.
 - `tests/`: host-side protocol and userspace-wrapper regression tests.
 
-The Linux kernel module that exposes `/dev/axivc` is not kept in tgoskits. It
-is built from
-[`arceos-hypervisor/axvisor-tools`](https://github.com/arceos-hypervisor/axvisor-tools)
-by tgosimages together with the target Linux kernel and installed into the
-rootfs as `/root/axvisor.ko`.
+The vendored `kernel_driver/` snapshot builds the Linux kernel module that
+exposes `/dev/axivc`. Its upstream maintenance location is
+[`arceos-hypervisor/axvisor-tools`](https://github.com/arceos-hypervisor/axvisor-tools),
+and `kernel_driver/VENDORED_FROM` records the exact imported revision.
 
 ## Message V1 demo protocol
 
@@ -72,14 +71,18 @@ apps/linux/ivc/build.sh --test
 
 ## QEMU test image
 
-The QEMU IVC test boots its Linux guest from the prebuilt virtio guest disk in
-the selected tgosimages rootfs artifact. Changing this directory does not
-replace `/root/axvisor.ko` or `/root/ivc-subscribe` in that artifact
-automatically; rebuild and publish the companion tgosimages rootfs before
-expecting the new Message V1 userspace program to run in QEMU.
-
-Run the integration test with:
+The QEMU IVC test boots its Linux guest from the tgosimages rootfs artifact.
+`scripts/ivc-local-e2e.sh` builds the kernel module and user programs from the
+current checkout, patches them into a local copy of that image, and then runs
+the test. The kernel module must be built against the same pinned Linux release
+as the guest image. Prepare a compatible external-module tree when needed:
 
 ```bash
-cargo xtask axvisor test qemu --arch aarch64 --test-group normal --test-case qemu-ivc
+cargo xtask image pull rootfs-aarch64-alpine.img
+export IVC_E2E_KDIR="$PWD/tmp/ivc-linux-kernel"
+scripts/ivc-prepare-linux-kernel.sh
+scripts/ivc-local-e2e.sh
 ```
+
+CI uses this same source-to-artifact path; it does not consume tracked `.ko` or
+ELF files.

@@ -161,21 +161,21 @@ int ivc_unsubscribe(ivc_subscriber_p subscriber) {
         return -1;
     }
 
-    // Close the subscriber device
+    int result = 0;
+
+    // A close error must not prevent releasing manager-side channel state.
     if (close(subscriber->fd) < 0) {
         perror("Failed to close subscriber device");
-        return -1;
+        result = -1;
     }
 
-    // Perform the unsubscribe operation
     if (ioctl(subscriber->manager->fd, IVC_UNSUBSCRIBE_CHANNEL, &subscriber->subscribe_arg) < 0) {
         perror("Failed to unsubscribe from channel");
-        return -1;
+        result = -1;
     }
 
-    // Free the subscriber memory
     free(subscriber);
-    return 0;
+    return result;
 }
 
 ivc_publisher_p ivc_publish(ivc_manager_p manager, uint64_t channel_key, uint64_t channel_size) {
@@ -287,19 +287,19 @@ int ivc_unpublish(ivc_publisher_p publisher) {
         return -1;
     }
 
-    // Close the publisher device
+    int result = 0;
+
+    // A close error must not prevent releasing manager-side channel state.
     if (close(publisher->fd) < 0) {
         perror("Failed to close publisher device");
-        return -1;
+        result = -1;
     }
 
-    // Perform the unpublish operation
     if (ioctl(publisher->manager->fd, IVC_UNPUBLISH_CHANNEL, &publisher->publish_arg) < 0) {
         perror("Failed to unpublish channel");
-        return -1;
+        result = -1;
     }
 
-    // Free the publisher memory
     free(publisher);
-    return 0;
+    return result;
 }

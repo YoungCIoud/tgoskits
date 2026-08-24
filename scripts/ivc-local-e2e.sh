@@ -19,7 +19,8 @@ set -euo pipefail
 #   IVC_E2E_WORKSPACE         工作区根目录（默认: 本脚本所在仓库根目录）
 #   IVC_E2E_KERNEL_DRIVER     kernel driver 源码目录
 #                             （默认: apps/linux/ivc/kernel_driver）
-#   IVC_E2E_KDIR              已配置/构建好的 guest Linux 内核源码树
+#   IVC_E2E_KDIR              已配置好的 guest Linux 内核源码树；CI 可先运行
+#                             scripts/ivc-prepare-linux-kernel.sh 生成
 #                             （默认 ~/workspace/tgosimages/build/qemu_linux）
 #   IVC_E2E_ARCHIVE           rootfs tar.xz 归档
 #                             （默认 tmp/axbuild/rootfs/rootfs-aarch64-alpine.img.tar.xz）
@@ -27,12 +28,6 @@ set -euo pipefail
 #   IVC_E2E_SKIP_GUEST_BUILD=1 跳过 ArceOS guest .bin 构建（只 patch Linux 侧）
 #   TGOS_IMAGE_LOCAL_STORAGE   兼容 axbuild 的本地镜像存储路径；设置后
 #                              patch 和后续测例会使用同一份镜像缓存
-#   IVC_E2E_PREBUILT_DIR       预编译产物目录（含 axvisor.ko / ivc-publish /
-#                              ivc-subscribe）。设置后跳过本地 .ko 和 Linux
-#                              用户态程序构建；给 CI 等没有 KDIR 的环境使用。
-#
-# 更新 CI 使用的 tracked 预编译产物:
-#   scripts/ivc-local-e2e.sh --no-run --update-prebuilt
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKSPACE="${IVC_E2E_WORKSPACE:-$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel)}"
@@ -45,7 +40,6 @@ IMAGES_TOML_TEMPLATE="$WORKSPACE/tmp/axbuild/rootfs/images.toml"
 LAST_SYNC_TEMPLATE="$WORKSPACE/tmp/axbuild/rootfs/.last_sync"
 
 RUN_DIR="$WORKSPACE/tmp/ivc-local-e2e"
-PREBUILT_DIR="${IVC_E2E_PREBUILT_DIR:-}"
 LINUX_APPS="$RUN_DIR/linux-apps"
 GUEST_BINS="$RUN_DIR/guest"
 ARCEOS_BUILD_CONFIG="$RUN_DIR/arceos-build.toml"
@@ -58,35 +52,30 @@ FRESH_IMAGE=0
 RUN_TEST=1
 BUILD_ARCEOS=1
 RUN_FSCK=0
-UPDATE_PREBUILT=0
 for arg in "$@"; do
     case "$arg" in
         --fresh-image) FRESH_IMAGE=1 ;;
         --no-run) RUN_TEST=0 ;;
         --no-arceos) BUILD_ARCEOS=0 ;;
         --fsck) RUN_FSCK=1 ;;
-        --update-prebuilt) UPDATE_PREBUILT=1 ;;
         *) echo "unknown argument: $arg" >&2; exit 2 ;;
     esac
 done
-if [ "$UPDATE_PREBUILT" = 1 ] && [ -n "$PREBUILT_DIR" ]; then
-    die "--update-prebuilt cannot be used together with IVC_E2E_PREBUILT_DIR"
-fi
 
 log() { printf '\n\033[1;34m[ivc-local-e2e]\033[0m %s\n' "$*"; }
 die() { printf '\033[1;31m[ivc-local-e2e] error:\033[0m %s\n' "$*" >&2; exit 1; }
 
-for tool in debugfs tar python3 cargo; do
+for tool in debugfs tar python3 cargo make modinfo; do
     command -v "$tool" >/dev/null 2>&1 || die "missing required tool: $tool"
 done
 [ -f "$ARCHIVE" ] || die "rootfs archive not found: $ARCHIVE"
 [ -f "$IMAGES_TOML_TEMPLATE" ] || die "images registry template not found: $IMAGES_TOML_TEMPLATE"
+[ -f "$KERNEL_DRIVER/Makefile" ] \
+    || die "vendored kernel driver not found: $KERNEL_DRIVER"
+[ -f "$KDIR/include/config/kernel.release" ] \
+    || die "guest kernel source tree not ready: $KDIR"
 
-if [ -n "$PREBUILT_DIR" ]; then
-    KERNEL_RELEASE="(prebuilt artifacts)"
-else
-    KERNEL_RELEASE="$(cat "$KDIR/include/config/kernel.release")"
-fi
+KERNEL_RELEASE="$(cat "$KDIR/include/config/kernel.release")"
 log "workspace        : $WORKSPACE"
 log "guest kernel     : $KERNEL_RELEASE"
 log "rootfs archive   : $ARCHIVE"
@@ -94,54 +83,37 @@ log "rootfs archive   : $ARCHIVE"
 ###############################################################################
 # 1. 使用仓库内 vendored kernel driver 编译 v3/Message V1 模块
 ###############################################################################
-if [ -n "$PREBUILT_DIR" ]; then
-    MODULE="$PREBUILT_DIR/axvisor.ko"
-    [ -f "$MODULE" ] || die "prebuilt module not found: $MODULE"
-    log "using prebuilt Linux kernel module from $PREBUILT_DIR"
-else
-    command -v modinfo >/dev/null 2>&1 || die "missing required tool: modinfo"
-    [ -f "$KERNEL_DRIVER/Makefile" ] \
-        || die "vendored kernel driver not found: $KERNEL_DRIVER"
-    [ -f "$KDIR/include/config/kernel.release" ] \
-        || die "guest kernel source tree not ready: $KDIR"
+log "building Linux kernel module from $KERNEL_DRIVER"
 
-    log "building Linux kernel module from $KERNEL_DRIVER"
-
-    CROSS_COMPILE="aarch64-unknown-linux-musl-"
-    if ! command -v "${CROSS_COMPILE}gcc" >/dev/null 2>&1; then
-        CROSS_COMPILE="aarch64-linux-gnu-"
-        command -v "${CROSS_COMPILE}gcc" >/dev/null 2>&1 \
-            || die "no aarch64 kernel cross compiler found"
-    fi
-
-    make -C "$KERNEL_DRIVER" \
-        CROSS_COMPILE="$CROSS_COMPILE" ARCH=arm64 KDIR="$KDIR" clean >/dev/null 2>&1 || true
-    make -C "$KERNEL_DRIVER" \
-        CROSS_COMPILE="$CROSS_COMPILE" ARCH=arm64 KDIR="$KDIR" -j"${IVC_E2E_JOBS:-4}"
-    MODULE="$KERNEL_DRIVER/axvisor.ko"
-    [ -f "$MODULE" ] || die "module build failed: axvisor.ko missing"
-    MODULE_VERMAGIC="$(modinfo "$MODULE" | awk '/^vermagic:/{$1=""; print; exit}')"
-    log "module vermagic   :${MODULE_VERMAGIC}"
+CROSS_COMPILE="aarch64-unknown-linux-musl-"
+if ! command -v "${CROSS_COMPILE}gcc" >/dev/null 2>&1; then
+    CROSS_COMPILE="aarch64-linux-gnu-"
+    command -v "${CROSS_COMPILE}gcc" >/dev/null 2>&1 \
+        || die "no aarch64 kernel cross compiler found"
 fi
 
-TRACKED_PREBUILT="$WORKSPACE/test-suit/axvisor/normal/qemu-ivc/prebuilt"
+make -C "$KERNEL_DRIVER" \
+    CROSS_COMPILE="$CROSS_COMPILE" ARCH=arm64 KDIR="$KDIR" clean >/dev/null 2>&1 || true
+make -C "$KERNEL_DRIVER" \
+    CROSS_COMPILE="$CROSS_COMPILE" ARCH=arm64 KDIR="$KDIR" -j"${IVC_E2E_JOBS:-4}"
+MODULE="$KERNEL_DRIVER/axvisor.ko"
+[ -f "$MODULE" ] || die "module build failed: axvisor.ko missing"
+MODULE_VERMAGIC="$(modinfo -F vermagic "$MODULE")"
+MODULE_RELEASE="${MODULE_VERMAGIC%% *}"
+[ "$MODULE_RELEASE" = "$KERNEL_RELEASE" ] \
+    || die "module release $MODULE_RELEASE does not match guest kernel $KERNEL_RELEASE"
+log "module vermagic   : $MODULE_VERMAGIC"
 
 ###############################################################################
 # 2. 用当前仓库 apps/linux/ivc 编译 Linux 用户态 subscribe/publish
 ###############################################################################
-if [ -n "$PREBUILT_DIR" ]; then
-    LINUX_APPS="$PREBUILT_DIR"
-    [ -f "$LINUX_APPS/ivc-publish" ] || die "prebuilt ivc-publish not found: $LINUX_APPS"
-    [ -f "$LINUX_APPS/ivc-subscribe" ] || die "prebuilt ivc-subscribe not found: $LINUX_APPS"
-    log "using prebuilt Linux user-space IVC apps from $PREBUILT_DIR"
-else
-    log "building Linux user-space IVC apps from apps/linux/ivc"
-    rm -rf "$LINUX_APPS"
-    AXVISOR_IVC_ARCH=aarch64 \
-    AXVISOR_IVC_OUT_DIR="$LINUX_APPS" \
-        "$WORKSPACE/apps/linux/ivc/build.sh"
-    [ -f "$LINUX_APPS/ivc-subscribe" ] || die "ivc-subscribe build failed"
-fi
+log "building Linux user-space IVC apps from apps/linux/ivc"
+rm -rf "$LINUX_APPS"
+AXVISOR_IVC_ARCH=aarch64 \
+AXVISOR_IVC_OUT_DIR="$LINUX_APPS" \
+    "$WORKSPACE/apps/linux/ivc/build.sh"
+[ -f "$LINUX_APPS/ivc-publish" ] || die "ivc-publish build failed"
+[ -f "$LINUX_APPS/ivc-subscribe" ] || die "ivc-subscribe build failed"
 
 ###############################################################################
 # 3. 用当前仓库源码编译 ArceOS guest publisher/subscriber
@@ -218,16 +190,6 @@ patch_image_file() {
         || die "failed to patch $guest_path"
     debugfs -w -R "sif $guest_path mode $mode" "$IMAGE" >/dev/null 2>&1 || true
 }
-
-if [ "$UPDATE_PREBUILT" = 1 ]; then
-    log "updating tracked prebuilt artifacts under $TRACKED_PREBUILT"
-    mkdir -p "$TRACKED_PREBUILT"
-    cp "$MODULE" "$TRACKED_PREBUILT/axvisor.ko"
-    cp "$LINUX_APPS/ivc-publish" "$TRACKED_PREBUILT/ivc-publish"
-    cp "$LINUX_APPS/ivc-subscribe" "$TRACKED_PREBUILT/ivc-subscribe"
-    chmod 644 "$TRACKED_PREBUILT/axvisor.ko"
-    chmod 755 "$TRACKED_PREBUILT/ivc-publish" "$TRACKED_PREBUILT/ivc-subscribe"
-fi
 
 log "patching rootfs image"
 patch_image_file "$MODULE" "/root/axvisor.ko" "0100644"

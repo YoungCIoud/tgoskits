@@ -26,5 +26,3 @@ cd ~/ivc_demos
 gcc axivc_subscribe.c -o axivc_subscribe
 ./axivc_subscribe 2 0xdeadbeef
 ```
-
-
