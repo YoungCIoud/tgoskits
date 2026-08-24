@@ -28,7 +28,7 @@ pub(crate) enum RiscvDeferredRunWork {
 }
 
 impl CpuUpOps for Riscv64Arch {
-    fn set_cpu_up_success(vcpu: &crate::vm::AxVCpuRef<Self::VCpu>) {
+    fn set_cpu_up_success(vcpu: &crate::vm::AxVCpu<Self::VCpu>) {
         vcpu.set_gpr(RiscvGprIndex::A0 as usize, 0);
     }
 }

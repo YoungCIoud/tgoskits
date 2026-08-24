@@ -5,6 +5,7 @@ use axvm_types::GuestPhysAddr;
 use crate::{
     AxVmResult,
     architecture::{Architecture, BoundVcpuExit, VcpuRunAction},
+    runtime::vcpus::VcpuOnError,
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -12,6 +13,15 @@ pub(crate) struct CpuUpExit {
     pub(crate) target_cpu: u64,
     pub(crate) entry_point: GuestPhysAddr,
     pub(crate) arg: u64,
+}
+
+/// Failure of one secondary-vCPU boot attempt.
+#[derive(Debug)]
+pub(crate) enum SecondaryCpuBootFailure {
+    /// Architecture-visible CPU ID did not resolve to a VM-local vCPU.
+    UnresolvedTarget(u64),
+    /// The target vCPU rejected or failed the boot attempt.
+    Boot(VcpuOnError),
 }
 
 /// Resolves architecture-visible CPU IDs through the VM-owned topology.
@@ -27,9 +37,59 @@ impl VmArchCpuIdResolver for crate::AxVM {
     }
 }
 
+/// Boots one secondary vCPU and reports which VM-local vCPU was started.
+///
+/// This is the transport-independent core shared by hypercall-driven CPU-up
+/// (PSCI/SBI) and interrupt-controller-driven CPU-up (x86 INIT-SIPI): resolve
+/// the architecture CPU ID, then hand the entry point to the generic vCPU
+/// runtime. Sender-visible success or error signaling stays with the caller so
+/// transports without a return-value ABI can omit it.
+pub(crate) fn boot_secondary_cpu(
+    vm: &crate::AxVMRef,
+    exit: CpuUpExit,
+) -> Result<usize, SecondaryCpuBootFailure> {
+    let vm_id = vm.id();
+    let target_vcpu_id = usize::try_from(exit.target_cpu)
+        .ok()
+        .and_then(|arch_cpu_id| vm.vcpu_id_for_arch_cpu_id(arch_cpu_id));
+    let Some(target_vcpu_id) = target_vcpu_id else {
+        warn!(
+            "VM[{vm_id}] cannot resolve architecture CPU target {} to a VM-local vCPU",
+            exit.target_cpu
+        );
+        return Err(SecondaryCpuBootFailure::UnresolvedTarget(exit.target_cpu));
+    };
+
+    match crate::runtime::vcpus::vcpu_on(
+        vm.clone(),
+        target_vcpu_id,
+        exit.entry_point,
+        exit.arg as _,
+    ) {
+        Ok(()) => Ok(target_vcpu_id),
+        Err(err) => {
+            warn!("Failed to boot VM[{vm_id}] VCpu[{target_vcpu_id}]: {err:?}");
+            Err(SecondaryCpuBootFailure::Boot(err))
+        }
+    }
+}
+
 pub(crate) trait CpuUpOps: Architecture {
-    fn set_cpu_up_success(vcpu: &crate::vm::AxVCpuRef<Self::VCpu>) {
+    /// Marks a successful CPU-up on the calling vCPU.
+    ///
+    /// The default clears the common success register. Architectures whose
+    /// transport has no return-value ABI must override this with a no-op so
+    /// live guest registers are never touched.
+    fn set_cpu_up_success(vcpu: &crate::vcpu::AxVCpu<Self::VCpu>) {
         vcpu.set_gpr(0, 0);
+    }
+
+    /// Marks a failed CPU-up attempt on the calling vCPU.
+    ///
+    /// The default follows the hypercall convention of returning an error
+    /// value; see [`CpuUpOps::set_cpu_up_success`] for when to override.
+    fn report_cpu_up_failure(vcpu: &crate::vcpu::AxVCpu<Self::VCpu>) {
+        vcpu.set_return_value(usize::MAX);
     }
 
     fn target_vcpu_id(vm: &crate::AxVMRef, target_cpu: u64) -> Option<usize> {
@@ -41,7 +101,7 @@ pub(crate) trait CpuUpOps: Architecture {
 
 pub(crate) fn handle<A: CpuUpOps>(
     vm: &crate::AxVMRef,
-    vcpu: &crate::vm::AxVCpuRef<A::VCpu>,
+    vcpu: &crate::vcpu::AxVCpu<A::VCpu>,
     exit: CpuUpExit,
 ) -> AxVmResult<BoundVcpuExit<A::DeferredRunWork>> {
     let vm_id = vm.id();
@@ -51,32 +111,11 @@ pub(crate) fn handle<A: CpuUpOps>(
         exit.target_cpu, exit.entry_point, exit.arg
     );
 
-    let Some(target_vcpu_id) = A::target_vcpu_id(vm, exit.target_cpu) else {
-        warn!(
-            "VM[{vm_id}] cannot resolve architecture CPU target {} to a VM-local vCPU",
-            exit.target_cpu
-        );
-        vcpu.set_return_value(usize::MAX);
-        return Ok(BoundVcpuExit::Complete(VcpuRunAction {
-            waits_for_event: false,
-            stop_reason: None,
-            resets_vm: false,
-            exits_vcpu: false,
-        }));
-    };
-
-    match crate::runtime::vcpus::vcpu_on(
-        vm.clone(),
-        target_vcpu_id,
-        exit.entry_point,
-        exit.arg as _,
-    ) {
-        Ok(()) => A::set_cpu_up_success(vcpu),
-        Err(err) => {
-            warn!("Failed to boot VM[{vm_id}] VCpu[{target_vcpu_id}]: {err:?}");
-            vcpu.set_return_value(usize::MAX);
-        }
+    match boot_secondary_cpu(vm, exit) {
+        Ok(_) => A::set_cpu_up_success(vcpu),
+        Err(_) => A::report_cpu_up_failure(vcpu),
     }
+
     Ok(BoundVcpuExit::Complete(VcpuRunAction {
         waits_for_event: false,
         stop_reason: None,
@@ -215,7 +254,7 @@ mod tests {
     impl CpuUpOps for RecordingArch<0> {}
 
     impl CpuUpOps for RecordingArch<1> {
-        fn set_cpu_up_success(vcpu: &crate::vm::AxVCpuRef<Self::VCpu>) {
+        fn set_cpu_up_success(vcpu: &crate::vcpu::AxVCpu<Self::VCpu>) {
             vcpu.set_gpr(1, 0);
         }
     }
