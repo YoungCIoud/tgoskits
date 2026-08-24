@@ -274,6 +274,10 @@ pub struct SvmVcpu<H: X86HostOps> {
     injecting_event: Option<PendingEvent>,
     /// Emulated Local APIC for x2APIC MSR accesses.
     vlapic: EmulatedLocalApic<H>,
+    /// SIPI start vector recorded before this vCPU ever runs, consumed at
+    /// `bind` time on the target's own host thread (VMCB state is plain host
+    /// memory owned by this vCPU until its task is spawned).
+    pending_sipi_vector: Option<u8>,
     /// The XState of the VCpu. Both host and guest.
     xstate: XState,
 }
@@ -294,6 +298,7 @@ impl<H: X86HostOps> SvmVcpu<H> {
             pending_events: VecDeque::with_capacity(8),
             injecting_event: None,
             vlapic: EmulatedLocalApic::<H>::new(vm_id, vcpu_id),
+            pending_sipi_vector: None,
             xstate: XState::new(),
         };
         info!("[HV] created SvmVcpu(vmcb: {:#x})", vcpu.vmcb.phys_addr());
@@ -1833,6 +1838,12 @@ impl<H: X86HostOps> SvmVcpu<H> {
         Ok(())
     }
 
+    /// Records the SIPI start vector whose entry state is programmed at the
+    /// next `bind`, overriding the recorded linear entry.
+    pub fn set_sipi_vector(&mut self, start_vector: u8) {
+        self.pending_sipi_vector = Some(start_vector);
+    }
+
     pub fn set_nested_page_table(&mut self, config: X86NestedPagingConfig) -> X86VcpuResult {
         self.npt_root = Some(config.root_paddr);
         Ok(())
@@ -1947,8 +1958,31 @@ impl<H: X86HostOps> SvmVcpu<H> {
         }
     }
 
+    /// Programs a pending SIPI start vector into the VMCB guest state.
+    ///
+    /// Runs on the vCPU's own host thread at `bind` time; the VMCB is plain
+    /// host memory owned exclusively by this vCPU until its task is spawned,
+    /// so no hardware currency step is required (unlike VMX).
+    fn program_pending_sipi_entry(&mut self) -> X86VcpuResult {
+        let Some(start_vector) = self.pending_sipi_vector.take() else {
+            return Ok(());
+        };
+        let entry_state = crate::x86_sipi_entry_state(start_vector);
+        let vmcb = unsafe { self.vmcb.as_vmcb() };
+        let state = &mut vmcb.state;
+        state.cs.selector.set(entry_state.cs_selector);
+        state.cs.base.set(entry_state.cs_base as u64);
+        state.rip.set(entry_state.rip as u64);
+        debug!(
+            "[HV] programmed SIPI entry: vector={start_vector:#x} cs={:#x}:{:#x}",
+            entry_state.cs_selector, entry_state.cs_base
+        );
+        Ok(())
+    }
+
     pub fn bind(&mut self) -> X86VcpuResult {
-        self.bind_to_current_processor()
+        self.bind_to_current_processor()?;
+        self.program_pending_sipi_entry()
     }
 
     pub fn unbind(&mut self) -> X86VcpuResult {

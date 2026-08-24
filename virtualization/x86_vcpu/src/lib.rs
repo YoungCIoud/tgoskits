@@ -236,6 +236,19 @@ pub(crate) fn x86_real_mode_entry_state(entry: X86GuestPhysAddr) -> X86RealModeE
     }
 }
 
+/// Entry state of a wait-for-SIPI target woken by a STARTUP IPI.
+///
+/// Intel SDM Vol.3 §9.4.4 / §11.6.2: the AP begins executing in real mode at
+/// `CS selector = vector << 8`, `CS base = vector << 12`, `IP = 0`, so the
+/// first instruction fetch lands at the vector's 4-KiB page.
+pub(crate) const fn x86_sipi_entry_state(start_vector: u8) -> X86RealModeEntryState {
+    X86RealModeEntryState {
+        cs_selector: (start_vector as u16) << 8,
+        cs_base: (start_vector as usize) << 12,
+        rip: 0,
+    }
+}
+
 mod svm;
 mod vmx;
 
@@ -280,6 +293,26 @@ mod tests {
                 cs_selector: 0xf000,
                 cs_base: 0xffff_0000,
                 rip: 0xfff0,
+            }
+        );
+    }
+
+    #[test]
+    fn sipi_entry_state_maps_vector_to_real_mode_cs_page() {
+        assert_eq!(
+            x86_sipi_entry_state(0x08),
+            X86RealModeEntryState {
+                cs_selector: 0x0800,
+                cs_base: 0x8000,
+                rip: 0,
+            }
+        );
+        assert_eq!(
+            x86_sipi_entry_state(0xd2),
+            X86RealModeEntryState {
+                cs_selector: 0xd200,
+                cs_base: 0xd2_000,
+                rip: 0,
             }
         );
     }

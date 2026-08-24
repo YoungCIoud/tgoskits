@@ -168,6 +168,15 @@ impl<H: X86HostOps> X86Vcpu<H> {
         dispatch_vcpu!(self, set_entry, entry)
     }
 
+    /// Record the SIPI start vector for a wait-for-SIPI vCPU.
+    ///
+    /// The next bind programs the protocol-exact real-mode entry state
+    /// (`CS selector = vector << 8`, `CS base = vector << 12`, `IP = 0`),
+    /// overriding the recorded linear entry.
+    pub fn set_sipi_vector(&mut self, start_vector: u8) {
+        dispatch_vcpu!(self, set_sipi_vector, start_vector)
+    }
+
     /// Install the guest nested page-table configuration.
     ///
     /// # Errors

@@ -188,6 +188,12 @@ pub struct VmxVcpu<H: X86HostOps> {
     pending_events: VecDeque<PendingEvent>,
     /// Emulated Local APIC.
     vlapic: EmulatedLocalApic<H>,
+    /// SIPI start vector recorded before this vCPU ever runs.
+    ///
+    /// Set from the INIT-SIPI CPU-up path on the sending thread while the
+    /// target task does not exist yet, then consumed once at `bind` time on
+    /// the target's own host thread, where this VMCS is current.
+    pending_sipi_vector: Option<u8>,
     /// Guest CR2 is not saved or restored by VMX hardware.
     guest_cr2: usize,
     /// Guest syscall MSRs that are not saved or restored by VMX hardware.
@@ -223,6 +229,7 @@ impl<H: X86HostOps> VmxVcpu<H> {
             msr_bitmap: MsrBitmap::<H>::passthrough_all()?,
             pending_events: VecDeque::with_capacity(8),
             vlapic: EmulatedLocalApic::<H>::new(vm_id, vcpu_id),
+            pending_sipi_vector: None,
             guest_cr2: 0,
             guest_syscall_msrs: VmxSyscallMsrState::default(),
             guest_memory_regions: Vec::new(),
@@ -1852,6 +1859,12 @@ impl<H: X86HostOps> VmxVcpu<H> {
         Ok(())
     }
 
+    /// Records the SIPI start vector whose entry state is programmed at the
+    /// next `bind`, overriding the recorded linear entry.
+    pub fn set_sipi_vector(&mut self, start_vector: u8) {
+        self.pending_sipi_vector = Some(start_vector);
+    }
+
     pub fn set_nested_page_table(&mut self, config: X86NestedPagingConfig) -> X86VcpuResult {
         self.nested_page_table_root = Some(config.root_paddr);
         Ok(())
@@ -2107,8 +2120,30 @@ impl<H: X86HostOps> VmxVcpu<H> {
         }
     }
 
+    /// Programs a pending SIPI start vector into live guest state.
+    ///
+    /// Must run on the vCPU's own host thread with this VMCS current (after
+    /// `bind_to_current_processor`): VMCS guest fields cannot be written from
+    /// the INIT-SIPI sending thread without stealing the current-VMCS pointer
+    /// that thread's own guest entry depends on.
+    fn program_pending_sipi_entry(&mut self) -> X86VcpuResult {
+        let Some(start_vector) = self.pending_sipi_vector.take() else {
+            return Ok(());
+        };
+        let entry_state = crate::x86_sipi_entry_state(start_vector);
+        VmcsGuest16::CS_SELECTOR.write(entry_state.cs_selector)?;
+        VmcsGuestNW::CS_BASE.write(entry_state.cs_base)?;
+        VmcsGuestNW::RIP.write(entry_state.rip)?;
+        debug!(
+            "[HV] programmed SIPI entry: vector={start_vector:#x} cs={:#x}:{:#x}",
+            entry_state.cs_selector, entry_state.cs_base
+        );
+        Ok(())
+    }
+
     pub fn bind(&mut self) -> X86VcpuResult {
-        self.bind_to_current_processor()
+        self.bind_to_current_processor()?;
+        self.program_pending_sipi_entry()
     }
 
     pub fn unbind(&mut self) -> X86VcpuResult {
