@@ -5,7 +5,7 @@ mod resources;
 
 use std::{format, sync::Arc, vec::Vec};
 
-use axdevice::{FwCfgKernelPayload, FwCfgPlatformConfig, FwCfgRamRegion};
+use axdevice::{FwCfgKernelPayload, FwCfgNonRamRegion, FwCfgPlatformConfig, FwCfgRamRegion};
 use axdevice_base::InterruptControllerId;
 use axvmconfig::{GuestConfig, VMBootProtocol};
 pub(crate) use resources::{
@@ -142,6 +142,9 @@ impl GuestPlatform {
         })?;
         Ok(FwCfgPlatformConfig {
             ram_regions: ram_regions.clone(),
+            // LoongArch guests consume the FDT memory map, not etc/e820; no
+            // non-RAM windows are declared for now.
+            non_ram_regions: <Arc<[FwCfgNonRamRegion]>>::default(),
             srat_regions: ram_regions,
             acpi,
         })

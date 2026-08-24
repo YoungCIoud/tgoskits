@@ -2,7 +2,7 @@
 
 use std::{format, sync::Arc, vec::Vec};
 
-use axdevice::{FwCfgKernelPayload, FwCfgPlatformConfig, FwCfgRamRegion};
+use axdevice::{FwCfgKernelPayload, FwCfgNonRamRegion, FwCfgPlatformConfig, FwCfgRamRegion};
 use axvm_types::GuestPhysAddr;
 use axvmconfig::{VMBootProtocol, VmMemMappingType};
 
@@ -402,6 +402,10 @@ fn prepare_x86_firmware(
             .map_err(|_| AxVmError::invalid_config("x86 fw_cfg CPU count exceeds 16 bits"))?,
         platform: FwCfgPlatformConfig {
             ram_regions: ram_regions.clone(),
+            // No non-RAM windows are declared yet: etc/e820 stays RAM-only until a
+            // platform declares e.g. a reserved EFI varstore window through
+            // `non_ram_regions`.
+            non_ram_regions: <Arc<[FwCfgNonRamRegion]>>::default(),
             srat_regions: ram_regions,
             acpi,
         },
