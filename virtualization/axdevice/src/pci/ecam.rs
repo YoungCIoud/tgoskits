@@ -25,24 +25,26 @@ const ECAM_ALIGNMENT: u64 = ECAM_SIZE;
 ///
 /// # Errors
 ///
-/// Returns [`PciError::InvalidHostAperture`] when the ECAM base is not 1 MiB
-/// aligned, either range overflows, the aperture is empty or extends above
-/// 4 GiB, or the two windows overlap.
+/// Returns [`PciError::InvalidHostAperture`] when the ECAM window is not a
+/// 1 MiB-aligned range of exactly 1 MiB, the aperture is empty or extends
+/// above 4 GiB, or the two windows overlap.
 pub fn validate_host_windows(ecam: Range<u64>, aperture: Range<u64>) -> PciResult {
     if ecam.start & (ECAM_ALIGNMENT - 1) != 0 {
         return Err(invalid_host("ECAM base is not 1 MiB aligned"));
     }
-    let ecam_end = ecam
-        .start
-        .checked_add(ECAM_SIZE)
-        .ok_or_else(|| invalid_host("ECAM range overflows u64"))?;
+    // The device built from this window reports exactly ECAM_SIZE bytes, so a
+    // caller-supplied range that disagrees with its own base would silently
+    // describe different facts.
+    if ecam.start.checked_add(ECAM_SIZE) != Some(ecam.end) {
+        return Err(invalid_host("ECAM window must be exactly 1 MiB"));
+    }
     if aperture.start >= aperture.end {
         return Err(invalid_host("memory aperture is empty"));
     }
     if aperture.end > FOUR_GIB {
         return Err(invalid_host("memory aperture extends above 4 GiB"));
     }
-    if ecam.start < aperture.end && aperture.start < ecam_end {
+    if ecam.start < aperture.end && aperture.start < ecam.end {
         return Err(invalid_host("ECAM and memory aperture overlap"));
     }
     Ok(())

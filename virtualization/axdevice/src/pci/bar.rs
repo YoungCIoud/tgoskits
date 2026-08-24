@@ -1,4 +1,17 @@
 //! Memory BAR descriptors and mutable decode state.
+//!
+//! Two deliberate differences from designs that store sizing responses in
+//! the config image (recorded for the x86 migration):
+//!
+//! * Attribute bits are re-derived from the resolved plan on every read
+//!   instead of being stored from guest writes, so no access width can flip
+//!   them.
+//! * A rejected relocation write still clears that dword's probe latch, so
+//!   the readback returns to the committed address; it does not keep showing
+//!   a stale size mask. Likewise, a non-canonical probe that writes
+//!   `~(size - 1)` with cleared attribute bits classifies as a relocation
+//!   candidate under [`PciBarDecodePolicy::Fixed`] and is rejected —
+//!   compliant drivers write all-ones dwords.
 
 use core::ops::Range;
 

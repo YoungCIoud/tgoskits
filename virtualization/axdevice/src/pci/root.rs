@@ -7,6 +7,13 @@
 //! already-validated typed accesses here. Endpoint handler callbacks always
 //! run outside the root lock.
 //!
+//! Lock contract for every extension of this state: the root lock covers
+//! validation, standard-state mutation, and effect snapshots only. Command
+//! effects ([`dispatch_command_effect`]), BAR handlers
+//! ([`PciRootState::resolve_bar`] consumers), and function resets
+//! ([`PciRootState::reset_collecting_handlers`]) dispatch outside it —
+//! transport, IRQ, DMA, and MMIO callbacks must never run under the lock.
+//!
 //! A future bus-owned DMA grant would be injected through the root device's
 //! bundle registration; the ECAM and memory-aperture frontends never own one.
 
@@ -41,7 +48,7 @@ pub(crate) struct PciRootState {
 impl PciRootState {
     /// Creates mutable config/BAR state from one frozen topology.
     pub(crate) fn new(topology: &ResolvedPciTopology) -> Self {
-        let functions = topology
+        let functions: Vec<FunctionState> = topology
             .function_plans()
             .iter()
             .map(|function| {
@@ -53,6 +60,14 @@ impl PciRootState {
                 )
             })
             .collect();
+        // `function_index` binary-searches by BDF, so the resolved order is a
+        // load-bearing invariant of this state.
+        debug_assert!(
+            functions
+                .windows(2)
+                .all(|pair| pair[0].bdf() <= pair[1].bdf()),
+            "resolved PCI functions must stay BDF-sorted"
+        );
         Self {
             memory_aperture: topology.memory_aperture().clone(),
             functions,
@@ -198,16 +213,24 @@ impl PciRootState {
     }
 
     pub(crate) fn resolve_bar(&self, access: &DeviceAccess) -> Option<BarRoute> {
+        // One overflow check up front: an access whose end overflows can
+        // never hit any BAR, and per-BAR failures below must never hide a
+        // later candidate.
+        let access_end = access.address().checked_add(access.width().size() as u64)?;
         for function in &self.functions {
             if !function.memory_decode_enabled() {
                 continue;
             }
+            let Some(handler) = function.handler() else {
+                continue;
+            };
             for bar in function.bars() {
-                let range = bar.range()?;
-                let end = access.address().checked_add(access.width().size() as u64)?;
-                if range.start <= access.address() && end <= range.end {
+                let Some(range) = bar.range() else {
+                    continue;
+                };
+                if range.start <= access.address() && access_end <= range.end {
                     return Some(BarRoute {
-                        handler: function.handler()?,
+                        handler,
                         access: PciBarAccess::new(
                             access.source_vcpu(),
                             function.bdf(),

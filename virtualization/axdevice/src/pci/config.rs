@@ -282,9 +282,12 @@ impl FunctionState {
         value: u64,
     ) -> Option<BarWriteAction> {
         let (bar, high) = self.bar_dword(offset)?;
-        // Classify only after merging the write into the full BAR dword, so a
-        // partial write that completes the all-ones sizing mask is treated
-        // exactly like a whole-dword probe.
+        // Classify only after merging the write into the full BAR dword: one
+        // policy application point per access, whatever the width. For the
+        // typed config accesses reachable today this coincides with
+        // classifying the raw value (an aligned BAR base can never complete
+        // an all-ones dword from a partial write); composing frontends such
+        // as CF8/CFC data-port bytes rely on the merged classification.
         let mut dword = self.bars[bar].committed_dword(high).to_le_bytes();
         merge_bytes(&mut dword, offset % 4, size, value, &[u8::MAX; 4]);
         let merged = u32::from_le_bytes(dword);
