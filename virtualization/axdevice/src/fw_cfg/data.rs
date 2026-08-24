@@ -38,6 +38,17 @@ fn push_memmap_entry(memmap: &mut Vec<u8>, base: u64, length: u64) {
     memmap.extend_from_slice(&0u32.to_le_bytes());
 }
 
+/// Placeholder for the typed `etc/e820` encoder. The regression tests in `tests.rs`
+/// pin the wire contract this function must satisfy; it intentionally returns an
+/// empty payload until that encoding is implemented.
+pub(super) fn build_e820_map(
+    ram_regions: &[FwCfgRamRegion],
+    non_ram_regions: &[FwCfgNonRamRegion],
+) -> Vec<u8> {
+    let _ = (ram_regions, non_ram_regions);
+    Vec::new()
+}
+
 pub(super) fn build_smbios_tables() -> Vec<u8> {
     let mut table = Vec::with_capacity(6);
     table.push(127);

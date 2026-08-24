@@ -64,6 +64,40 @@ pub struct FwCfgRamRegion {
     pub size: u64,
 }
 
+/// Firmware-visible memory type of an [`FwCfgNonRamRegion`] window.
+///
+/// These are the `etc/e820` record types other than usable RAM: usable RAM comes only
+/// from `FwCfgPlatformConfig::ram_regions` and is encoded as record type 1 by
+/// construction, never through this type.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum E820NonRamType {
+    /// Hole or firmware-owned memory that guests must not allocate from.
+    Reserved = 2,
+    /// ACPI tables that firmware hands off and the OS may reclaim after boot.
+    AcpiReclaimable = 3,
+    /// ACPI non-volatile-sleep memory preserved across sleep states.
+    AcpiNvs = 4,
+}
+
+impl E820NonRamType {
+    /// Wire value of the `type` field in a packed `etc/e820` record.
+    pub fn wire_value(self) -> u32 {
+        self as u32
+    }
+}
+
+/// A guest physical window that firmware must see as something other than usable RAM.
+///
+/// Declared windows flow into the `etc/e820` fw_cfg file verbatim, sorted by base
+/// address; callers must keep them disjoint from each other and from declared RAM.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FwCfgNonRamRegion {
+    pub base: u64,
+    pub size: u64,
+    pub memory_type: E820NonRamType,
+}
+
 /// Prebuilt platform firmware blobs exposed through fw_cfg file entries.
 ///
 /// `fw_cfg` itself is only the transport. Architecture boot code owns the

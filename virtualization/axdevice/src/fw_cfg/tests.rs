@@ -188,7 +188,7 @@ fn dma_descriptor_uses_the_runtime_granted_memory_port() {
     let mut runtime = crate::DeviceRuntime::empty();
     runtime.register_bundle(bundle).unwrap();
     let mut memory = TestGuestMemory {
-        bytes: alloc::vec![0; 0x200],
+        bytes: alloc::alloc::vec![0; 0x200],
     };
     let control = FW_CFG_DMA_CTL_SELECT | FW_CFG_DMA_CTL_READ;
     memory.bytes[DESCRIPTOR..DESCRIPTOR + 4].copy_from_slice(&control.to_be_bytes());
@@ -300,7 +300,7 @@ fn pio_selector_data_and_dma_share_one_fw_cfg_state() {
     assert_eq!(setup, b"setup");
 
     let mut memory = TestGuestMemory {
-        bytes: alloc::vec![0; 0x200],
+        bytes: alloc::alloc::vec![0; 0x200],
     };
     let control = FW_CFG_DMA_CTL_SELECT | FW_CFG_DMA_CTL_READ;
     memory.bytes[DESCRIPTOR..DESCRIPTOR + 4].copy_from_slice(&control.to_be_bytes());
@@ -340,7 +340,7 @@ fn pio_dma_fault_does_not_poison_the_next_32_bit_transfer() {
     let mut runtime = crate::DeviceRuntime::empty();
     runtime.register_bundle(bundle).unwrap();
     let mut memory = TestGuestMemory {
-        bytes: alloc::vec![0; 0x200],
+        bytes: alloc::alloc::vec![0; 0x200],
     };
 
     write(
@@ -376,4 +376,175 @@ fn pio_dma_fault_does_not_poison_the_next_32_bit_transfer() {
     );
 
     assert_eq!(&memory.bytes[BUFFER..BUFFER + 4], b"QEMU");
+}
+
+#[test]
+fn e820_records_pack_little_endian_with_twenty_byte_stride() {
+    let ram = [FwCfgRamRegion {
+        base: 0x0,
+        size: 0xa_0000,
+    }];
+    let non_ram = [FwCfgNonRamRegion {
+        base: 0xa_0000,
+        size: 0x6_0000,
+        memory_type: E820NonRamType::Reserved,
+    }];
+
+    let payload = build_e820_map(&ram, &non_ram);
+
+    // Byte-exact first record pins field order, little-endian packing, and the
+    // 20-byte stride consumers derive entry counts from (no padding bytes).
+    let mut expected = Vec::new();
+    expected.extend_from_slice(&[
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // addr = 0
+        0x00, 0x00, 0x0a, 0x00, 0x00, 0x00, 0x00, 0x00, // size = 0xa0000
+        0x01, 0x00, 0x00, 0x00, // type = usable RAM
+    ]);
+    expected.extend_from_slice(&0xa_0000u64.to_le_bytes());
+    expected.extend_from_slice(&0x6_0000u64.to_le_bytes());
+    expected.extend_from_slice(&2u32.to_le_bytes());
+
+    assert_eq!(payload.len(), 2 * 20);
+    assert_eq!(payload, expected);
+}
+
+#[test]
+fn e820_orders_entries_by_base_across_ram_and_reserved_windows() {
+    let ram = [
+        FwCfgRamRegion {
+            base: 0x8000_0000,
+            size: 0x1000,
+        },
+        FwCfgRamRegion {
+            base: 0x0,
+            size: 0xa_0000,
+        },
+    ];
+    let non_ram = [
+        FwCfgNonRamRegion {
+            base: 0xc000_0000,
+            size: 0x1000,
+            memory_type: E820NonRamType::AcpiNvs,
+        },
+        FwCfgNonRamRegion {
+            base: 0xf_0000,
+            size: 0x1_0000,
+            memory_type: E820NonRamType::Reserved,
+        },
+    ];
+
+    let entries = decode_e820_records(&build_e820_map(&ram, &non_ram));
+
+    let bases: Vec<u64> = entries.iter().map(|entry| entry.0).collect();
+    assert_eq!(bases, alloc::vec![0x0, 0xf_0000, 0x8000_0000, 0xc000_0000]);
+}
+
+#[test]
+fn e820_encodes_reserved_reclaim_and_nvs_wire_types() {
+    let non_ram = [
+        FwCfgNonRamRegion {
+            base: 0x1000,
+            size: 0x1000,
+            memory_type: E820NonRamType::Reserved,
+        },
+        FwCfgNonRamRegion {
+            base: 0x2000,
+            size: 0x1000,
+            memory_type: E820NonRamType::AcpiReclaimable,
+        },
+        FwCfgNonRamRegion {
+            base: 0x3000,
+            size: 0x1000,
+            memory_type: E820NonRamType::AcpiNvs,
+        },
+    ];
+
+    let entries = decode_e820_records(&build_e820_map(&[], &non_ram));
+
+    let types: Vec<u32> = entries.iter().map(|entry| entry.2).collect();
+    assert_eq!(types, alloc::vec![2, 3, 4]);
+}
+
+#[test]
+fn e820_drops_zero_length_declared_regions() {
+    let ram = [
+        FwCfgRamRegion {
+            base: 0x0,
+            size: 0,
+        },
+        FwCfgRamRegion {
+            base: 0x1000,
+            size: 0x1000,
+        },
+    ];
+    let non_ram = [FwCfgNonRamRegion {
+        base: 0x9000,
+        size: 0,
+        memory_type: E820NonRamType::Reserved,
+    }];
+
+    let entries = decode_e820_records(&build_e820_map(&ram, &non_ram));
+
+    assert_eq!(entries, alloc::vec![(0x1000, 0x1000, 1)]);
+}
+
+#[test]
+fn e820_without_non_ram_input_preserves_legacy_memmap_coverage() {
+    let ram = [
+        FwCfgRamRegion {
+            base: 0x0,
+            size: 0x1000_0000,
+        },
+        FwCfgRamRegion {
+            base: 0x8000_0000,
+            size: 0x2400_0000,
+        },
+    ];
+
+    // The pre-e820 "etc/memmap" payload and the typed encoder must expose exactly
+    // the same (addr, size, type=RAM) coverage when nothing else is declared; only
+    // the record stride differs (24-byte padded vs packed 20-byte).
+    let legacy_entries = decode_legacy_memmap_records(&legacy_memmap_bytes(&ram));
+    let e820_entries = decode_e820_records(&build_e820_map(&ram, &[]));
+
+    assert_eq!(e820_entries, legacy_entries);
+}
+
+fn decode_e820_records(payload: &[u8]) -> Vec<(u64, u64, u32)> {
+    payload
+        .chunks_exact(20)
+        .map(|record| {
+            (
+                u64::from_le_bytes(record[0..8].try_into().unwrap()),
+                u64::from_le_bytes(record[8..16].try_into().unwrap()),
+                u32::from_le_bytes(record[16..20].try_into().unwrap()),
+            )
+        })
+        .collect()
+}
+
+// Mirrors the retired `build_memmap` wire shape: 24-byte records with four trailing
+// padding bytes, all entries typed as usable RAM.
+fn legacy_memmap_bytes(regions: &[FwCfgRamRegion]) -> Vec<u8> {
+    let mut memmap = Vec::new();
+    for region in regions.iter().filter(|region| region.size != 0) {
+        memmap.extend_from_slice(&region.base.to_le_bytes());
+        memmap.extend_from_slice(&region.size.to_le_bytes());
+        memmap.extend_from_slice(&1u32.to_le_bytes());
+        memmap.extend_from_slice(&0u32.to_le_bytes());
+    }
+    memmap
+}
+
+fn decode_legacy_memmap_records(payload: &[u8]) -> Vec<(u64, u64, u32)> {
+    payload
+        .chunks_exact(24)
+        .map(|record| {
+            (
+                u64::from_le_bytes(record[0..8].try_into().unwrap()),
+                u64::from_le_bytes(record[8..16].try_into().unwrap()),
+                u32::from_le_bytes(record[16..20].try_into().unwrap()),
+            )
+        })
+        .collect()
 }
