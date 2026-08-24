@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Add root-level direct config access validation for supported widths and function-boundary checks.
 - Add PCI BDF reservations (`PciTopologyBuilder::reserve_bdf`) so architectures can protect platform positions, and make automatic placement device-granular so unrelated endpoints never merge into one multi-function device.
 - Add PCI BAR decode policies: `PciMemoryBar::with_decode_policy(Fixed)` keeps a planner-owned base permanent against guest relocations, and the prefetchable attribute is modeled and preserved across reads, sizing probes, partial writes, and reset. BAR write classification now happens after the write is merged into the full dword, so partial accesses obey the same policy as whole accesses.
+- Model standard PCI command state (Memory Space Enable, Bus Master Enable, and INTx Disable) in the root config image and dispatch command transitions as effects outside the root lock, preparing the seam for endpoint observers and function reset.
 
 ### Changed
 

@@ -17,7 +17,33 @@ use crate::DeviceNodeId;
 const LEGACY_CONFIG_END: usize = 0x100;
 const CAPABILITY_START: usize = 0x40;
 const COMMAND_MEMORY_ENABLE: u8 = 0x02;
+const COMMAND_BUS_MASTER_ENABLE: u8 = 0x04;
+/// PCI Interrupt Disable is command bit 10: bit 2 of the high byte of the
+/// little-endian 16-bit command field at offset 4.
+const COMMAND_INTX_DISABLE_HIGH: u8 = 0x04;
 const STATUS_CAPABILITY_LIST: u8 = 0x10;
+
+/// Standard PCI command state owned by the root config image.
+///
+/// Endpoints observe transitions through the root's out-of-lock effect
+/// dispatch instead of owning their own header copy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PciCommandState {
+    pub(crate) memory_space_enabled: bool,
+    pub(crate) bus_master_enabled: bool,
+    pub(crate) intx_disabled: bool,
+}
+
+impl PciCommandState {
+    /// Reads the modeled command bits from one config image.
+    pub(crate) fn from_config(config: &[u8; CONFIG_SPACE_SIZE]) -> Self {
+        Self {
+            memory_space_enabled: config[4] & COMMAND_MEMORY_ENABLE != 0,
+            bus_master_enabled: config[4] & COMMAND_BUS_MASTER_ENABLE != 0,
+            intx_disabled: config[5] & COMMAND_INTX_DISABLE_HIGH != 0,
+        }
+    }
+}
 
 /// One conventional PCI capability body.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -121,7 +147,8 @@ impl PowerOnConfig {
         let mut write_mask = Box::new([0; CONFIG_SPACE_SIZE]);
         bytes[0..2].copy_from_slice(&identity.vendor_id().to_le_bytes());
         bytes[2..4].copy_from_slice(&identity.device_id().to_le_bytes());
-        write_mask[4] = COMMAND_MEMORY_ENABLE;
+        write_mask[4] = COMMAND_MEMORY_ENABLE | COMMAND_BUS_MASTER_ENABLE;
+        write_mask[5] = COMMAND_INTX_DISABLE_HIGH;
         let class = identity.class();
         bytes[8] = identity.revision();
         bytes[9] = class.programming_interface();
@@ -220,6 +247,11 @@ impl FunctionState {
 
     pub(crate) fn memory_decode_enabled(&self) -> bool {
         self.config[4] & COMMAND_MEMORY_ENABLE != 0
+    }
+
+    /// Returns the standard command state of this function's config image.
+    pub(crate) fn command_state(&self) -> PciCommandState {
+        PciCommandState::from_config(&self.config)
     }
 
     pub(crate) fn bars(&self) -> &[BarState] {

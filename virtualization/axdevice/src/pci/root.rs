@@ -25,7 +25,7 @@ use super::{
     ResolvedPciTopology,
     address::CONFIG_SPACE_SIZE,
     bar::PciBarDecodePolicy,
-    config::{BarWriteAction, FunctionState},
+    config::{BarWriteAction, FunctionState, PciCommandState},
 };
 use crate::{DeviceBundle, DeviceNodeId};
 
@@ -107,28 +107,36 @@ impl PciRootState {
         ))
     }
 
-    /// Applies one already width-checked config write.
+    /// Applies one already width-checked config write and snapshots any
+    /// standard command transition.
     ///
-    /// An absent BDF ignores the write.
+    /// An absent BDF ignores the write. Callers hold the root lock while this
+    /// runs; endpoint effects are dispatched outside it through
+    /// [`dispatch_command_effect`].
     ///
     /// # Errors
     ///
     /// Returns [`PciError::InvalidDirectConfigAccess`] under the same
     /// conditions as [`PciRootState::read_config`].
-    pub(crate) fn write_config(
+    pub(crate) fn write_config_locked(
         &mut self,
         bdf: PciBdf,
         offset: usize,
         size: usize,
         value: u64,
-    ) -> PciResult {
+    ) -> PciResult<Option<PciConfigWriteEffect>> {
         Self::validate_direct_access(offset, size)?;
         let Some(index) = self.function_index(bdf) else {
-            return Ok(());
+            return Ok(None);
         };
+        let command_before = self.functions[index].command_state();
         let Some(action) = self.functions[index].prepare_bar_write(offset, size, value) else {
             self.functions[index].write_non_bar(offset, size, value);
-            return Ok(());
+            let command_after = self.functions[index].command_state();
+            let command = (command_after != command_before).then_some(command_after);
+            return Ok(command.map(|command| PciConfigWriteEffect {
+                command: Some(command),
+            }));
         };
         match action {
             BarWriteAction::Probe { bar, high } => {
@@ -165,7 +173,7 @@ impl PciRootState {
                 self.functions[index].finish_relocation(bar, high, accepted.then_some(candidate));
             }
         }
-        Ok(())
+        Ok(None)
     }
 
     fn validate_direct_access(offset: usize, size: usize) -> PciResult {
@@ -266,6 +274,56 @@ pub(crate) struct BarRoute {
     pub(crate) access: PciBarAccess,
 }
 
+/// A standard-state change produced inside the root lock, applied outside it.
+///
+/// The dynamic config window and endpoint function-access effects ride on
+/// this seam once a real consumer exists; command transitions are the first
+/// dispatched kind and the reset path reuses the same out-of-lock pattern.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PciConfigWriteEffect {
+    pub(crate) command: Option<PciCommandState>,
+}
+
+/// Applies one width-checked config write through the shared root state.
+///
+/// The lock scope covers validation, the standard-state merge, and the
+/// effect snapshot only; transport, IRQ, DMA, and BAR handlers never run
+/// inside it.
+///
+/// # Errors
+///
+/// Returns [`PciError::InvalidDirectConfigAccess`] when the access violates
+/// root-level width or boundary rules.
+pub(crate) fn write_config(
+    root: &SharedPciRoot,
+    bdf: PciBdf,
+    offset: usize,
+    size: usize,
+    value: u64,
+) -> PciResult {
+    let effect = root
+        .lock_irqsave()
+        .write_config_locked(bdf, offset, size, value)?;
+    if let Some(effect) = effect {
+        dispatch_command_effect(root, effect);
+    }
+    Ok(())
+}
+
+fn dispatch_command_effect(_root: &SharedPciRoot, effect: PciConfigWriteEffect) {
+    // Runs outside the root lock by contract. No endpoint consumes command
+    // transitions yet; log so guest-visible changes stay diagnosable until
+    // the observer arrives with the first dynamic consumer.
+    if let Some(command) = effect.command {
+        log::debug!(
+            "PCI command state: memory_space={}, bus_master={}, intx_disabled={}",
+            command.memory_space_enabled,
+            command.bus_master_enabled,
+            command.intx_disabled
+        );
+    }
+}
+
 /// Binds one runtime function for exactly the lifetime of `bundle`.
 ///
 /// The binding lease is retained by `bundle`, so bundle registration failure
@@ -330,4 +388,95 @@ pub(crate) fn contains_access(range: &Range<u64>, access: &DeviceAccess) -> bool
 
 fn all_ones(size: usize) -> u64 {
     u64::MAX >> ((8 - size) * 8)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        super::{PciClass, PciEndpointIdentity, PciFunctionSpec, PciTopologyBuilder},
+        *,
+    };
+    use crate::DeviceNodeId;
+
+    const APERTURE: Range<u64> = 0x2000_0000..0x2010_0000;
+
+    fn root_with_one_function() -> PciRootState {
+        let mut builder = PciTopologyBuilder::new();
+        builder
+            .add_function(PciFunctionSpec::new(
+                DeviceNodeId::new("endpoint").unwrap(),
+                PciEndpointIdentity::new(0x1234, 0x5678, PciClass::new(0xff, 0, 0)),
+            ))
+            .unwrap();
+        let topology = builder.resolve(APERTURE).unwrap();
+        PciRootState::new(&topology)
+    }
+
+    /// Direct public callers must get typed errors instead of panics or
+    /// silently wrapped reads; the ECAM frontend rejects these earlier, so
+    /// root-level enforcement guards only non-ECAM frontends and direct use.
+    fn assert_rejected(state: &mut PciRootState, offset: usize, size: usize) {
+        let bdf = state.functions[0].bdf();
+        assert!(
+            matches!(
+                state.read_config(bdf, offset, size),
+                Err(PciError::InvalidDirectConfigAccess { .. })
+            ),
+            "read offset {offset:#x} size {size} must be rejected"
+        );
+        assert!(
+            matches!(
+                state.write_config_locked(bdf, offset, size, 0),
+                Err(PciError::InvalidDirectConfigAccess { .. })
+            ),
+            "write offset {offset:#x} size {size} must be rejected"
+        );
+    }
+
+    #[test]
+    fn rejects_zero_length_config_accesses() {
+        let mut state = root_with_one_function();
+        assert_rejected(&mut state, 0, 0);
+    }
+
+    #[test]
+    fn rejects_qword_config_accesses() {
+        let mut state = root_with_one_function();
+        assert_rejected(&mut state, 0, 8);
+        assert_rejected(&mut state, 0x100, 8);
+    }
+
+    #[test]
+    fn rejects_size_width_mismatches() {
+        let mut state = root_with_one_function();
+        for size in [3usize, 5, 16] {
+            assert_rejected(&mut state, 0, size);
+        }
+    }
+
+    #[test]
+    fn rejects_config_accesses_past_the_tail() {
+        let mut state = root_with_one_function();
+        assert_rejected(&mut state, 0x1000 - 3, 4);
+        assert_rejected(&mut state, CONFIG_SPACE_SIZE - 1, 2);
+    }
+
+    #[test]
+    fn rejects_overflowing_config_offsets() {
+        let mut state = root_with_one_function();
+        assert_rejected(&mut state, usize::MAX - 2, 4);
+    }
+
+    #[test]
+    fn absent_bdf_reads_all_ones_and_ignores_writes_without_effects() {
+        let mut state = root_with_one_function();
+        let absent = PciBdf::bus_zero(31 * 8 + 7);
+        assert_eq!(state.read_config(absent, 0, 1).unwrap(), 0xff);
+        assert!(
+            state
+                .write_config_locked(absent, 4, 2, 0xffff)
+                .unwrap()
+                .is_none()
+        );
+    }
 }

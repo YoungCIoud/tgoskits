@@ -141,7 +141,9 @@ fn ecam_exposes_type_zero_identity_capabilities_and_absent_functions() {
     assert_eq!(read_config(&runtime, bdf, 0x43, AccessWidth::Byte), 0xbb);
 
     write_config(&runtime, bdf, 4, AccessWidth::Word, u64::MAX);
-    assert_eq!(read_config(&runtime, bdf, 4, AccessWidth::Word), 0x0002);
+    // Memory Space Enable, Bus Master Enable, and INTx Disable are the
+    // modeled command bits; everything else stays masked off.
+    assert_eq!(read_config(&runtime, bdf, 4, AccessWidth::Word), 0x0406);
     assert_eq!(read_config(&runtime, bdf, 0x100, AccessWidth::Dword), 0);
 
     let absent = PciBdf::new(PciSegment::new(0), 0, 31, 7).unwrap();
@@ -163,6 +165,40 @@ fn ecam_exposes_type_zero_identity_capabilities_and_absent_functions() {
 
     runtime.reset_lifecycle_devices().unwrap();
     assert_eq!(read_config(&runtime, bdf, 0x42, AccessWidth::Byte), 0xaa);
+    assert_eq!(read_config(&runtime, bdf, 4, AccessWidth::Word), 0);
+}
+
+#[test]
+fn command_register_expresses_mse_bme_and_intx_disable() {
+    let function = Arc::new(RecordingFunction::default());
+    let bdf = PciBdf::new(PciSegment::new(0), 0, 6, 0).unwrap();
+    let spec = bare_function("endpoint").with_bdf(ResourceRequest::Fixed(bdf));
+    let (_, runtime) = build_pci([spec], [("endpoint", function)]);
+
+    // Modeled command bits are writable and read back; unmodeled bits are
+    // masked off instead of being stored from guest writes.
+    write_config(&runtime, bdf, 4, AccessWidth::Word, 0xffff);
+    assert_eq!(read_config(&runtime, bdf, 4, AccessWidth::Word), 0x0406);
+
+    // INTx Disable lives in the high byte of the 16-bit command field.
+    write_config(&runtime, bdf, 5, AccessWidth::Byte, 0);
+    assert_eq!(read_config(&runtime, bdf, 4, AccessWidth::Word), 0x0006);
+    write_config(&runtime, bdf, 5, AccessWidth::Byte, 0xff);
+    assert_eq!(read_config(&runtime, bdf, 4, AccessWidth::Word), 0x0406);
+    write_config(&runtime, bdf, 4, AccessWidth::Word, 0);
+    assert_eq!(read_config(&runtime, bdf, 4, AccessWidth::Word), 0);
+}
+
+#[test]
+fn reset_restores_power_on_command_state() {
+    let function = Arc::new(RecordingFunction::default());
+    let bdf = PciBdf::new(PciSegment::new(0), 0, 6, 0).unwrap();
+    let spec = bare_function("endpoint").with_bdf(ResourceRequest::Fixed(bdf));
+    let (_, runtime) = build_pci([spec], [("endpoint", function)]);
+
+    write_config(&runtime, bdf, 4, AccessWidth::Word, 0xffff);
+    assert_eq!(read_config(&runtime, bdf, 4, AccessWidth::Word), 0x0406);
+    runtime.reset_lifecycle_devices().unwrap();
     assert_eq!(read_config(&runtime, bdf, 4, AccessWidth::Word), 0);
 }
 

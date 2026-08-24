@@ -105,9 +105,7 @@ impl PciEcamDevice {
         let size = offset
             .validate_access(access.width())
             .map_err(config_access_error)?;
-        self.root
-            .lock_irqsave()
-            .write_config(bdf, usize::from(offset.value()), size, value)
+        super::root::write_config(&self.root, bdf, usize::from(offset.value()), size, value)
             .map_err(config_access_error)
     }
 }
