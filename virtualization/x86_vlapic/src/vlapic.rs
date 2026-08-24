@@ -399,19 +399,70 @@ impl<H: X86VlapicHostOps> VirtualApicRegs<H> {
         warn!("[VLAPIC] ignoring NMI IPI to vcpu {vcpu_id}: NMI injection is not implemented yet");
     }
 
+    /// Handles an INIT delivery accepted by `write_icr`.
+    ///
+    /// Per Intel SDM Vol.3 §11.6.2 the INIT level de-assert form (trigger mode
+    /// = level ∧ level = de-assert) is an arbitration synchronization message,
+    /// not a reset; KVM applies the same rule (`!trig_mode || level`). Every
+    /// other INIT encoding resets the targets, which this device models as a
+    /// wait-for-SIPI request to the host. Failures are logged and dropped: an
+    /// ICR write must never fail guest execution.
+    fn process_init(&mut self, vcpu_id: u32, icr_low: InterruptCommandRegisterLowLocal) {
+        let level_triggered = icr_low.is_set(INTERRUPT_COMMAND_LOW::TriggerMode);
+        let level_asserted = icr_low.is_set(INTERRUPT_COMMAND_LOW::Level);
+        if level_triggered && !level_asserted {
+            debug!(
+                "[VLAPIC] ignoring INIT level de-assert to vcpu {vcpu_id}: arbitration sync \
+                 message"
+            );
+            return;
+        }
+
+        if vcpu_id == self.vapic_id {
+            warn!(
+                "[VLAPIC] ignoring INIT addressed to the sending vCPU {vcpu_id}: a running vCPU \
+                 cannot reset itself"
+            );
+            return;
+        }
+
+        if let Err(err) = host::request_ap_init::<H>(H::current_vm_id(), vcpu_id as X86VcpuId) {
+            warn!("[VLAPIC] host rejected wait-for-SIPI request for vcpu {vcpu_id}: {err:?}");
+        }
+    }
+
+    /// Handles a SIPI delivery accepted by `write_icr` by asking the host to
+    /// start the target in real mode at `CS = vector << 12`, `IP = 0`.
+    ///
+    /// Wait-for-SIPI gating is the host's decision; this layer only forwards
+    /// protocol-exact requests so that unsupported forms stay logged-and-ignored
+    /// without ever failing the writing guest.
+    fn process_sipi(&mut self, vcpu_id: u32, icr_low: InterruptCommandRegisterLowLocal) {
+        let start_vector = icr_low.read(INTERRUPT_COMMAND_LOW::Vector) as u8;
+
+        if vcpu_id == self.vapic_id {
+            warn!("[VLAPIC] ignoring SIPI addressed to the sending vCPU {vcpu_id}");
+            return;
+        }
+
+        if let Err(err) =
+            host::request_sipi_startup::<H>(H::current_vm_id(), vcpu_id as X86VcpuId, start_vector)
+        {
+            warn!("[VLAPIC] host rejected SIPI startup for vcpu {vcpu_id}: {err:?}");
+        }
+    }
+
     fn process_init_sipi(
         &mut self,
         vcpu_id: u32,
         mode: APICDeliveryMode,
         icr_low: InterruptCommandRegisterLowLocal,
     ) {
-        debug!(
-            "[VLAPIC] ignoring {:?} IPI to vcpu {} in current single-vCPU bring-up path, icr_low: \
-             {:#010X}",
-            mode,
-            vcpu_id,
-            icr_low.get()
-        );
+        match mode {
+            APICDeliveryMode::INIT => self.process_init(vcpu_id, icr_low),
+            APICDeliveryMode::StartUp => self.process_sipi(vcpu_id, icr_low),
+            _ => unreachable!("write_icr dispatches only INIT and StartUp here"),
+        }
     }
 
     /// Figure 11-13. Logical Destination Register (LDR)
@@ -550,7 +601,14 @@ impl<H: X86VlapicHostOps> VirtualApicRegs<H> {
                             debug!("[VLAPIC] sending NMI to vcpu {i}");
                         }
                         APICDeliveryMode::INIT | APICDeliveryMode::StartUp => {
-                            self.process_init_sipi(i, mode, icr_low);
+                            // MP initialization only uses physical addressing or
+                            // broadcast shorthands; logical-mode INIT/SIPI has no
+                            // hardware meaning, so it stays a logged no-op.
+                            if is_phys {
+                                self.process_init_sipi(i, mode, icr_low);
+                            } else {
+                                warn!("[VLAPIC] ignoring logical-mode {mode:?} IPI to vcpu {i}");
+                            }
                         }
                         APICDeliveryMode::SMI => {
                             warn!("[VLPAIC] SMI IPI do not support");
@@ -1012,6 +1070,9 @@ mod tests {
     }
 
     static NEXT_MOCK_FRAME: AtomicUsize = AtomicUsize::new(1);
+    /// Serializes tests against the process-wide mock statics below: cargo runs
+    /// tests in parallel threads, and each mock test reconfigures the host.
+    static MOCK_TEST_LOCK: SpinMutex<()> = SpinMutex::new(());
     static MOCK_CONFIG: SpinMutex<MockConfig> = SpinMutex::new(MockConfig {
         vm_id: 7,
         vcpu_num: 2,
@@ -1021,12 +1082,22 @@ mod tests {
     static INJECTED_VECTORS: SpinMutex<Vec<(X86VmId, X86VcpuId, X86InterruptVector)>> =
         SpinMutex::new(Vec::new());
 
-    fn configure_mock(vm_id: X86VmId, vcpu_num: usize, active_vcpus: usize) {
+    /// Locks the process-wide mock statics, reconfigures the host topology, and
+    /// clears recorded requests. Hold the returned guard for the whole test.
+    fn mock_session(
+        vm_id: X86VmId,
+        vcpu_num: usize,
+        active_vcpus: usize,
+    ) -> crate::lock::SpinMutexGuard<'static, ()> {
+        let guard = MOCK_TEST_LOCK.lock();
         *MOCK_CONFIG.lock() = MockConfig {
             vm_id,
             vcpu_num,
             active_vcpus,
         };
+        CPU_UP_REQUESTS.lock().clear();
+        INJECTED_VECTORS.lock().clear();
+        guard
     }
 
     fn recorded_cpu_up_requests() -> Vec<RecordedCpuUpRequest> {
@@ -1046,7 +1117,12 @@ mod tests {
 
     impl host::X86VlapicHostOps for RecordingHost {
         fn alloc_frame() -> Option<X86HostPhysAddr> {
-            let frame = unsafe { alloc_zeroed(Layout::from_size_align(X86_PAGE_SIZE_4K, 4096).expect("valid 4 KiB layout")).cast::<u8>() };
+            let frame = unsafe {
+                alloc_zeroed(
+                    Layout::from_size_align(X86_PAGE_SIZE_4K, 4096).expect("valid 4 KiB layout"),
+                )
+                .cast::<u8>()
+            };
             if frame.is_null() {
                 return None;
             }
@@ -1100,10 +1176,9 @@ mod tests {
         }
 
         fn request_ap_init(vm_id: X86VmId, vcpu_id: X86VcpuId) -> X86VlapicResult {
-            CPU_UP_REQUESTS.lock().push(RecordedCpuUpRequest::ApInit {
-                vm_id,
-                vcpu_id,
-            });
+            CPU_UP_REQUESTS
+                .lock()
+                .push(RecordedCpuUpRequest::ApInit { vm_id, vcpu_id });
             Ok(())
         }
 
@@ -1125,9 +1200,19 @@ mod tests {
 
     /// Writes ICR destination and low halves exactly like xAPIC guest software.
     fn write_icr(vlapic: &mut VirtualApicRegs<RecordingHost>, dest: u32, icr_low: u32) {
-        vlapic.handle_write(ApicRegOffset::ICRHi, (dest << 24) as usize, X86AccessWidth::Dword)
+        vlapic
+            .handle_write(
+                ApicRegOffset::ICRHi,
+                (dest << 24) as usize,
+                X86AccessWidth::Dword,
+            )
             .expect("ICR-high write must succeed");
-        vlapic.handle_write(ApicRegOffset::ICRLow, icr_low as usize, X86AccessWidth::Dword)
+        vlapic
+            .handle_write(
+                ApicRegOffset::ICRLow,
+                icr_low as usize,
+                X86AccessWidth::Dword,
+            )
             .expect("ICR-low write must succeed");
     }
 
@@ -1138,11 +1223,15 @@ mod tests {
 
     #[test]
     fn asserted_init_requests_wait_for_sipi_at_physical_target() {
-        configure_mock(7, 2, 0b11);
+        let _mock = mock_session(7, 2, 0b11);
         let mut vlapic = VirtualApicRegs::<RecordingHost>::new(7, 0);
 
         // Linux's wakeup sequence: level-triggered, level-asserted INIT.
-        write_icr(&mut vlapic, 1, DELIVERY_INIT | LEVEL_TRIGGERED | LEVEL_ASSERTED);
+        write_icr(
+            &mut vlapic,
+            1,
+            DELIVERY_INIT | LEVEL_TRIGGERED | LEVEL_ASSERTED,
+        );
 
         assert_eq!(
             recorded_cpu_up_requests(),
@@ -1158,7 +1247,7 @@ mod tests {
         // Pentium-4-style INIT leaves both the trigger-mode and level flags
         // cleared; per KVM the INIT accept rule is `!trig_mode || level`, so this
         // must not be mistaken for the level de-assert form.
-        configure_mock(7, 2, 0b11);
+        let _mock = mock_session(7, 2, 0b11);
         let mut vlapic = VirtualApicRegs::<RecordingHost>::new(7, 0);
 
         write_icr(&mut vlapic, 1, DELIVERY_INIT);
@@ -1174,7 +1263,7 @@ mod tests {
 
     #[test]
     fn sipi_requests_startup_at_the_shifted_start_vector() {
-        configure_mock(7, 2, 0b11);
+        let _mock = mock_session(7, 2, 0b11);
         let mut vlapic = VirtualApicRegs::<RecordingHost>::new(7, 0);
 
         write_icr(&mut vlapic, 1, DELIVERY_STARTUP | 0x08);
@@ -1191,7 +1280,7 @@ mod tests {
 
     #[test]
     fn physical_miss_records_no_cpu_up_request() {
-        configure_mock(7, 2, 0b11);
+        let _mock = mock_session(7, 2, 0b11);
         let mut vlapic = VirtualApicRegs::<RecordingHost>::new(7, 0);
 
         write_icr(&mut vlapic, 5, DELIVERY_INIT | LEVEL_ASSERTED);
@@ -1202,7 +1291,7 @@ mod tests {
 
     #[test]
     fn all_excluding_self_broadcast_reaches_every_other_target() {
-        configure_mock(7, 3, 0b111);
+        let _mock = mock_session(7, 3, 0b111);
         let mut vlapic = VirtualApicRegs::<RecordingHost>::new(7, 0);
         let shorthand_all_excluding_self = 0b11 << 18;
 
@@ -1229,7 +1318,7 @@ mod tests {
 
     #[test]
     fn logical_destination_mode_is_ignored_for_init_and_sipi() {
-        configure_mock(7, 2, 0b11);
+        let _mock = mock_session(7, 2, 0b11);
         let mut vlapic = VirtualApicRegs::<RecordingHost>::new(7, 0);
         let destination_mode_logical = 1 << 11;
 
@@ -1238,14 +1327,18 @@ mod tests {
             1,
             DELIVERY_INIT | LEVEL_ASSERTED | destination_mode_logical,
         );
-        write_icr(&mut vlapic, 1, DELIVERY_STARTUP | 0x08 | destination_mode_logical);
+        write_icr(
+            &mut vlapic,
+            1,
+            DELIVERY_STARTUP | 0x08 | destination_mode_logical,
+        );
 
         assert!(recorded_cpu_up_requests().is_empty());
     }
 
     #[test]
     fn self_shorthand_startup_is_rejected_without_a_request() {
-        configure_mock(7, 2, 0b11);
+        let _mock = mock_session(7, 2, 0b11);
         let mut vlapic = VirtualApicRegs::<RecordingHost>::new(7, 0);
         let shorthand_self = 0b01 << 18;
 
@@ -1256,10 +1349,14 @@ mod tests {
 
     #[test]
     fn init_level_de_assert_does_not_request_another_reset() {
-        configure_mock(7, 2, 0b11);
+        let _mock = mock_session(7, 2, 0b11);
         let mut vlapic = VirtualApicRegs::<RecordingHost>::new(7, 0);
 
-        write_icr(&mut vlapic, 1, DELIVERY_INIT | LEVEL_TRIGGERED | LEVEL_ASSERTED);
+        write_icr(
+            &mut vlapic,
+            1,
+            DELIVERY_INIT | LEVEL_TRIGGERED | LEVEL_ASSERTED,
+        );
         // Legacy P6 arbitration sync message: trigger=level ∧ level=de-assert.
         write_icr(&mut vlapic, 1, DELIVERY_INIT | LEVEL_TRIGGERED);
 
@@ -1274,7 +1371,7 @@ mod tests {
 
     #[test]
     fn fixed_delivery_keeps_injecting_vectors_without_cpu_up_requests() {
-        configure_mock(7, 2, 0b11);
+        let _mock = mock_session(7, 2, 0b11);
         let mut vlapic = VirtualApicRegs::<RecordingHost>::new(7, 0);
 
         write_icr(&mut vlapic, 1, 0x41);
