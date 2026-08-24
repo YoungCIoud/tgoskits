@@ -13,7 +13,7 @@ use core::ops::Range;
 use axdevice_base::{Device, DeviceAccess, DeviceContext, DeviceError, DeviceResult, Resource};
 
 use super::root::{SharedPciRoot, contains_access, ensure_mmio_access};
-use crate::{DeviceLifecycle, DeviceManagerResult};
+use crate::{DeviceLifecycle, DeviceManagerError, DeviceManagerResult};
 
 pub(crate) struct PciMemoryApertureDevice {
     aperture: Range<u64>,
@@ -111,9 +111,30 @@ impl Device for PciMemoryApertureDevice {
 }
 
 impl DeviceLifecycle for PciMemoryApertureDevice {
+    /// Resets the whole PCI root: recover every function's power-on config
+    /// and BAR state under the lock, then attempt each bound endpoint reset
+    /// outside it.
+    ///
+    /// A failing function never prevents the remaining functions from being
+    /// reset; the first real error is returned and later failures are logged.
     fn reset(&self) -> DeviceManagerResult {
-        self.root.lock_irqsave().reset();
-        Ok(())
+        let handlers = self.root.lock_irqsave().reset_collecting_handlers();
+        // The power-on command snapshots ride along so a future observer can
+        // resync transport-side Bus Master/INTx state without changing this
+        // lock discipline.
+        let mut first_error: Option<DeviceError> = None;
+        for (handler, _power_on_command) in &handlers {
+            if let Err(error) = handler.reset() {
+                log::error!("PCI function {} reset failed: {error}", handler.name());
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
+        }
+        match first_error {
+            Some(error) => Err(DeviceManagerError::from(error)),
+            None => Ok(()),
+        }
     }
 
     fn suspend(&self) -> DeviceManagerResult {

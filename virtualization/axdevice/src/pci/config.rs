@@ -132,6 +132,10 @@ pub(crate) struct PowerOnConfig {
 }
 
 impl PowerOnConfig {
+    pub(crate) fn command_state(&self) -> PciCommandState {
+        PciCommandState::from_config(&self.bytes)
+    }
+
     pub(crate) fn build(
         identity: PciEndpointIdentity,
         bars: &[ResolvedBarPlan],
@@ -252,6 +256,11 @@ impl FunctionState {
     /// Returns the standard command state of this function's config image.
     pub(crate) fn command_state(&self) -> PciCommandState {
         PciCommandState::from_config(&self.config)
+    }
+
+    /// Returns the power-on standard command state this function resets to.
+    pub(crate) fn power_on_command_state(&self) -> PciCommandState {
+        self.power_on.command_state()
     }
 
     pub(crate) fn bars(&self) -> &[BarState] {

@@ -23,6 +23,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Remove `PciHostBridgeConfig`; resolved ECAM and memory windows are exposed through `ResolvedPciBus` and validated by `validate_host_windows`.
 
+### Fixed
+
+- PCI root reset now attempts every bound endpoint function instead of only recovering root-owned state, returning the first real error and logging later ones so transport, Bus Master, and INTx state cannot stay stale after a re-enumeration.
+
 ## [0.6.0](https://github.com/rcore-os/tgoskits/compare/axdevice-v0.5.7...axdevice-v0.6.0) - 2026-08-20
 
 ### Added

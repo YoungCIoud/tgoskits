@@ -62,7 +62,7 @@ impl PciFunction for RecordingFunction {
 }
 
 struct StaticEndpointModel {
-    function: Arc<RecordingFunction>,
+    function: Arc<dyn PciFunction>,
 }
 
 impl PciEndpointModel for StaticEndpointModel {
@@ -385,6 +385,91 @@ fn fixed_policy_bar_function(id: &str, bdf: PciBdf, bars: Vec<PciMemoryBar>) -> 
         spec = spec.with_bar(bar).unwrap();
     }
     spec
+}
+
+/// Endpoint probe whose reset outcome and invocation count are observable.
+struct LifecycleProbeFunction {
+    name: &'static str,
+    fail_reset: bool,
+    reset_calls: Mutex<u32>,
+}
+
+impl PciFunction for LifecycleProbeFunction {
+    fn name(&self) -> &str {
+        self.name
+    }
+
+    fn read_bar(
+        &self,
+        _access: &PciBarAccess,
+        _context: &mut dyn DeviceContext,
+    ) -> DeviceResult<u64> {
+        Ok(0)
+    }
+
+    fn write_bar(
+        &self,
+        _access: &PciBarAccess,
+        _value: u64,
+        _context: &mut dyn DeviceContext,
+    ) -> DeviceResult {
+        Ok(())
+    }
+
+    fn reset(&self) -> DeviceResult {
+        *self.reset_calls.lock().unwrap() += 1;
+        if self.fail_reset {
+            Err(DeviceError::Unsupported {
+                operation: "reset PCI function",
+                detail: "probe failure".into(),
+            })
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[test]
+fn root_reset_tries_every_bound_function_and_returns_first_error() {
+    let failing = Arc::new(LifecycleProbeFunction {
+        name: "failing",
+        fail_reset: true,
+        reset_calls: Mutex::new(0),
+    });
+    let healthy = Arc::new(LifecycleProbeFunction {
+        name: "healthy",
+        fail_reset: false,
+        reset_calls: Mutex::new(0),
+    });
+    let bdf_a = PciBdf::new(PciSegment::new(0), 0, 1, 0).unwrap();
+    let bdf_b = PciBdf::new(PciSegment::new(0), 0, 2, 0).unwrap();
+    let specs = [
+        bare_function("ep-a").with_bdf(ResourceRequest::Fixed(bdf_a)),
+        bare_function("ep-b").with_bdf(ResourceRequest::Fixed(bdf_b)),
+    ];
+    let (_, runtime) = build_pci_dyn(
+        specs,
+        [("ep-a", failing.clone()), ("ep-b", healthy.clone())],
+    );
+
+    // Both functions carry non-power-on command state before the reset.
+    write_config(&runtime, bdf_a, 4, AccessWidth::Word, 0xffff);
+    write_config(&runtime, bdf_b, 4, AccessWidth::Word, 0xffff);
+
+    let error = runtime.reset_lifecycle_devices().unwrap_err();
+    assert!(matches!(
+        error,
+        DeviceManagerError::Device(DeviceError::Unsupported { .. })
+    ));
+
+    // The failing function is reported first (lowest BDF), and the healthy
+    // function is still attempted afterwards.
+    assert_eq!(*failing.reset_calls.lock().unwrap(), 1);
+    assert_eq!(*healthy.reset_calls.lock().unwrap(), 1);
+
+    // Root-owned power-on state is restored regardless of endpoint failures.
+    assert_eq!(read_config(&runtime, bdf_a, 4, AccessWidth::Word), 0);
+    assert_eq!(read_config(&runtime, bdf_b, 4, AccessWidth::Word), 0);
 }
 
 #[test]
@@ -1016,6 +1101,16 @@ fn fixed_bar_function(id: &str, bdf: PciBdf, address: u64) -> PciFunctionSpec {
 fn build_pci<const N: usize>(
     specs: [PciFunctionSpec; N],
     functions: [(&str, Arc<RecordingFunction>); N],
+) -> (ResolvedPciBus, DeviceRuntime) {
+    build_pci_dyn(
+        specs,
+        functions.map(|(id, function)| (id, function as Arc<dyn PciFunction>)),
+    )
+}
+
+fn build_pci_dyn<const N: usize>(
+    specs: [PciFunctionSpec; N],
+    functions: [(&str, Arc<dyn PciFunction>); N],
 ) -> (ResolvedPciBus, DeviceRuntime) {
     let host_id = function_id("pci-host");
     let host_resources = PciHostResourceRequirements::new(

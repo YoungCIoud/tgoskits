@@ -177,6 +177,16 @@ pub trait PciFunction: Send + Sync {
         value: u64,
         context: &mut dyn DeviceContext,
     ) -> DeviceResult;
+
+    /// Restores transport-owned state after the root recovered its power-on
+    /// configuration.
+    ///
+    /// Called outside the root lock; a failing function must not prevent the
+    /// remaining functions from being reset. The default matches endpoints
+    /// with no transport state to resynchronize.
+    fn reset(&self) -> DeviceResult {
+        Ok(())
+    }
 }
 
 /// Unresolved Type-0 function declaration consumed by [`PciTopologyBuilder`](super::PciTopologyBuilder).

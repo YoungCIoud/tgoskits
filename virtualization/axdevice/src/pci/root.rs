@@ -260,10 +260,22 @@ impl PciRootState {
             .ok()
     }
 
-    pub(crate) fn reset(&mut self) {
+    /// Recovers root-owned power-on state and collects the live endpoint
+    /// handlers with their power-on command snapshots.
+    ///
+    /// Callers hold the root lock only for this recovery; handler resets run
+    /// outside it so a failing or sleeping endpoint cannot stall the bus.
+    pub(crate) fn reset_collecting_handlers(
+        &mut self,
+    ) -> Vec<(Arc<dyn PciFunction>, PciCommandState)> {
+        let mut collected = Vec::new();
         for function in &mut self.functions {
             function.reset();
+            if let Some(handler) = function.handler() {
+                collected.push((handler, function.power_on_command_state()));
+            }
         }
+        collected
     }
 }
 
