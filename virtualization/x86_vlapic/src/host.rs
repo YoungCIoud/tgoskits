@@ -49,6 +49,28 @@ pub trait X86VlapicHostOps {
         vector: X86InterruptVector,
     ) -> X86VlapicResult;
 
+    /// Accept an INIT request that puts `vcpu_id` into the wait-for-SIPI state.
+    ///
+    /// This is the x86 MP-initialization half of CPU-up: the target AP must not
+    /// execute until a matching start-up request arrives. Hosts without guest
+    /// SMP support fail closed with [`X86VlapicError::Unsupported`].
+    fn request_ap_init(_vm_id: X86VmId, _vcpu_id: X86VcpuId) -> X86VlapicResult {
+        Err(X86VlapicError::Unsupported)
+    }
+
+    /// Accept a SIPI that starts a wait-for-SIPI `vcpu_id` in real mode at
+    /// `CS = start_vector << 12`, `IP = 0`.
+    ///
+    /// Hosts without guest SMP support fail closed with
+    /// [`X86VlapicError::Unsupported`].
+    fn request_sipi_startup(
+        _vm_id: X86VmId,
+        _vcpu_id: X86VcpuId,
+        _start_vector: u8,
+    ) -> X86VlapicResult {
+        Err(X86VlapicError::Unsupported)
+    }
+
     /// Route a PIT IRQ0 edge through the VM's selected legacy or I/O APIC path.
     fn inject_pit_irq(_vm_id: X86VmId, _vcpu_id: X86VcpuId) -> X86VlapicResult {
         Err(X86VlapicError::Unsupported)
@@ -137,4 +159,19 @@ pub(crate) fn inject_interrupt<H: X86VlapicHostOps>(
     vector: X86InterruptVector,
 ) -> X86VlapicResult {
     H::inject_interrupt(vm_id, vcpu_id, vector)
+}
+
+pub(crate) fn request_ap_init<H: X86VlapicHostOps>(
+    vm_id: X86VmId,
+    vcpu_id: X86VcpuId,
+) -> X86VlapicResult {
+    H::request_ap_init(vm_id, vcpu_id)
+}
+
+pub(crate) fn request_sipi_startup<H: X86VlapicHostOps>(
+    vm_id: X86VmId,
+    vcpu_id: X86VcpuId,
+    start_vector: u8,
+) -> X86VlapicResult {
+    H::request_sipi_startup(vm_id, vcpu_id, start_vector)
 }
