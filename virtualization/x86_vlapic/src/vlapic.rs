@@ -975,3 +975,311 @@ impl<H: X86VlapicHostOps> VirtualApicRegs<H> {
         self.process_eoi()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use alloc::{alloc::alloc_zeroed, vec, vec::Vec};
+    use core::{
+        alloc::Layout,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
+
+    use super::*;
+    use crate::{
+        host::X86_PAGE_SIZE_4K,
+        lock::SpinMutex,
+        types::{X86HostVirtAddr, X86InterruptVector, X86TimerCallback},
+    };
+
+    /// One CPU-up request observed at the host boundary.
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    enum RecordedCpuUpRequest {
+        ApInit {
+            vm_id: X86VmId,
+            vcpu_id: X86VcpuId,
+        },
+        SipiStartup {
+            vm_id: X86VmId,
+            vcpu_id: X86VcpuId,
+            start_vector: u8,
+        },
+    }
+
+    struct MockConfig {
+        vm_id: X86VmId,
+        vcpu_num: usize,
+        active_vcpus: usize,
+    }
+
+    static NEXT_MOCK_FRAME: AtomicUsize = AtomicUsize::new(1);
+    static MOCK_CONFIG: SpinMutex<MockConfig> = SpinMutex::new(MockConfig {
+        vm_id: 7,
+        vcpu_num: 2,
+        active_vcpus: 0b11,
+    });
+    static CPU_UP_REQUESTS: SpinMutex<Vec<RecordedCpuUpRequest>> = SpinMutex::new(Vec::new());
+    static INJECTED_VECTORS: SpinMutex<Vec<(X86VmId, X86VcpuId, X86InterruptVector)>> =
+        SpinMutex::new(Vec::new());
+
+    fn configure_mock(vm_id: X86VmId, vcpu_num: usize, active_vcpus: usize) {
+        *MOCK_CONFIG.lock() = MockConfig {
+            vm_id,
+            vcpu_num,
+            active_vcpus,
+        };
+    }
+
+    fn recorded_cpu_up_requests() -> Vec<RecordedCpuUpRequest> {
+        CPU_UP_REQUESTS.lock().clone()
+    }
+
+    fn injected_vectors() -> Vec<(X86VmId, X86VcpuId, X86InterruptVector)> {
+        INJECTED_VECTORS.lock().clone()
+    }
+
+    /// Host stub whose identity phys↔virt mapping hands out leaked zeroed frames.
+    ///
+    /// Mirrors the `DummyHost` style used by the APIC timer tests. Frames are
+    /// intentionally never freed: each test allocates one virtual-APIC page and
+    /// the test process is short-lived.
+    struct RecordingHost;
+
+    impl host::X86VlapicHostOps for RecordingHost {
+        fn alloc_frame() -> Option<X86HostPhysAddr> {
+            let frame = unsafe { alloc_zeroed(Layout::from_size_align(X86_PAGE_SIZE_4K, 4096).expect("valid 4 KiB layout")).cast::<u8>() };
+            if frame.is_null() {
+                return None;
+            }
+            NEXT_MOCK_FRAME.fetch_add(1, Ordering::Relaxed);
+            Some(X86HostPhysAddr::from_usize(frame as usize))
+        }
+
+        fn dealloc_frame(_paddr: X86HostPhysAddr) {}
+
+        fn phys_to_virt(paddr: X86HostPhysAddr) -> X86HostVirtAddr {
+            X86HostVirtAddr::from_usize(paddr.as_usize())
+        }
+
+        fn virt_to_phys(vaddr: X86HostVirtAddr) -> X86HostPhysAddr {
+            X86HostPhysAddr::from_usize(vaddr.as_usize())
+        }
+
+        fn current_time_nanos() -> u64 {
+            0
+        }
+
+        fn register_timer(_deadline_nanos: u64, _callback: X86TimerCallback) -> Option<usize> {
+            None
+        }
+
+        fn cancel_timer(_token: usize) {}
+
+        fn current_vm_id() -> X86VmId {
+            MOCK_CONFIG.lock().vm_id
+        }
+
+        fn current_vm_vcpu_num() -> usize {
+            MOCK_CONFIG.lock().vcpu_num
+        }
+
+        fn current_vm_active_vcpus() -> usize {
+            MOCK_CONFIG.lock().active_vcpus
+        }
+
+        fn active_vcpus(_vm_id: X86VmId) -> Option<usize> {
+            Some(MOCK_CONFIG.lock().active_vcpus)
+        }
+
+        fn inject_interrupt(
+            vm_id: X86VmId,
+            vcpu_id: X86VcpuId,
+            vector: X86InterruptVector,
+        ) -> X86VlapicResult {
+            INJECTED_VECTORS.lock().push((vm_id, vcpu_id, vector));
+            Ok(())
+        }
+
+        fn request_ap_init(vm_id: X86VmId, vcpu_id: X86VcpuId) -> X86VlapicResult {
+            CPU_UP_REQUESTS.lock().push(RecordedCpuUpRequest::ApInit {
+                vm_id,
+                vcpu_id,
+            });
+            Ok(())
+        }
+
+        fn request_sipi_startup(
+            vm_id: X86VmId,
+            vcpu_id: X86VcpuId,
+            start_vector: u8,
+        ) -> X86VlapicResult {
+            CPU_UP_REQUESTS
+                .lock()
+                .push(RecordedCpuUpRequest::SipiStartup {
+                    vm_id,
+                    vcpu_id,
+                    start_vector,
+                });
+            Ok(())
+        }
+    }
+
+    /// Writes ICR destination and low halves exactly like xAPIC guest software.
+    fn write_icr(vlapic: &mut VirtualApicRegs<RecordingHost>, dest: u32, icr_low: u32) {
+        vlapic.handle_write(ApicRegOffset::ICRHi, (dest << 24) as usize, X86AccessWidth::Dword)
+            .expect("ICR-high write must succeed");
+        vlapic.handle_write(ApicRegOffset::ICRLow, icr_low as usize, X86AccessWidth::Dword)
+            .expect("ICR-low write must succeed");
+    }
+
+    const DELIVERY_INIT: u32 = 0x5 << 8;
+    const DELIVERY_STARTUP: u32 = 0x6 << 8;
+    const LEVEL_TRIGGERED: u32 = 1 << 15;
+    const LEVEL_ASSERTED: u32 = 1 << 14;
+
+    #[test]
+    fn asserted_init_requests_wait_for_sipi_at_physical_target() {
+        configure_mock(7, 2, 0b11);
+        let mut vlapic = VirtualApicRegs::<RecordingHost>::new(7, 0);
+
+        // Linux's wakeup sequence: level-triggered, level-asserted INIT.
+        write_icr(&mut vlapic, 1, DELIVERY_INIT | LEVEL_TRIGGERED | LEVEL_ASSERTED);
+
+        assert_eq!(
+            recorded_cpu_up_requests(),
+            vec![RecordedCpuUpRequest::ApInit {
+                vm_id: 7,
+                vcpu_id: 1
+            }]
+        );
+    }
+
+    #[test]
+    fn edge_triggered_init_with_deassert_level_flag_is_still_an_init() {
+        // Pentium-4-style INIT leaves both the trigger-mode and level flags
+        // cleared; per KVM the INIT accept rule is `!trig_mode || level`, so this
+        // must not be mistaken for the level de-assert form.
+        configure_mock(7, 2, 0b11);
+        let mut vlapic = VirtualApicRegs::<RecordingHost>::new(7, 0);
+
+        write_icr(&mut vlapic, 1, DELIVERY_INIT);
+
+        assert_eq!(
+            recorded_cpu_up_requests(),
+            vec![RecordedCpuUpRequest::ApInit {
+                vm_id: 7,
+                vcpu_id: 1
+            }]
+        );
+    }
+
+    #[test]
+    fn sipi_requests_startup_at_the_shifted_start_vector() {
+        configure_mock(7, 2, 0b11);
+        let mut vlapic = VirtualApicRegs::<RecordingHost>::new(7, 0);
+
+        write_icr(&mut vlapic, 1, DELIVERY_STARTUP | 0x08);
+
+        assert_eq!(
+            recorded_cpu_up_requests(),
+            vec![RecordedCpuUpRequest::SipiStartup {
+                vm_id: 7,
+                vcpu_id: 1,
+                start_vector: 0x08,
+            }]
+        );
+    }
+
+    #[test]
+    fn physical_miss_records_no_cpu_up_request() {
+        configure_mock(7, 2, 0b11);
+        let mut vlapic = VirtualApicRegs::<RecordingHost>::new(7, 0);
+
+        write_icr(&mut vlapic, 5, DELIVERY_INIT | LEVEL_ASSERTED);
+        write_icr(&mut vlapic, 5, DELIVERY_STARTUP | 0x08);
+
+        assert!(recorded_cpu_up_requests().is_empty());
+    }
+
+    #[test]
+    fn all_excluding_self_broadcast_reaches_every_other_target() {
+        configure_mock(7, 3, 0b111);
+        let mut vlapic = VirtualApicRegs::<RecordingHost>::new(7, 0);
+        let shorthand_all_excluding_self = 0b11 << 18;
+
+        write_icr(
+            &mut vlapic,
+            0,
+            DELIVERY_INIT | LEVEL_ASSERTED | shorthand_all_excluding_self,
+        );
+
+        assert_eq!(
+            recorded_cpu_up_requests(),
+            vec![
+                RecordedCpuUpRequest::ApInit {
+                    vm_id: 7,
+                    vcpu_id: 1
+                },
+                RecordedCpuUpRequest::ApInit {
+                    vm_id: 7,
+                    vcpu_id: 2
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn logical_destination_mode_is_ignored_for_init_and_sipi() {
+        configure_mock(7, 2, 0b11);
+        let mut vlapic = VirtualApicRegs::<RecordingHost>::new(7, 0);
+        let destination_mode_logical = 1 << 11;
+
+        write_icr(
+            &mut vlapic,
+            1,
+            DELIVERY_INIT | LEVEL_ASSERTED | destination_mode_logical,
+        );
+        write_icr(&mut vlapic, 1, DELIVERY_STARTUP | 0x08 | destination_mode_logical);
+
+        assert!(recorded_cpu_up_requests().is_empty());
+    }
+
+    #[test]
+    fn self_shorthand_startup_is_rejected_without_a_request() {
+        configure_mock(7, 2, 0b11);
+        let mut vlapic = VirtualApicRegs::<RecordingHost>::new(7, 0);
+        let shorthand_self = 0b01 << 18;
+
+        write_icr(&mut vlapic, 0, DELIVERY_STARTUP | 0x08 | shorthand_self);
+
+        assert!(recorded_cpu_up_requests().is_empty());
+    }
+
+    #[test]
+    fn init_level_de_assert_does_not_request_another_reset() {
+        configure_mock(7, 2, 0b11);
+        let mut vlapic = VirtualApicRegs::<RecordingHost>::new(7, 0);
+
+        write_icr(&mut vlapic, 1, DELIVERY_INIT | LEVEL_TRIGGERED | LEVEL_ASSERTED);
+        // Legacy P6 arbitration sync message: trigger=level ∧ level=de-assert.
+        write_icr(&mut vlapic, 1, DELIVERY_INIT | LEVEL_TRIGGERED);
+
+        assert_eq!(
+            recorded_cpu_up_requests(),
+            vec![RecordedCpuUpRequest::ApInit {
+                vm_id: 7,
+                vcpu_id: 1
+            }]
+        );
+    }
+
+    #[test]
+    fn fixed_delivery_keeps_injecting_vectors_without_cpu_up_requests() {
+        configure_mock(7, 2, 0b11);
+        let mut vlapic = VirtualApicRegs::<RecordingHost>::new(7, 0);
+
+        write_icr(&mut vlapic, 1, 0x41);
+
+        assert!(recorded_cpu_up_requests().is_empty());
+        assert_eq!(injected_vectors(), vec![(7, 1, 0x41)]);
+    }
+}
