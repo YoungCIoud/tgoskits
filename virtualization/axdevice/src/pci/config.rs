@@ -241,15 +241,19 @@ impl FunctionState {
         value: u64,
     ) -> Option<BarWriteAction> {
         let (bar, high) = self.bar_dword(offset)?;
-        if size == 4 && offset.is_multiple_of(4) && value as u32 == u32::MAX {
-            return Some(BarWriteAction::Probe { bar, high });
-        }
+        // Classify only after merging the write into the full BAR dword, so a
+        // partial write that completes the all-ones sizing mask is treated
+        // exactly like a whole-dword probe.
         let mut dword = self.bars[bar].committed_dword(high).to_le_bytes();
         merge_bytes(&mut dword, offset % 4, size, value, &[u8::MAX; 4]);
+        let merged = u32::from_le_bytes(dword);
+        if merged == u32::MAX {
+            return Some(BarWriteAction::Probe { bar, high });
+        }
         Some(BarWriteAction::Relocate {
             bar,
             high,
-            candidate: self.bars[bar].candidate_address(high, u32::from_le_bytes(dword)),
+            candidate: self.bars[bar].candidate_address(high, merged),
         })
     }
 
@@ -323,11 +327,8 @@ fn validate_capability(id: u8, body: &[u8], write_mask: &[u8]) -> PciResult {
 fn write_initial_bars(bytes: &mut [u8; CONFIG_SPACE_SIZE], bars: &[ResolvedBarPlan]) {
     for bar in bars {
         let offset = usize::from(bar.index.config_offset());
-        let type_bits = match bar.width {
-            PciMemoryBarWidth::Bits32 => 0,
-            PciMemoryBarWidth::Bits64 => 0x4,
-        };
-        let low = (bar.address as u32 & 0xffff_fff0) | type_bits;
+        let low = (bar.address as u32 & 0xffff_fff0)
+            | super::bar::bar_attributes(bar.width, bar.prefetchable);
         bytes[offset..offset + 4].copy_from_slice(&low.to_le_bytes());
         if bar.width == PciMemoryBarWidth::Bits64 {
             bytes[offset + 4..offset + 8]

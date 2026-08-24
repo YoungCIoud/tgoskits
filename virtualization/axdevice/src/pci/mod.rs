@@ -25,7 +25,7 @@ mod topology;
 pub(crate) const FOUR_GIB: u64 = 1 << 32;
 
 pub use address::{ConfigOffset, PciBarIndex, PciBdf, PciSegment};
-pub use bar::{PciMemoryBar, PciMemoryBarWidth};
+pub use bar::{PciBarDecodePolicy, PciMemoryBar, PciMemoryBarWidth};
 pub use config::PciCapability;
 pub use ecam::validate_host_windows;
 pub use error::{PciError, PciResult};

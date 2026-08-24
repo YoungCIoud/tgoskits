@@ -24,6 +24,7 @@ use super::{
     FOUR_GIB, PciBarAccess, PciBdf, PciError, PciFunction, PciMemoryBarWidth, PciResult,
     ResolvedPciTopology,
     address::CONFIG_SPACE_SIZE,
+    bar::PciBarDecodePolicy,
     config::{BarWriteAction, FunctionState},
 };
 use crate::{DeviceBundle, DeviceNodeId};
@@ -138,10 +139,30 @@ impl PciRootState {
                 high,
                 candidate,
             } => {
-                let accepted = self
-                    .bar_address_available(index, bar, candidate)
-                    .then_some(candidate);
-                self.functions[index].finish_relocation(bar, high, accepted);
+                let target = &self.functions[index].bars()[bar];
+                let accepted = match target.decode_policy() {
+                    PciBarDecodePolicy::Fixed => {
+                        // The planned base is permanent. Rewriting it is
+                        // accepted (it is already the decoded value); any
+                        // other address is ignored with a diagnostic so the
+                        // guest-visible readback and the decode never drift.
+                        let planned = target.planned_address();
+                        if candidate == planned {
+                            true
+                        } else {
+                            log::warn!(
+                                "ignoring PCI BAR{} relocation to {candidate:#x}: fixed policy \
+                                 keeps the planned base {planned:#x}",
+                                self.functions[index].bars()[bar].index().value()
+                            );
+                            false
+                        }
+                    }
+                    PciBarDecodePolicy::RelocatableWithinHostAperture => {
+                        self.bar_address_available(index, bar, candidate)
+                    }
+                };
+                self.functions[index].finish_relocation(bar, high, accepted.then_some(candidate));
             }
         }
         Ok(())

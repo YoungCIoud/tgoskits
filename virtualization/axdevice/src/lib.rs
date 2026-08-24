@@ -81,10 +81,10 @@ pub use model::{
     FdtContributionSpec, FdtNodeSpec,
 };
 pub use pci::{
-    ConfigOffset, PciBarAccess, PciBarIndex, PciBdf, PciBusGraphBuilder, PciCapability, PciClass,
-    PciEndpointBundle, PciEndpointIdentity, PciEndpointModel, PciError, PciFunction,
-    PciFunctionSpec, PciHostResourceRequirements, PciMemoryBar, PciMemoryBarWidth, PciResult,
-    PciSegment, PciTopologyBuilder, ResolvedPciBar, ResolvedPciBus, ResolvedPciFunction,
+    ConfigOffset, PciBarAccess, PciBarDecodePolicy, PciBarIndex, PciBdf, PciBusGraphBuilder,
+    PciCapability, PciClass, PciEndpointBundle, PciEndpointIdentity, PciEndpointModel, PciError,
+    PciFunction, PciFunctionSpec, PciHostResourceRequirements, PciMemoryBar, PciMemoryBarWidth,
+    PciResult, PciSegment, PciTopologyBuilder, ResolvedPciBar, ResolvedPciBus, ResolvedPciFunction,
     ResolvedPciTopology, validate_host_windows,
 };
 pub use registration::{

@@ -14,17 +14,37 @@ pub enum PciMemoryBarWidth {
     Bits64,
 }
 
+/// Runtime decode policy of one memory BAR, independent of its initial
+/// placement.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PciBarDecodePolicy {
+    /// The planner address is permanent: guest writes never move the decode.
+    ///
+    /// Sizing probes still report the size mask and rewriting the planned
+    /// address itself stays accepted, so compliant drivers observe normal
+    /// behavior while stray relocations are ignored with a diagnostic.
+    Fixed,
+    /// The BAR may relocate inside the host memory aperture at runtime.
+    RelocatableWithinHostAperture,
+}
+
 /// One non-prefetchable memory BAR requested by a virtual PCI function.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PciMemoryBar {
     index: PciBarIndex,
     size: u64,
     width: PciMemoryBarWidth,
+    prefetchable: bool,
+    decode_policy: PciBarDecodePolicy,
     address: ResourceRequest<u64>,
 }
 
 impl PciMemoryBar {
     /// Creates an automatically placed memory BAR.
+    ///
+    /// The BAR defaults to non-prefetchable with a relocatable decode; use
+    /// [`PciMemoryBar::prefetchable`] and [`PciMemoryBar::with_decode_policy`]
+    /// to model the other contracts.
     ///
     /// # Errors
     ///
@@ -51,8 +71,23 @@ impl PciMemoryBar {
             index,
             size,
             width,
+            prefetchable: false,
+            decode_policy: PciBarDecodePolicy::RelocatableWithinHostAperture,
             address: ResourceRequest::Auto,
         })
+    }
+
+    /// Marks the BAR prefetchable (config attribute bit 3).
+    pub const fn prefetchable(mut self) -> Self {
+        self.prefetchable = true;
+        self
+    }
+
+    /// Selects the runtime decode policy, independent of the initial
+    /// placement requested through [`PciMemoryBar::with_address`].
+    pub const fn with_decode_policy(mut self, decode_policy: PciBarDecodePolicy) -> Self {
+        self.decode_policy = decode_policy;
+        self
     }
 
     /// Selects automatic or fixed initial placement inside the host aperture.
@@ -76,6 +111,16 @@ impl PciMemoryBar {
         self.width
     }
 
+    /// Returns whether the BAR declares the prefetchable attribute.
+    pub const fn is_prefetchable(&self) -> bool {
+        self.prefetchable
+    }
+
+    /// Returns the runtime decode policy.
+    pub const fn decode_policy(&self) -> PciBarDecodePolicy {
+        self.decode_policy
+    }
+
     pub(crate) const fn address_request(&self) -> ResourceRequest<u64> {
         self.address
     }
@@ -88,11 +133,26 @@ impl PciMemoryBar {
     }
 }
 
+/// Encodes the immutable attribute bits of one memory BAR dword.
+pub(crate) const fn bar_attributes(width: PciMemoryBarWidth, prefetchable: bool) -> u32 {
+    let width_bits = match width {
+        PciMemoryBarWidth::Bits32 => 0,
+        PciMemoryBarWidth::Bits64 => 0x4,
+    };
+    if prefetchable {
+        width_bits | 0x8
+    } else {
+        width_bits
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ResolvedBarPlan {
     pub(crate) index: PciBarIndex,
     pub(crate) size: u64,
     pub(crate) width: PciMemoryBarWidth,
+    pub(crate) prefetchable: bool,
+    pub(crate) policy: PciBarDecodePolicy,
     pub(crate) address: u64,
 }
 
@@ -143,7 +203,7 @@ impl BarState {
         if high {
             (self.address >> 32) as u32
         } else {
-            (self.address as u32 & 0xffff_fff0) | self.type_bits()
+            (self.address as u32 & 0xffff_fff0) | self.attributes()
         }
     }
 
@@ -182,15 +242,21 @@ impl BarState {
         self.probe_high = false;
     }
 
-    const fn type_bits(&self) -> u32 {
-        match self.plan.width {
-            PciMemoryBarWidth::Bits32 => 0,
-            PciMemoryBarWidth::Bits64 => 0x4,
-        }
+    pub(crate) const fn attributes(&self) -> u32 {
+        bar_attributes(self.plan.width, self.plan.prefetchable)
+    }
+
+    pub(crate) const fn decode_policy(&self) -> PciBarDecodePolicy {
+        self.plan.policy
+    }
+
+    /// Returns the planner-owned base this BAR resets and decodes to.
+    pub(crate) const fn planned_address(&self) -> u64 {
+        self.plan.address
     }
 
     const fn mask_low(&self) -> u32 {
-        (!(self.plan.size - 1) as u32 & 0xffff_fff0) | self.type_bits()
+        (!(self.plan.size - 1) as u32 & 0xffff_fff0) | self.attributes()
     }
 
     const fn mask_high(&self) -> u32 {

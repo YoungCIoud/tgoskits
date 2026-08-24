@@ -95,6 +95,8 @@ impl PciTopologyBuilder {
                     index: bar.index(),
                     size: bar.size(),
                     width: bar.width(),
+                    prefetchable: bar.is_prefetchable(),
+                    policy: bar.decode_policy(),
                     address: bar_addresses[&(id.clone(), bar.index())],
                 })
                 .collect::<Vec<_>>();
@@ -192,6 +194,14 @@ impl ResolvedPciBar {
     /// Returns the encoded width.
     pub const fn width(self) -> PciMemoryBarWidth {
         self.0.width
+    }
+
+    /// Returns whether this BAR declares the prefetchable attribute.
+    ///
+    /// Firmware composers need this bit to describe prefetchable ranges;
+    /// the decode policy stays internal to the runtime root.
+    pub const fn prefetchable(self) -> bool {
+        self.0.prefetchable
     }
 }
 

@@ -342,6 +342,337 @@ fn sixty_four_bit_bar_probe_and_relocation_update_the_pair_together() {
     );
 }
 
+fn fixed_policy_bar_function(id: &str, bdf: PciBdf, bars: Vec<PciMemoryBar>) -> PciFunctionSpec {
+    let mut spec = PciFunctionSpec::new(function_id(id), endpoint_identity())
+        .with_bdf(ResourceRequest::Fixed(bdf));
+    for bar in bars {
+        spec = spec.with_bar(bar).unwrap();
+    }
+    spec
+}
+
+#[test]
+fn fixed_bar_size_probe_returns_mask_with_attributes_and_keeps_decode() {
+    let function = Arc::new(RecordingFunction::default());
+    let bdf = PciBdf::new(PciSegment::new(0), 0, 1, 0).unwrap();
+    let base = APERTURE_BASE;
+    let spec = fixed_policy_bar_function(
+        "endpoint",
+        bdf,
+        vec![
+            PciMemoryBar::new(
+                PciBarIndex::new(0).unwrap(),
+                0x1000,
+                PciMemoryBarWidth::Bits32,
+            )
+            .unwrap()
+            .with_decode_policy(PciBarDecodePolicy::Fixed)
+            .with_address(ResourceRequest::Fixed(base)),
+        ],
+    );
+    let (_, runtime) = build_pci([spec], [("endpoint", function)]);
+
+    write_config(&runtime, bdf, 4, AccessWidth::Word, 2);
+    write_config(&runtime, bdf, 0x10, AccessWidth::Dword, u64::from(u32::MAX));
+    assert_eq!(
+        read_config(&runtime, bdf, 0x10, AccessWidth::Dword),
+        0xffff_f000
+    );
+    // The sizing probe must not move the decode: the aperture still routes.
+    assert_eq!(
+        read_mmio(&runtime, base + 0x24, AccessWidth::Dword).unwrap(),
+        0xa500_0024
+    );
+}
+
+#[test]
+fn fixed_bar_rejects_relocation_but_accepts_planned_address() {
+    let function = Arc::new(RecordingFunction::default());
+    let bdf = PciBdf::new(PciSegment::new(0), 0, 1, 0).unwrap();
+    let planned = APERTURE_BASE + 0x4000;
+    let spec = fixed_policy_bar_function(
+        "endpoint",
+        bdf,
+        vec![
+            PciMemoryBar::new(
+                PciBarIndex::new(0).unwrap(),
+                0x1000,
+                PciMemoryBarWidth::Bits32,
+            )
+            .unwrap()
+            .with_decode_policy(PciBarDecodePolicy::Fixed)
+            .with_address(ResourceRequest::Fixed(planned)),
+        ],
+    );
+    let (_, runtime) = build_pci([spec], [("endpoint", function)]);
+
+    write_config(&runtime, bdf, 4, AccessWidth::Word, 2);
+    // Rewriting the planned address itself stays accepted and harmless.
+    write_config(&runtime, bdf, 0x10, AccessWidth::Dword, planned);
+    assert_eq!(
+        read_config(&runtime, bdf, 0x10, AccessWidth::Dword),
+        planned
+    );
+    assert_eq!(
+        read_mmio(&runtime, planned + 8, AccessWidth::Dword).unwrap(),
+        0xa500_0008
+    );
+
+    // Any other whole-dword address is ignored: readback and decode stay on
+    // the plan.
+    write_config(&runtime, bdf, 0x10, AccessWidth::Dword, planned + 0x2000);
+    assert_eq!(
+        read_config(&runtime, bdf, 0x10, AccessWidth::Dword),
+        planned
+    );
+    assert!(read_mmio(&runtime, planned + 0x2008, AccessWidth::Dword).is_err());
+
+    // A partial write that only changes address bits is rejected as well.
+    write_config(&runtime, bdf, 0x11, AccessWidth::Byte, 0xff);
+    assert_eq!(
+        read_config(&runtime, bdf, 0x10, AccessWidth::Dword),
+        planned
+    );
+    assert_eq!(
+        read_mmio(&runtime, planned + 8, AccessWidth::Dword).unwrap(),
+        0xa500_0008
+    );
+}
+
+#[test]
+fn fixed_bar_half_mask_write_is_ignored_and_full_probe_still_reports_mask() {
+    let function = Arc::new(RecordingFunction::default());
+    let bdf = PciBdf::new(PciSegment::new(0), 0, 1, 0).unwrap();
+    let planned = APERTURE_BASE + 0x3000;
+    let spec = fixed_policy_bar_function(
+        "endpoint",
+        bdf,
+        vec![
+            PciMemoryBar::new(
+                PciBarIndex::new(0).unwrap(),
+                0x1000,
+                PciMemoryBarWidth::Bits32,
+            )
+            .unwrap()
+            .with_decode_policy(PciBarDecodePolicy::Fixed)
+            .with_address(ResourceRequest::Fixed(planned)),
+        ],
+    );
+    let (_, runtime) = build_pci([spec], [("endpoint", function)]);
+    write_config(&runtime, bdf, 4, AccessWidth::Word, 2);
+
+    // One half of the sizing mask alone matches neither the mask nor the
+    // planned base: it must leave config and decode untouched instead of
+    // starting a relocation transaction.
+    write_config(&runtime, bdf, 0x12, AccessWidth::Word, 0xffff);
+    assert_eq!(
+        read_config(&runtime, bdf, 0x10, AccessWidth::Dword),
+        planned
+    );
+    assert_eq!(
+        read_mmio(&runtime, planned + 4, AccessWidth::Dword).unwrap(),
+        0xa500_0004
+    );
+
+    // The completed all-ones dword afterwards is classified as a probe and
+    // reports the size mask without moving the decode.
+    write_config(&runtime, bdf, 0x10, AccessWidth::Dword, u64::from(u32::MAX));
+    assert_eq!(
+        read_config(&runtime, bdf, 0x10, AccessWidth::Dword),
+        0xffff_f000
+    );
+    assert_eq!(
+        read_mmio(&runtime, planned + 4, AccessWidth::Dword).unwrap(),
+        0xa500_0004
+    );
+}
+
+#[test]
+fn bar_attributes_survive_probe_partial_writes_and_reset() {
+    let function = Arc::new(RecordingFunction::default());
+    let bdf = PciBdf::new(PciSegment::new(0), 0, 2, 0).unwrap();
+    let plain32 = APERTURE_BASE;
+    let prefetchable32 = APERTURE_BASE + 0x1000;
+    let prefetchable64 = APERTURE_BASE + 0x2000;
+
+    // Fixed policy keeps every readback below deterministic; the prefetchable
+    // bit rides on the low dword and the width bit selects the high dword.
+    let bars = [
+        PciMemoryBar::new(
+            PciBarIndex::new(0).unwrap(),
+            0x1000,
+            PciMemoryBarWidth::Bits32,
+        )
+        .unwrap()
+        .with_decode_policy(PciBarDecodePolicy::Fixed)
+        .with_address(ResourceRequest::Fixed(plain32)),
+        PciMemoryBar::new(
+            PciBarIndex::new(2).unwrap(),
+            0x1000,
+            PciMemoryBarWidth::Bits32,
+        )
+        .unwrap()
+        .prefetchable()
+        .with_decode_policy(PciBarDecodePolicy::Fixed)
+        .with_address(ResourceRequest::Fixed(prefetchable32)),
+        PciMemoryBar::new(
+            PciBarIndex::new(4).unwrap(),
+            0x1000,
+            PciMemoryBarWidth::Bits64,
+        )
+        .unwrap()
+        .prefetchable()
+        .with_decode_policy(PciBarDecodePolicy::Fixed)
+        .with_address(ResourceRequest::Fixed(prefetchable64)),
+    ];
+    let mut spec = PciFunctionSpec::new(function_id("endpoint"), endpoint_identity())
+        .with_bdf(ResourceRequest::Fixed(bdf));
+    for bar in bars {
+        spec = spec.with_bar(bar).unwrap();
+    }
+    let (_, runtime) = build_pci([spec], [("endpoint", function)]);
+    write_config(&runtime, bdf, 4, AccessWidth::Word, 2);
+
+    // Ordinary reads expose the planned attributes.
+    assert_eq!(
+        read_config(&runtime, bdf, 0x10, AccessWidth::Dword),
+        plain32
+    );
+    assert_eq!(
+        read_config(&runtime, bdf, 0x18, AccessWidth::Dword),
+        prefetchable32 | 0x8
+    );
+    assert_eq!(
+        read_config(&runtime, bdf, 0x20, AccessWidth::Dword),
+        prefetchable64 | 0xc
+    );
+
+    // Sizing probes carry the same attributes in the mask.
+    for (offset, attribute) in [(0x10u16, 0u32), (0x18, 0x8), (0x20, 0xc)] {
+        write_config(
+            &runtime,
+            bdf,
+            offset,
+            AccessWidth::Dword,
+            u64::from(u32::MAX),
+        );
+        assert_eq!(
+            read_config(&runtime, bdf, offset, AccessWidth::Dword),
+            0xffff_f000 | u64::from(attribute),
+            "probe mask must keep attributes at {offset:#x}"
+        );
+    }
+    // Probing the high dword of the 64-bit pair reports its address mask.
+    write_config(&runtime, bdf, 0x24, AccessWidth::Dword, u64::from(u32::MAX));
+    assert_eq!(
+        read_config(&runtime, bdf, 0x24, AccessWidth::Dword),
+        0xffff_ffff
+    );
+
+    // Guest writes cannot flip attributes: the bits are re-derived from the
+    // plan on every read instead of being stored from the config image.
+    for (offset, value) in [
+        (0x10u16, 0x08u8), // try to mark the plain BAR prefetchable
+        (0x18, 0xf7),      // try to clear the prefetchable bit
+        (0x20, 0xf3),      // try to clear the 64-bit width bit
+    ] {
+        write_config(&runtime, bdf, offset, AccessWidth::Byte, u64::from(value));
+    }
+    assert_eq!(
+        read_config(&runtime, bdf, 0x10, AccessWidth::Dword),
+        plain32
+    );
+    assert_eq!(
+        read_config(&runtime, bdf, 0x18, AccessWidth::Dword),
+        prefetchable32 | 0x8
+    );
+    assert_eq!(
+        read_config(&runtime, bdf, 0x20, AccessWidth::Dword),
+        prefetchable64 | 0xc
+    );
+
+    runtime.reset_lifecycle_devices().unwrap();
+    assert_eq!(
+        read_config(&runtime, bdf, 0x10, AccessWidth::Dword),
+        plain32
+    );
+    assert_eq!(
+        read_config(&runtime, bdf, 0x18, AccessWidth::Dword),
+        prefetchable32 | 0x8
+    );
+    assert_eq!(
+        read_config(&runtime, bdf, 0x20, AccessWidth::Dword),
+        prefetchable64 | 0xc
+    );
+}
+
+#[test]
+fn sixty_four_bit_fixed_bar_pair_probe_preserves_high_dword_mask() {
+    let function = Arc::new(RecordingFunction::default());
+    let bdf = PciBdf::new(PciSegment::new(0), 0, 3, 0).unwrap();
+    let planned = APERTURE_BASE + 0x8000;
+    let spec = fixed_policy_bar_function(
+        "endpoint",
+        bdf,
+        vec![
+            PciMemoryBar::new(
+                PciBarIndex::new(2).unwrap(),
+                0x2000,
+                PciMemoryBarWidth::Bits64,
+            )
+            .unwrap()
+            .with_decode_policy(PciBarDecodePolicy::Fixed)
+            .with_address(ResourceRequest::Fixed(planned)),
+        ],
+    );
+    let (_, runtime) = build_pci([spec], [("endpoint", function)]);
+    write_config(&runtime, bdf, 4, AccessWidth::Word, 2);
+
+    // Probing both dwords reports the full pair masks without moving decode.
+    write_config(&runtime, bdf, 0x18, AccessWidth::Dword, u64::from(u32::MAX));
+    write_config(&runtime, bdf, 0x1c, AccessWidth::Dword, u64::from(u32::MAX));
+    assert_eq!(
+        read_config(&runtime, bdf, 0x18, AccessWidth::Dword),
+        0xffff_e004
+    );
+    assert_eq!(
+        read_config(&runtime, bdf, 0x1c, AccessWidth::Dword),
+        0xffff_ffff
+    );
+    assert_eq!(
+        read_mmio(&runtime, planned + 0x40, AccessWidth::Dword).unwrap(),
+        0xa500_0040
+    );
+
+    // A high-dword relocation attempt is rejected. It clears only its own
+    // probe flag: the low dword keeps its latched sizing response until it
+    // is rewritten, exactly like the committed high dword returns to zero.
+    write_config(&runtime, bdf, 0x1c, AccessWidth::Dword, 1);
+    assert_eq!(read_config(&runtime, bdf, 0x1c, AccessWidth::Dword), 0);
+    assert_eq!(
+        read_config(&runtime, bdf, 0x18, AccessWidth::Dword),
+        0xffff_e004
+    );
+
+    // Rewriting the planned pair itself is accepted and the decode stays.
+    write_config(&runtime, bdf, 0x18, AccessWidth::Dword, planned | 0x4);
+    assert_eq!(
+        read_config(&runtime, bdf, 0x18, AccessWidth::Dword),
+        planned | 0x4
+    );
+    assert_eq!(
+        read_mmio(&runtime, planned + 0x40, AccessWidth::Dword).unwrap(),
+        0xa500_0040
+    );
+
+    runtime.reset_lifecycle_devices().unwrap();
+    assert_eq!(
+        read_config(&runtime, bdf, 0x18, AccessWidth::Dword),
+        planned | 0x4
+    );
+    assert_eq!(read_config(&runtime, bdf, 0x1c, AccessWidth::Dword), 0);
+}
+
 #[test]
 fn topology_rejects_duplicate_bdfs_bar_slots_and_orphan_functions() {
     let original_bdf = PciBdf::new(PciSegment::new(0), 0, 5, 0).unwrap();
