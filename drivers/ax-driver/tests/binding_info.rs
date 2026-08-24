@@ -54,14 +54,14 @@ impl_trait! {
             PhysAddr::from_usize(addr.as_usize())
         }
 
-        fn mem_make_dma_coherent_uncached(
-            _addr: VirtAddr,
+        fn mem_map_dma_coherent_uncached(
+            _addr: core::ptr::NonNull<u8>,
             _size: usize,
         ) -> axklib::DmaCoherentMappingOutcome {
             axklib::DmaCoherentMappingOutcome::NotStarted(KlibError::Unsupported)
         }
 
-        fn mem_restore_dma_cached(_addr: VirtAddr, _size: usize) -> KlibResult {
+        fn mem_unmap_dma_coherent(_addr: core::ptr::NonNull<u8>, _size: usize) -> KlibResult {
             Err(KlibError::Unsupported)
         }
 
@@ -71,11 +71,11 @@ impl_trait! {
 
         fn dma_cache_clean_invalidate(_addr: VirtAddr, _size: usize) {}
 
-        fn dma_alloc_pages(_dma_mask: u64, _num_pages: usize, _align: usize) -> KlibResult<VirtAddr> {
+        fn dma_alloc_pages(_dma_mask: u64, _num_pages: usize, _align: usize) -> KlibResult<core::ptr::NonNull<u8>> {
             Err(KlibError::Unsupported)
         }
 
-        fn dma_dealloc_pages(_addr: VirtAddr, _num_pages: usize) {}
+        fn dma_dealloc_pages(_addr: core::ptr::NonNull<u8>, _num_pages: usize) {}
 
         fn time_busy_wait(_dur: Duration) {}
 
@@ -136,6 +136,7 @@ fn optional_pci_binding_info_can_be_empty() {
             interrupt_pin: 0,
             interrupt_line: 0,
             intx_route: None,
+            dma_coherent: false,
         },
         PciIrqRequirement::Optional,
     )
@@ -153,6 +154,7 @@ fn required_pci_binding_info_reports_unresolved_irq() {
             interrupt_pin: 0,
             interrupt_line: 0,
             intx_route: None,
+            dma_coherent: false,
         },
         PciIrqRequirement::Required,
     )
@@ -192,7 +194,7 @@ fn named_fdt_interrupt_binding_selects_matching_specifier() {
     *CAPTURED_IRQ.lock().unwrap() = None;
     *SETUP_SPECIFIER.lock().unwrap() = None;
 
-    ensure_rdrive_fdt_initialized();
+    ensure_rdrive_test_intc();
 
     let irq = rdrive::with_fdt(|fdt| {
         let node = fdt.find_compatible(&["test,binding-info"]).pop().unwrap();

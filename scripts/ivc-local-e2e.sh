@@ -22,12 +22,11 @@ set -euo pipefail
 #   IVC_E2E_KDIR              已配置好的 guest Linux 内核源码树；CI 可先运行
 #                             scripts/ivc-prepare-linux-kernel.sh 生成
 #                             （默认 ~/workspace/tgosimages/build/qemu_linux）
-#   IVC_E2E_ARCHIVE           rootfs tar.xz 归档
-#                             （默认 tmp/axbuild/rootfs/rootfs-aarch64-alpine.img.tar.xz）
 #   IVC_E2E_TIMEOUT           测例超时，例如 120s；为空则不加 timeout
 #   IVC_E2E_SKIP_GUEST_BUILD=1 跳过 ArceOS guest .bin 构建（只 patch Linux 侧）
-#   TGOS_IMAGE_LOCAL_STORAGE   兼容 axbuild 的本地镜像存储路径；设置后
-#                              patch 和后续测例会使用同一份镜像缓存
+#   TGOS_IMAGE_DOWNLOAD_DIR    axbuild 镜像归档缓存目录
+#   TGOS_IMAGE_EXTRACT_DIR     axbuild 镜像解压目录；patch 和后续测例使用
+#                              同一目录
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKSPACE="${IVC_E2E_WORKSPACE:-$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel)}"
@@ -35,18 +34,14 @@ cd "$WORKSPACE"
 
 KERNEL_DRIVER="${IVC_E2E_KERNEL_DRIVER:-$WORKSPACE/apps/linux/ivc/kernel_driver}"
 KDIR="${IVC_E2E_KDIR:-/home/user/workspace/tgosimages/build/qemu_linux}"
-ARCHIVE="${IVC_E2E_ARCHIVE:-$WORKSPACE/tmp/axbuild/rootfs/rootfs-aarch64-alpine.img.tar.xz}"
-IMAGES_TOML_TEMPLATE="$WORKSPACE/tmp/axbuild/rootfs/images.toml"
-LAST_SYNC_TEMPLATE="$WORKSPACE/tmp/axbuild/rootfs/.last_sync"
-
 RUN_DIR="$WORKSPACE/tmp/ivc-local-e2e"
 LINUX_APPS="$RUN_DIR/linux-apps"
 GUEST_BINS="$RUN_DIR/guest"
 ARCEOS_BUILD_CONFIG="$RUN_DIR/arceos-build.toml"
-LOCAL_STORAGE="${IVC_E2E_LOCAL_STORAGE:-${TGOS_IMAGE_LOCAL_STORAGE:-$WORKSPACE/tmp/axbuild-local/rootfs}}"
+DOWNLOAD_DIR="${TGOS_IMAGE_DOWNLOAD_DIR:-$RUN_DIR/tgosimages}"
+EXTRACT_DIR="${TGOS_IMAGE_EXTRACT_DIR:-$WORKSPACE/tmp/axbuild-local/rootfs}"
 IMAGE_NAME="rootfs-aarch64-alpine.img"
-IMAGE_DIR="$LOCAL_STORAGE/$IMAGE_NAME"
-IMAGE="$IMAGE_DIR/$IMAGE_NAME"
+IMAGE="$EXTRACT_DIR/$IMAGE_NAME"
 
 FRESH_IMAGE=0
 RUN_TEST=1
@@ -65,11 +60,9 @@ done
 log() { printf '\n\033[1;34m[ivc-local-e2e]\033[0m %s\n' "$*"; }
 die() { printf '\033[1;31m[ivc-local-e2e] error:\033[0m %s\n' "$*" >&2; exit 1; }
 
-for tool in debugfs tar python3 cargo make modinfo; do
+for tool in cargo debugfs make modinfo; do
     command -v "$tool" >/dev/null 2>&1 || die "missing required tool: $tool"
 done
-[ -f "$ARCHIVE" ] || die "rootfs archive not found: $ARCHIVE"
-[ -f "$IMAGES_TOML_TEMPLATE" ] || die "images registry template not found: $IMAGES_TOML_TEMPLATE"
 [ -f "$KERNEL_DRIVER/Makefile" ] \
     || die "vendored kernel driver not found: $KERNEL_DRIVER"
 [ -f "$KDIR/include/config/kernel.release" ] \
@@ -78,7 +71,7 @@ done
 KERNEL_RELEASE="$(cat "$KDIR/include/config/kernel.release")"
 log "workspace        : $WORKSPACE"
 log "guest kernel     : $KERNEL_RELEASE"
-log "rootfs archive   : $ARCHIVE"
+log "rootfs image     : $IMAGE"
 
 ###############################################################################
 # 1. 使用仓库内 vendored kernel driver 编译 v3/Message V1 模块
@@ -148,38 +141,22 @@ EOF
 fi
 
 ###############################################################################
-# 4. 准备本地 rootfs 镜像（干净归档解压 + debugfs patch）
+# 4. 准备 axbuild 管理的 rootfs 镜像并用 debugfs patch
 ###############################################################################
 log "preparing local rootfs image"
-mkdir -p "$LOCAL_STORAGE"
-cp "$IMAGES_TOML_TEMPLATE" "$LOCAL_STORAGE/images.toml"
-if [ -f "$LAST_SYNC_TEMPLATE" ]; then
-    cp "$LAST_SYNC_TEMPLATE" "$LOCAL_STORAGE/.last_sync"
+mkdir -p "$DOWNLOAD_DIR" "$EXTRACT_DIR"
+if [ -d "$IMAGE" ]; then
+    log "removing legacy nested rootfs layout: $IMAGE"
+    rm -rf "$IMAGE"
+elif [ "$FRESH_IMAGE" = 1 ]; then
+    rm -f "$IMAGE"
 fi
-ln -sfn "$ARCHIVE" "$LOCAL_STORAGE/$IMAGE_NAME.tar.xz"
-
-EXPECTED_SHA="$(
-    python3 - "$IMAGES_TOML_TEMPLATE" "$IMAGE_NAME" <<'PY'
-import sys, tomllib
-images = tomllib.load(open(sys.argv[1], 'rb'))['images']
-name = sys.argv[2]
-for image in images:
-    if image['name'] == name:
-        print(image['sha256'])
-        break
-else:
-    raise SystemExit(f'image {name} not found')
-PY
-)"
-
-if [ "$FRESH_IMAGE" = 1 ] || [ ! -f "$IMAGE" ]; then
-    log "extracting fresh rootfs from archive"
-    rm -rf "$IMAGE_DIR"
-    mkdir -p "$IMAGE_DIR"
-    tar -xJf "$ARCHIVE" -C "$IMAGE_DIR"
-    printf '%s\n' "$EXPECTED_SHA" > "$IMAGE_DIR/.archive.sha256"
+if [ ! -f "$IMAGE" ]; then
+    TGOS_IMAGE_DOWNLOAD_DIR="$DOWNLOAD_DIR" \
+    TGOS_IMAGE_EXTRACT_DIR="$EXTRACT_DIR" \
+        cargo xtask image pull "$IMAGE_NAME"
 fi
-[ -f "$IMAGE" ] || die "rootfs image is missing after prepare"
+[ -f "$IMAGE" ] || die "rootfs image is missing after prepare: $IMAGE"
 
 patch_image_file() {
     local host_path="$1"
@@ -225,6 +202,7 @@ RUN_CMD=(
 if [ -n "${IVC_E2E_TIMEOUT:-}" ]; then
     RUN_CMD=(timeout --kill-after=5s "$IVC_E2E_TIMEOUT" "${RUN_CMD[@]}")
 fi
-TGOS_IMAGE_LOCAL_STORAGE="$LOCAL_STORAGE" \
+TGOS_IMAGE_DOWNLOAD_DIR="$DOWNLOAD_DIR" \
+TGOS_IMAGE_EXTRACT_DIR="$EXTRACT_DIR" \
 TMPDIR="$RUN_DIR" \
     "${RUN_CMD[@]}"

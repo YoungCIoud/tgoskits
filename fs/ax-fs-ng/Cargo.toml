@@ -1,6 +1,6 @@
 [package]
 name = "ax-fs-ng"
-version = "0.8.7"
+version = "0.9.0"
 repository = "https://github.com/rcore-os/tgoskits"
 edition.workspace = true
 authors = ["Mivik <mivikq@gmail.com>"]
@@ -9,6 +9,7 @@ license.workspace = true
 
 [features]
 axtest = []
+host-test = ["ax-sync/host-test"]
 fat = ["dep:fatfs"]
 ext4 = ["dep:rsext4"]
 vfs = ["ax-sync/sleep"]
@@ -45,3 +46,19 @@ version = "0.4.1-preview.2"
 default-features = false
 optional = true
 features = ["alloc", "lfn", "log_level_trace", "unicode"]
+
+[[test]]
+name = "axtest"
+path = "tests/axtest.rs"
+harness = false
+required-features = ["axtest"]
+
+[dev-dependencies.axtest]
+path = "../../components/axtest/axtest"
+
+[dev-dependencies.ax-std]
+path = "../../os/arceos/ulib/axstd"
+features = ["default"]
+
+[dev-dependencies.ax-hal]
+path = "../../os/arceos/modules/axhal"
