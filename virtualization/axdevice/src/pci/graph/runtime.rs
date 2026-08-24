@@ -175,3 +175,98 @@ impl PciBusShared {
             })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::{
+        DeviceGraphBuilder, DeviceNodeSpec, ResourcePools,
+        interrupt::InterruptRegistry,
+        pci::{PciClass, PciEndpointIdentity, PciFunctionSpec, PciTopologyBuilder},
+    };
+
+    /// Model that only exists so the planner hands out host-shaped claims.
+    struct RequirementsModel(PciHostResourceRequirements);
+
+    impl DeviceModel for RequirementsModel {
+        fn requirements(&self) -> DeviceManagerResult<DeviceRequirements> {
+            self.0.device_requirements()
+        }
+
+        fn firmware(&self) -> DeviceFirmwareSpec {
+            DeviceFirmwareSpec::None
+        }
+
+        fn build(
+            &self,
+            _context: &mut DeviceBuildContext<'_>,
+        ) -> DeviceManagerResult<DeviceBundle> {
+            unreachable!("the drift-guard test never builds through this model")
+        }
+    }
+
+    /// Publishes a resolved plan whose windows deliberately differ from the
+    /// ranges the planner-backed claim set below hands to `build`.
+    fn published_plan_and_model() -> (Arc<PciBusShared>, PciHostModel) {
+        let shared = Arc::new(PciBusShared::new());
+        let requirements = PciHostResourceRequirements::new(0x10_0000, 0x10_0000).unwrap();
+        let model = PciHostModel::new(requirements, shared.clone());
+        let mut builder = PciTopologyBuilder::new();
+        builder
+            .add_function(PciFunctionSpec::new(
+                DeviceNodeId::new("endpoint").unwrap(),
+                PciEndpointIdentity::new(0x1234, 0x5678, PciClass::new(0xff, 0, 0)),
+            ))
+            .unwrap();
+        let topology = Arc::new(builder.resolve(0x2000_0000..0x2010_0000).unwrap());
+        shared
+            .publish_plan(Arc::new(PciHostPlan {
+                topology,
+                ecam_window: 0x3000_0000..0x3010_0000,
+            }))
+            .unwrap();
+        (shared, model)
+    }
+
+    #[test]
+    fn host_build_rejects_claims_that_drift_from_the_resolved_plan() {
+        let (shared, model) = published_plan_and_model();
+
+        // Real planner claims for a host whose slots resolve far away from
+        // the hand-published windows above.
+        let mut graph = DeviceGraphBuilder::new();
+        graph
+            .add(DeviceNodeSpec::virtual_device(
+                DeviceNodeId::new("pci-host").unwrap(),
+                Arc::new(RequirementsModel(
+                    PciHostResourceRequirements::new(0x10_0000, 0x10_0000).unwrap(),
+                )),
+            ))
+            .unwrap();
+        let mut pools = ResourcePools::new();
+        pools.add_auto_mmio(0x1000_0000..0x1100_0000).unwrap();
+        let resolved = graph.declare().unwrap().resolve(pools).unwrap();
+        let claims = resolved.resource_plan().claim_device("pci-host").unwrap();
+
+        let interrupts = InterruptRegistry::new();
+        let mut context = DeviceBuildContext::planned(&interrupts, claims);
+        let error = match model.build(&mut context) {
+            Err(error) => error,
+            Ok(_) => unreachable!("drifting claims must fail the host build"),
+        };
+
+        assert!(
+            error
+                .to_string()
+                .contains("claimed host ranges differ from the resolved PCI topology"),
+            "unexpected error: {error}"
+        );
+        // The drift guard must fire before anything is published.
+        assert!(matches!(
+            shared.root_lock(&DeviceNodeId::new("pci-host").unwrap()),
+            Err(PciError::HostUnavailable { .. })
+        ));
+    }
+}

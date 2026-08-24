@@ -387,10 +387,12 @@ fn fixed_policy_bar_function(id: &str, bdf: PciBdf, bars: Vec<PciMemoryBar>) -> 
     spec
 }
 
-/// Endpoint probe whose reset outcome and invocation count are observable.
+/// Endpoint probe whose reset outcome, error identity, and invocation count
+/// are observable.
 struct LifecycleProbeFunction {
     name: &'static str,
     fail_reset: bool,
+    error_detail: &'static str,
     reset_calls: Mutex<u32>,
 }
 
@@ -421,7 +423,7 @@ impl PciFunction for LifecycleProbeFunction {
         if self.fail_reset {
             Err(DeviceError::Unsupported {
                 operation: "reset PCI function",
-                detail: "probe failure".into(),
+                detail: self.error_detail.into(),
             })
         } else {
             Ok(())
@@ -431,45 +433,64 @@ impl PciFunction for LifecycleProbeFunction {
 
 #[test]
 fn root_reset_tries_every_bound_function_and_returns_first_error() {
-    let failing = Arc::new(LifecycleProbeFunction {
-        name: "failing",
+    // Two failing functions with distinguishable errors pin the "first real
+    // error" contract: a last-error regression would flip the assertion.
+    let failing_a = Arc::new(LifecycleProbeFunction {
+        name: "failing-a",
         fail_reset: true,
+        error_detail: "first probe failure",
+        reset_calls: Mutex::new(0),
+    });
+    let failing_b = Arc::new(LifecycleProbeFunction {
+        name: "failing-b",
+        fail_reset: true,
+        error_detail: "second probe failure",
         reset_calls: Mutex::new(0),
     });
     let healthy = Arc::new(LifecycleProbeFunction {
         name: "healthy",
         fail_reset: false,
+        error_detail: "",
         reset_calls: Mutex::new(0),
     });
     let bdf_a = PciBdf::new(PciSegment::new(0), 0, 1, 0).unwrap();
     let bdf_b = PciBdf::new(PciSegment::new(0), 0, 2, 0).unwrap();
+    let bdf_c = PciBdf::new(PciSegment::new(0), 0, 3, 0).unwrap();
     let specs = [
         bare_function("ep-a").with_bdf(ResourceRequest::Fixed(bdf_a)),
         bare_function("ep-b").with_bdf(ResourceRequest::Fixed(bdf_b)),
+        bare_function("ep-c").with_bdf(ResourceRequest::Fixed(bdf_c)),
     ];
     let (_, runtime) = build_pci_dyn(
         specs,
-        [("ep-a", failing.clone()), ("ep-b", healthy.clone())],
+        [
+            ("ep-a", failing_a.clone()),
+            ("ep-b", failing_b.clone()),
+            ("ep-c", healthy.clone()),
+        ],
     );
 
-    // Both functions carry non-power-on command state before the reset.
-    write_config(&runtime, bdf_a, 4, AccessWidth::Word, 0xffff);
-    write_config(&runtime, bdf_b, 4, AccessWidth::Word, 0xffff);
+    // All three functions carry non-power-on command state before the reset.
+    for bdf in [bdf_a, bdf_b, bdf_c] {
+        write_config(&runtime, bdf, 4, AccessWidth::Word, 0xffff);
+    }
 
-    let error = runtime.reset_lifecycle_devices().unwrap_err();
-    assert!(matches!(
-        error,
-        DeviceManagerError::Device(DeviceError::Unsupported { .. })
-    ));
+    match runtime.reset_lifecycle_devices() {
+        Err(DeviceManagerError::Device(DeviceError::Unsupported { detail, .. })) => {
+            assert_eq!(detail, "first probe failure");
+        }
+        other => panic!("reset must return the first function error, got {other:?}"),
+    }
 
-    // The failing function is reported first (lowest BDF), and the healthy
-    // function is still attempted afterwards.
-    assert_eq!(*failing.reset_calls.lock().unwrap(), 1);
+    // Every bound function is attempted exactly once despite the failures.
+    assert_eq!(*failing_a.reset_calls.lock().unwrap(), 1);
+    assert_eq!(*failing_b.reset_calls.lock().unwrap(), 1);
     assert_eq!(*healthy.reset_calls.lock().unwrap(), 1);
 
     // Root-owned power-on state is restored regardless of endpoint failures.
-    assert_eq!(read_config(&runtime, bdf_a, 4, AccessWidth::Word), 0);
-    assert_eq!(read_config(&runtime, bdf_b, 4, AccessWidth::Word), 0);
+    for bdf in [bdf_a, bdf_b, bdf_c] {
+        assert_eq!(read_config(&runtime, bdf, 4, AccessWidth::Word), 0);
+    }
 }
 
 #[test]
@@ -667,6 +688,8 @@ fn bar_attributes_survive_probe_partial_writes_and_reset() {
         read_config(&runtime, bdf, 0x20, AccessWidth::Dword),
         prefetchable64 | 0xc
     );
+    // Undeclared BAR slots stay hard-wired to zero.
+    assert_eq!(read_config(&runtime, bdf, 0x14, AccessWidth::Dword), 0);
 
     // Sizing probes carry the same attributes in the mask.
     for (offset, attribute) in [(0x10u16, 0u32), (0x18, 0x8), (0x20, 0xc)] {
@@ -916,9 +939,13 @@ fn fixed_platform_functions_and_reservations_shape_deterministic_auto_allocation
     let build = |reverse_platform: bool| -> ResolvedPciTopology {
         let mut builder = PciTopologyBuilder::new();
         // The host bridge and LPC are real guest-enumerable platform
-        // functions declared below; only contract-kept holes are reserved.
-        builder.reserve_bdf(platform_bdf(3, 0)).unwrap();
-        builder.reserve_bdf(platform_bdf(3, 0)).unwrap();
+        // functions declared below. The reserved holes include the first
+        // free device, so automatic placement provably skips reservations —
+        // without this position the scan would never reach a reserved BDF.
+        for position in [platform_bdf(1, 0), platform_bdf(3, 0)] {
+            builder.reserve_bdf(position).unwrap();
+            builder.reserve_bdf(position).unwrap();
+        }
         let mut platform = [
             (
                 "host-bridge",
@@ -954,15 +981,17 @@ fn fixed_platform_functions_and_reservations_shape_deterministic_auto_allocation
     let forward = build(false);
     let reversed = build(true);
 
-    // Automatic placement skips fixed platform functions and reservations.
-    // Allocation follows stable node-id order across whole devices.
+    // Automatic placement skips fixed platform functions AND reservations:
+    // device 1 is reserved, so alpha lands on device 2 and beta jumps over
+    // the reserved device 3. Allocation follows stable node-id order across
+    // whole devices.
     assert_eq!(
         forward.function(&function_id("beta")).unwrap().bdf(),
-        PciBdf::new(PciSegment::new(0), 0, 2, 0).unwrap()
+        PciBdf::new(PciSegment::new(0), 0, 4, 0).unwrap()
     );
     assert_eq!(
         forward.function(&function_id("alpha")).unwrap().bdf(),
-        PciBdf::new(PciSegment::new(0), 0, 1, 0).unwrap()
+        PciBdf::new(PciSegment::new(0), 0, 2, 0).unwrap()
     );
     // Declaration order never changes the resolved placement.
     for id in ["alpha", "beta", "host-bridge", "lpc"] {
@@ -985,6 +1014,23 @@ fn reserved_bdfs_reject_fixed_requests() {
     match builder.resolve(APERTURE_BASE..APERTURE_END) {
         Err(PciError::BdfReserved { bdf, .. }) => assert_eq!(bdf, reserved),
         other => panic!("reserved placement must fail deterministically, got {other:?}"),
+    }
+}
+
+#[test]
+fn automatic_placement_reports_exhaustion_after_thirty_two_devices() {
+    // Zero-padded ids keep declaration index equal to the lexicographic
+    // node-id order the allocator follows.
+    let mut builder = PciTopologyBuilder::new();
+    for index in 0..33u8 {
+        builder
+            .add_function(bare_function(&std::format!("auto-{index:02}")))
+            .unwrap();
+    }
+
+    match builder.resolve(APERTURE_BASE..APERTURE_END) {
+        Err(PciError::BdfExhausted { function }) => assert_eq!(function, "auto-32"),
+        other => panic!("device 33 must exhaust bus-zero placement, got {other:?}"),
     }
 }
 
