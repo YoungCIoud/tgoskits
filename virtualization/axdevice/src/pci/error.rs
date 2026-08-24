@@ -97,6 +97,14 @@ pub enum PciError {
         /// Second stable function identity.
         second: String,
     },
+    /// A fixed request targets a BDF reserved by the platform contract.
+    #[error("PCI BDF {bdf} is reserved and cannot be assigned to {function}")]
+    BdfReserved {
+        /// Reserved BDF that was targeted.
+        bdf: PciBdf,
+        /// Stable function identity that was rejected.
+        function: String,
+    },
     /// A non-zero function has no function zero at the same device.
     #[error("PCI function {bdf} has no function zero at the same device")]
     MissingFunctionZero {

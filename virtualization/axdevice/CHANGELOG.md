@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Add a typed virtual PCI Type-0/ECAM foundation with deterministic BDF/BAR planning and transactional resolved-device-graph integration.
 - Add root-level direct config access validation for supported widths and function-boundary checks.
+- Add PCI BDF reservations (`PciTopologyBuilder::reserve_bdf`) so architectures can protect platform positions, and make automatic placement device-granular so unrelated endpoints never merge into one multi-function device.
 
 ### Changed
 

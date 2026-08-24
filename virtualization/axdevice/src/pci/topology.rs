@@ -13,11 +13,12 @@ use super::{
 };
 use crate::{DeviceNodeId, ResourceRequest};
 
-const BDF_COUNT: u16 = 32 * 8;
+const DEVICE_COUNT: u16 = 32;
 
 /// Mutable PCI topology declaration sealed before VM execution.
 pub struct PciTopologyBuilder {
     functions: BTreeMap<DeviceNodeId, PciFunctionSpec>,
+    reservations: BTreeSet<PciBdf>,
 }
 
 impl fmt::Debug for PciTopologyBuilder {
@@ -25,6 +26,7 @@ impl fmt::Debug for PciTopologyBuilder {
         formatter
             .debug_struct("PciTopologyBuilder")
             .field("function_count", &self.functions.len())
+            .field("reservation_count", &self.reservations.len())
             .finish()
     }
 }
@@ -34,6 +36,7 @@ impl PciTopologyBuilder {
     pub const fn new() -> Self {
         Self {
             functions: BTreeMap::new(),
+            reservations: BTreeSet::new(),
         }
     }
 
@@ -54,6 +57,22 @@ impl PciTopologyBuilder {
         Ok(())
     }
 
+    /// Reserves a BDF so automatic placement can never assign it.
+    ///
+    /// Used for platform functions that are enumerated separately or for
+    /// positions an architecture contract keeps empty. Duplicate reservations
+    /// are accepted so several declarations can share one platform contract.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PciError::InvalidAddress`] for segment or bus values outside
+    /// the supported single-segment, bus-zero space.
+    pub fn reserve_bdf(&mut self, bdf: PciBdf) -> PciResult {
+        validate_supported_bdf(bdf)?;
+        self.reservations.insert(bdf);
+        Ok(())
+    }
+
     /// Resolves all fixed requests, performs deterministic automatic
     /// placement, validates the complete topology, and freezes it.
     ///
@@ -62,7 +81,7 @@ impl PciTopologyBuilder {
     /// Returns a typed [`PciError`] for any BDF, BAR, capability, or aperture
     /// conflict. No partially resolved topology is published.
     pub fn resolve(self, memory_aperture: Range<u64>) -> PciResult<ResolvedPciTopology> {
-        let bdfs = resolve_bdfs(&self.functions)?;
+        let bdfs = resolve_bdfs(&self.functions, &self.reservations)?;
         validate_function_zero(&bdfs)?;
         let bar_addresses = resolve_bar_addresses(&memory_aperture, &self.functions)?;
         let multifunction_devices = multifunction_devices(&bdfs);
@@ -216,12 +235,19 @@ impl ResolvedPciTopology {
 
 fn resolve_bdfs(
     functions: &BTreeMap<DeviceNodeId, PciFunctionSpec>,
+    reservations: &BTreeSet<PciBdf>,
 ) -> PciResult<BTreeMap<DeviceNodeId, PciBdf>> {
     let mut resolved = BTreeMap::new();
     let mut occupied = BTreeMap::<PciBdf, DeviceNodeId>::new();
     for (id, spec) in functions {
         if let ResourceRequest::Fixed(bdf) = spec.bdf {
             validate_supported_bdf(bdf)?;
+            if reservations.contains(&bdf) {
+                return Err(PciError::BdfReserved {
+                    bdf,
+                    function: id.to_string(),
+                });
+            }
             if let Some(existing) = occupied.insert(bdf, id.clone()) {
                 return Err(PciError::DuplicateBdf {
                     bdf,
@@ -234,9 +260,15 @@ fn resolve_bdfs(
     }
     for (id, spec) in functions {
         if spec.bdf == ResourceRequest::Auto {
-            let bdf = (0..BDF_COUNT)
-                .map(PciBdf::bus_zero)
-                .find(|candidate| !occupied.contains_key(candidate))
+            // Automatic placement is device-granular: every automatically
+            // placed function owns the next free device's function 0, so
+            // unrelated endpoints never merge into one multi-function
+            // device and explicit sibling functions stay declaration-owned.
+            let bdf = (0..DEVICE_COUNT)
+                .map(|device| PciBdf::bus_zero(device * 8))
+                .find(|candidate| {
+                    !occupied.contains_key(candidate) && !reservations.contains(candidate)
+                })
                 .ok_or_else(|| PciError::BdfExhausted {
                     function: id.to_string(),
                 })?;

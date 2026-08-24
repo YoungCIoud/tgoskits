@@ -457,6 +457,86 @@ fn topology_reports_bar_and_capability_aperture_exhaustion() {
 }
 
 #[test]
+fn fixed_platform_functions_and_reservations_shape_deterministic_auto_allocation() {
+    let platform_bdf =
+        |device: u8, function: u8| PciBdf::new(PciSegment::new(0), 0, device, function).unwrap();
+
+    let build = |reverse_platform: bool| -> ResolvedPciTopology {
+        let mut builder = PciTopologyBuilder::new();
+        // The host bridge and LPC are real guest-enumerable platform
+        // functions declared below; only contract-kept holes are reserved.
+        builder.reserve_bdf(platform_bdf(3, 0)).unwrap();
+        builder.reserve_bdf(platform_bdf(3, 0)).unwrap();
+        let mut platform = [
+            (
+                "host-bridge",
+                PciEndpointIdentity::new(0x8086, 0x29c0, PciClass::new(0x06, 0x00, 0x00)),
+                platform_bdf(0, 0),
+            ),
+            (
+                "lpc",
+                PciEndpointIdentity::new(0x8086, 0x2918, PciClass::new(0x06, 0x01, 0x00)),
+                platform_bdf(31, 0),
+            ),
+        ];
+        if reverse_platform {
+            platform.reverse();
+        }
+        for (id, identity, position) in platform {
+            builder
+                .add_function(
+                    PciFunctionSpec::new(function_id(id), identity)
+                        .with_bdf(ResourceRequest::Fixed(position)),
+                )
+                .unwrap();
+        }
+        builder
+            .add_function(auto_bar_function("beta", 0x1000))
+            .unwrap();
+        builder
+            .add_function(auto_bar_function("alpha", 0x2000))
+            .unwrap();
+        builder.resolve(APERTURE_BASE..APERTURE_END).unwrap()
+    };
+
+    let forward = build(false);
+    let reversed = build(true);
+
+    // Automatic placement skips fixed platform functions and reservations.
+    // Allocation follows stable node-id order across whole devices.
+    assert_eq!(
+        forward.function(&function_id("beta")).unwrap().bdf(),
+        PciBdf::new(PciSegment::new(0), 0, 2, 0).unwrap()
+    );
+    assert_eq!(
+        forward.function(&function_id("alpha")).unwrap().bdf(),
+        PciBdf::new(PciSegment::new(0), 0, 1, 0).unwrap()
+    );
+    // Declaration order never changes the resolved placement.
+    for id in ["alpha", "beta", "host-bridge", "lpc"] {
+        assert_eq!(
+            forward.function(&function_id(id)).map(|f| f.bdf()),
+            reversed.function(&function_id(id)).map(|f| f.bdf())
+        );
+    }
+}
+
+#[test]
+fn reserved_bdfs_reject_fixed_requests() {
+    let reserved = PciBdf::new(PciSegment::new(0), 0, 5, 0).unwrap();
+    let mut builder = PciTopologyBuilder::new();
+    builder.reserve_bdf(reserved).unwrap();
+    builder
+        .add_function(bare_function("clash").with_bdf(ResourceRequest::Fixed(reserved)))
+        .unwrap();
+
+    match builder.resolve(APERTURE_BASE..APERTURE_END) {
+        Err(PciError::BdfReserved { bdf, .. }) => assert_eq!(bdf, reserved),
+        other => panic!("reserved placement must fail deterministically, got {other:?}"),
+    }
+}
+
+#[test]
 fn automatic_topology_assignment_is_stable_and_reset_restores_power_on_state() {
     let mut first = PciTopologyBuilder::new();
     first
