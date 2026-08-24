@@ -58,9 +58,9 @@ pub use device::{
 };
 pub use error::{DeviceManagerError, DeviceManagerResult};
 pub use fw_cfg::{
-    FwCfg, FwCfgAcpiBlobs, FwCfgBuildConfig, FwCfgDeviceFactory, FwCfgDmaDevice,
-    FwCfgKernelPayload, FwCfgPayloadConfig, FwCfgPayloadFactory, FwCfgPayloadSlot, FwCfgPioDevice,
-    FwCfgPlatformConfig, FwCfgRamRegion,
+    E820NonRamType, FwCfg, FwCfgAcpiBlobs, FwCfgBuildConfig, FwCfgDeviceFactory, FwCfgDmaDevice,
+    FwCfgKernelPayload, FwCfgNonRamRegion, FwCfgPayloadConfig, FwCfgPayloadFactory,
+    FwCfgPayloadSlot, FwCfgPioDevice, FwCfgPlatformConfig, FwCfgRamRegion,
 };
 pub use graph::{
     DeclaredDeviceGraph, DeviceFirmwareBinding, DeviceGraphBuilder, DeviceGraphError, DeviceNodeId,

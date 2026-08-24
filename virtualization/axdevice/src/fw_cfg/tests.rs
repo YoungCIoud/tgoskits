@@ -468,10 +468,7 @@ fn e820_encodes_reserved_reclaim_and_nvs_wire_types() {
 #[test]
 fn e820_drops_zero_length_declared_regions() {
     let ram = [
-        FwCfgRamRegion {
-            base: 0x0,
-            size: 0,
-        },
+        FwCfgRamRegion { base: 0x0, size: 0 },
         FwCfgRamRegion {
             base: 0x1000,
             size: 0x1000,
@@ -512,7 +509,9 @@ fn e820_without_non_ram_input_preserves_legacy_memmap_coverage() {
 
 fn decode_e820_records(payload: &[u8]) -> Vec<(u64, u64, u32)> {
     payload
-        .chunks_exact(20)
+        .as_chunks::<20>()
+        .0
+        .iter()
         .map(|record| {
             (
                 u64::from_le_bytes(record[0..8].try_into().unwrap()),
@@ -538,7 +537,9 @@ fn legacy_memmap_bytes(regions: &[FwCfgRamRegion]) -> Vec<u8> {
 
 fn decode_legacy_memmap_records(payload: &[u8]) -> Vec<(u64, u64, u32)> {
     payload
-        .chunks_exact(24)
+        .as_chunks::<24>()
+        .0
+        .iter()
         .map(|record| {
             (
                 u64::from_le_bytes(record[0..8].try_into().unwrap()),

@@ -38,7 +38,6 @@ const LOWMEM_BASE: u64 = 0;
 const LOWMEM_LENGTH: u64 = 0x1000_0000;
 const HIGHMEM_BASE: u64 = 0x8000_0000;
 const HIGHMEM_LENGTH: u64 = 0x2400_0000;
-const MEMMAP_RAM_TYPE: u32 = 1;
 
 const FW_CFG_DATA_OFFSET: usize = 0x00;
 const FW_CFG_SELECTOR_OFFSET: usize = 0x08;
@@ -73,11 +72,11 @@ pub struct FwCfgRamRegion {
 #[repr(u32)]
 pub enum E820NonRamType {
     /// Hole or firmware-owned memory that guests must not allocate from.
-    Reserved = 2,
+    Reserved        = 2,
     /// ACPI tables that firmware hands off and the OS may reclaim after boot.
     AcpiReclaimable = 3,
     /// ACPI non-volatile-sleep memory preserved across sleep states.
-    AcpiNvs = 4,
+    AcpiNvs         = 4,
 }
 
 impl E820NonRamType {
@@ -112,6 +111,10 @@ pub struct FwCfgAcpiBlobs {
 #[derive(Clone, Debug)]
 pub struct FwCfgPlatformConfig {
     pub ram_regions: Arc<[FwCfgRamRegion]>,
+    /// Guest physical windows that must appear in `etc/e820` as something other
+    /// than usable RAM (reserved, ACPI reclaimable, or ACPI NVS). Callers must keep
+    /// these disjoint from each other and from `ram_regions`.
+    pub non_ram_regions: Arc<[FwCfgNonRamRegion]>,
     pub srat_regions: Arc<[FwCfgRamRegion]>,
     pub acpi: FwCfgAcpiBlobs,
 }
@@ -132,6 +135,7 @@ impl Default for FwCfgPlatformConfig {
         let regions: Arc<[FwCfgRamRegion]> = Arc::from(DEFAULT_RAM_REGIONS);
         Self {
             ram_regions: regions.clone(),
+            non_ram_regions: <Arc<[FwCfgNonRamRegion]>>::default(),
             srat_regions: regions,
             acpi: FwCfgAcpiBlobs::default(),
         }
@@ -153,7 +157,7 @@ pub struct FwCfg {
     initrd: Option<Arc<[u8]>>,
     cmdline: Vec<u8>,
     file_dir: Vec<u8>,
-    memmap: Vec<u8>,
+    e820: Vec<u8>,
     smbios_tables: Vec<u8>,
     smbios_anchor: Vec<u8>,
     acpi_tables: Vec<u8>,
@@ -184,7 +188,11 @@ impl FwCfg {
             .ram_regions
             .iter()
             .fold(0u64, |acc, region| acc.saturating_add(region.size));
-        let memmap = build_memmap(&platform.ram_regions);
+        // "etc/e820" is the upstream-consumed name (QEMU emits it, edk2 OVMF
+        // PlatformScanE820 scans it). It replaces the nonstandard "etc/memmap" at
+        // the same selector FW_CFG_FILE_FIRST so every selector assignment stays
+        // stable; guests locate fw_cfg files by name through the file dir.
+        let e820 = build_e820_map(&platform.ram_regions, &platform.non_ram_regions);
         let smbios_tables = build_smbios_tables();
         let smbios_anchor = build_smbios_anchor();
         let acpi = platform.acpi;
@@ -193,9 +201,9 @@ impl FwCfg {
         boot_kernel.extend_from_slice(kernel.kernel());
         let mut files = alloc::vec![
             FwCfgFile {
-                name: "etc/memmap",
+                name: "etc/e820",
                 selector: FW_CFG_FILE_FIRST,
-                size: memmap.len() as u32,
+                size: e820.len() as u32,
             },
             FwCfgFile {
                 name: "etc/smbios/smbios-anchor",
@@ -254,7 +262,7 @@ impl FwCfg {
             initrd,
             cmdline,
             file_dir,
-            memmap,
+            e820,
             smbios_tables,
             smbios_anchor,
             acpi_tables: acpi.tables,
@@ -302,7 +310,7 @@ impl FwCfg {
             }
             FW_CFG_KERNEL_SETUP_DATA => FwCfgEntry::Bytes(self.kernel.setup()),
             FW_CFG_FILE_DIR => FwCfgEntry::Bytes(&self.file_dir),
-            FW_CFG_FILE_FIRST => FwCfgEntry::Bytes(&self.memmap),
+            FW_CFG_FILE_FIRST => FwCfgEntry::Bytes(&self.e820),
             FW_CFG_SMBIOS_TABLES => FwCfgEntry::Bytes(&self.smbios_tables),
             FW_CFG_SMBIOS_ANCHOR => FwCfgEntry::Bytes(&self.smbios_anchor),
             FW_CFG_ACPI_TABLES => FwCfgEntry::Bytes(&self.acpi_tables),
