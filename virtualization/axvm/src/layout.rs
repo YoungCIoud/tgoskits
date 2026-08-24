@@ -177,7 +177,7 @@ impl PassthroughWindow {
     }
 }
 
-/// Final guest physical address layout owned by [`crate::AxVMResources`].
+/// Final guest physical address layout retained by the VM resource owner.
 #[derive(Debug, Default, Clone)]
 pub struct VmAddressLayout {
     mappings: Vec<VmStage2Mapping>,

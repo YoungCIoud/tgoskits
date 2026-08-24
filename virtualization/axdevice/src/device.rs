@@ -12,12 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use alloc::{collections::BTreeMap, sync::Arc, vec::Vec};
+use alloc::{boxed::Box, collections::BTreeMap, sync::Arc, vec::Vec};
 
 use axdevice_base::*;
 use axvm_types::GuestPhysAddr;
 
-use crate::{runtime_resources::*, *};
+use crate::{registration::RetainedRegistration, runtime_resources::*, *};
 
 /// Runtime backend for access-scoped virtual timer requests.
 pub trait TimerAccessPort: Send + Sync {
@@ -153,6 +153,8 @@ pub struct DeviceRuntime {
     lifecycle_devices: Vec<Arc<dyn DeviceLifecycle>>,
     /// Typed capabilities contributed during VM preparation.
     services: DeviceServices,
+    /// Non-discoverable registrations whose drop releases a runtime binding.
+    retained_registrations: Vec<Box<dyn RetainedRegistration>>,
     /// Planned controller, endpoint, and lease state.
     planned: PlannedRuntimeResources,
     /// Devices explicitly granted access to guest memory during a routed access.
@@ -309,6 +311,7 @@ impl DeviceRuntime {
             dma_pollable_devices: Vec::new(),
             lifecycle_devices: Vec::new(),
             services: DeviceServices::new(),
+            retained_registrations: Vec::new(),
             planned: PlannedRuntimeResources::new(),
             dma_grants: Vec::new(),
             timer_grants: Vec::new(),
@@ -482,6 +485,8 @@ impl DeviceRuntime {
             );
         self.lifecycle_devices.extend(bundle.lifecycle);
         self.services.append(bundle.services);
+        self.retained_registrations
+            .extend(bundle.retained_registrations);
         self.planned.append(bundle.planned);
         Ok(())
     }

@@ -5,13 +5,14 @@ use std::vec::Vec;
 
 use axdevice::{DeviceFirmwareBinding, DeviceNodeId, DeviceNodeSpec};
 
-use super::{firmware_plan::*, shared_provider::*, vgic::*};
+use super::{firmware_plan::*, pci_plan::*, shared_provider::*, vgic::*};
 use crate::{config::*, machine::*, vm::prepare::device_plan::*, *};
 
 /// Complete AArch64 plan created once before firmware and devices are finalized.
 pub(crate) struct Aarch64VmPlan {
     devices: VmDevicePlan,
     firmware: Aarch64FirmwarePlan,
+    pci: Option<Aarch64PciPlan>,
 }
 
 impl Aarch64VmPlan {
@@ -31,12 +32,21 @@ impl Aarch64VmPlan {
 
         let shared_providers = SharedProviderBootstrap::from_config(config)?;
         nodes.extend(shared_providers.device_nodes()?);
-        crate::configured::append_configured_devices(
+        let configured = crate::configured::collect_configured_devices(
             config,
-            &mut nodes,
             &controller_id,
             vgic.config().controller_id(),
         )?;
+        nodes.extend(configured.platform_nodes);
+        let declared_pci =
+            match Aarch64PciPlanBuilder::declare(config, &controller_id, configured.pci_endpoints)?
+            {
+                Some((declaration, pci_nodes)) => {
+                    nodes.extend(pci_nodes);
+                    Some(declaration)
+                }
+                None => None,
+            };
 
         let mut replacement_ranges = gic_ranges(profile)?;
         replacement_ranges.extend(shared_providers.replacement_ranges()?);
@@ -54,8 +64,15 @@ impl Aarch64VmPlan {
             &replacement_ranges,
             super::resource_pools::create(vgic.config())?,
         )?;
+        let pci = declared_pci
+            .map(|declaration| declaration.resolve(devices.graph()))
+            .transpose()?;
         let firmware = Aarch64FirmwarePlan::new(config, vgic.config(), devices.graph())?;
-        Ok(Self { devices, firmware })
+        Ok(Self {
+            devices,
+            firmware,
+            pci,
+        })
     }
 
     pub(crate) const fn gic_profile(&self) -> &GuestGicProfile {
@@ -80,6 +97,10 @@ impl Aarch64VmPlan {
 
     pub(crate) const fn timer_profile(&self) -> &GuestTimerProfile {
         self.firmware.timer()
+    }
+
+    pub(crate) fn pci_firmware(&self) -> Option<crate::boot::fdt::core::pci::GuestPciHost> {
+        self.pci.as_ref().map(Aarch64PciPlan::firmware)
     }
 }
 

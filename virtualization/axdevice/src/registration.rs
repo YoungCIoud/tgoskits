@@ -14,11 +14,16 @@
 
 //! Transactional device registration types.
 
-use alloc::{sync::Arc, vec::Vec};
+use alloc::{boxed::Box, sync::Arc, vec::Vec};
 
 use axdevice_base::*;
 
 use crate::{interrupt::*, *};
+
+/// Private lifetime token retained only for its `Drop` behavior.
+pub(crate) trait RetainedRegistration: Send + Sync {}
+
+impl<T: Send + Sync> RetainedRegistration for T {}
 
 /// A device capability that can be polled by the VM runtime.
 pub trait PollableDeviceOps: Send + Sync {
@@ -71,7 +76,9 @@ pub enum DeviceRegistration {
 /// A set of device capabilities that must be registered atomically.
 ///
 /// The contained registration lists are private so callers cannot bypass
-/// [`DeviceRegistration`] when adding future capability kinds.
+/// [`DeviceRegistration`] when adding future capability kinds. Crate-internal
+/// adapters may additionally retain non-discoverable drop guards so a runtime
+/// binding is committed and released with the same bundle.
 #[derive(Default)]
 pub struct DeviceBundle {
     pub(crate) devices: Vec<Arc<dyn Device>>,
@@ -88,6 +95,7 @@ pub struct DeviceBundle {
     pub(crate) dma_pollable: Vec<(usize, Arc<dyn DmaPollableDeviceOps>, DmaGrant)>,
     pub(crate) lifecycle: Vec<Arc<dyn DeviceLifecycle>>,
     pub(crate) services: DeviceServices,
+    pub(crate) retained_registrations: Vec<Box<dyn RetainedRegistration>>,
     pub(crate) planned: PlannedBundleResources,
 }
 
@@ -104,6 +112,7 @@ impl DeviceBundle {
             dma_pollable: Vec::new(),
             lifecycle: Vec::new(),
             services: DeviceServices::new(),
+            retained_registrations: Vec::new(),
             planned: PlannedBundleResources::new(),
         }
     }
@@ -278,6 +287,10 @@ impl DeviceBundle {
         Ok(self)
     }
 
+    pub(crate) fn retain_registration<T: Send + Sync + 'static>(&mut self, registration: T) {
+        self.retained_registrations.push(Box::new(registration));
+    }
+
     /// Returns whether this bundle contains no capabilities.
     pub fn is_empty(&self) -> bool {
         self.devices.is_empty()
@@ -289,6 +302,7 @@ impl DeviceBundle {
             && self.dma_pollable.is_empty()
             && self.lifecycle.is_empty()
             && self.services.is_empty()
+            && self.retained_registrations.is_empty()
             && self.planned.is_empty()
     }
 }

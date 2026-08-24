@@ -13,7 +13,10 @@ mod append;
 mod devices;
 
 pub use append::DefaultVirtualDeviceIntent;
+#[cfg(any(test, not(target_arch = "aarch64")))]
 pub(crate) use append::append_configured_devices;
+#[cfg(target_arch = "aarch64")]
+pub(crate) use append::collect_configured_devices;
 
 pub(crate) fn register_devices(
     catalog: &mut ConfiguredDeviceCatalog,
@@ -36,10 +39,68 @@ pub struct ConfiguredModelRegistration {
     pub create: ConfiguredModelConstructor,
 }
 
+/// Creates one PCI endpoint declaration and its build-time model.
+pub type ConfiguredPciModelConstructor =
+    for<'a> fn(
+        DeviceNodeId,
+        &VirtualDeviceRequest,
+        &'a DeviceInstantiationContext,
+    ) -> Result<ConfiguredPciEndpoint, ConfiguredDeviceError>;
+
+/// One explicit PCI endpoint catalog entry.
+#[derive(Clone, Copy)]
+pub struct ConfiguredPciModelRegistration {
+    pub model: &'static str,
+    pub create: ConfiguredPciModelConstructor,
+}
+
+/// Typed PCI attachment returned by a configured endpoint constructor.
+pub struct ConfiguredPciEndpoint {
+    function: PciFunctionSpec,
+    model: Arc<dyn PciEndpointModel>,
+}
+
+impl ConfiguredPciEndpoint {
+    /// Pairs one pure PCI function declaration with its build-time model.
+    pub fn new(function: PciFunctionSpec, model: Arc<dyn PciEndpointModel>) -> Self {
+        Self { function, model }
+    }
+
+    /// Returns the pure function declaration.
+    pub const fn function(&self) -> &PciFunctionSpec {
+        &self.function
+    }
+
+    /// Splits this attachment into its declaration and build-time model.
+    pub fn into_parts(self) -> (PciFunctionSpec, Arc<dyn PciEndpointModel>) {
+        (self.function, self.model)
+    }
+}
+
+impl fmt::Debug for ConfiguredPciEndpoint {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ConfiguredPciEndpoint")
+            .field("function", &self.function)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone, Copy)]
+enum RegisteredModelKind {
+    Platform(ConfiguredModelRegistration),
+    Pci(ConfiguredPciModelRegistration),
+}
+
 #[derive(Clone)]
 struct RegisteredModel {
     owner: &'static str,
-    registration: ConfiguredModelRegistration,
+    kind: RegisteredModelKind,
+}
+
+pub(crate) enum ConfiguredDeviceAttachment {
+    Platform(DeviceNodeSpec),
+    Pci(ConfiguredPciEndpoint),
 }
 
 #[derive(Clone, Debug)]
@@ -215,7 +276,32 @@ impl ConfiguredDeviceCatalog {
             name.into(),
             RegisteredModel {
                 owner,
-                registration,
+                kind: RegisteredModelKind::Platform(registration),
+            },
+        );
+        Ok(())
+    }
+
+    /// Registers a configured model that attaches below an architecture PCI bus.
+    pub fn register_pci_model(
+        &mut self,
+        owner: &'static str,
+        registration: ConfiguredPciModelRegistration,
+    ) -> Result<(), ConfiguredDeviceError> {
+        let name = registration.model;
+        validate_model_name(name)?;
+        if let Some(existing) = self.registrations.get(name) {
+            return Err(ConfiguredDeviceError::DuplicateModel {
+                model: name.into(),
+                first_owner: existing.owner.into(),
+                duplicate_owner: owner.into(),
+            });
+        }
+        self.registrations.insert(
+            name.into(),
+            RegisteredModel {
+                owner,
+                kind: RegisteredModelKind::Pci(registration),
             },
         );
         Ok(())
@@ -239,18 +325,52 @@ impl ConfiguredDeviceCatalog {
         request: &VirtualDeviceRequest,
         context: &DeviceInstantiationContext,
     ) -> Result<DeviceNodeSpec, ConfiguredDeviceError> {
-        let id = DeviceNodeId::new(request.id.clone()).map_err(|error| {
-            ConfiguredDeviceError::InvalidDeviceId {
-                device: request.id.clone(),
-                detail: std::format!("{error}"),
+        let id = request_device_id(request)?;
+        match self
+            .registrations
+            .get(&request.model)
+            .map(|model| model.kind)
+        {
+            Some(RegisteredModelKind::Platform(registration)) => {
+                (registration.create)(id, request, context)
             }
-        })?;
-        let registration = self.registrations.get(&request.model).ok_or_else(|| {
-            ConfiguredDeviceError::UnknownVirtualDeviceModel {
-                model: request.model.clone(),
+            Some(RegisteredModelKind::Pci(_)) => Err(attachment_mismatch(request, "platform")),
+            None => Err(unknown_model(request)),
+        }
+    }
+
+    pub(crate) fn instantiate(
+        &self,
+        request: &VirtualDeviceRequest,
+        context: &DeviceInstantiationContext,
+    ) -> Result<ConfiguredDeviceAttachment, ConfiguredDeviceError> {
+        let id = request_device_id(request)?;
+        match self
+            .registrations
+            .get(&request.model)
+            .map(|model| model.kind)
+        {
+            Some(RegisteredModelKind::Platform(registration)) => {
+                (registration.create)(id, request, context)
+                    .map(ConfiguredDeviceAttachment::Platform)
             }
-        })?;
-        (registration.registration.create)(id, request, context)
+            Some(RegisteredModelKind::Pci(registration)) => {
+                let requested_id = id.clone();
+                let endpoint = (registration.create)(id, request, context)?;
+                if endpoint.function().id() != &requested_id {
+                    return Err(ConfiguredDeviceError::Instantiation {
+                        device: request.id.clone(),
+                        model: request.model.clone(),
+                        detail: std::format!(
+                            "PCI constructor returned function id '{}'",
+                            endpoint.function().id()
+                        ),
+                    });
+                }
+                Ok(ConfiguredDeviceAttachment::Pci(endpoint))
+            }
+            None => Err(unknown_model(request)),
+        }
     }
 }
 
@@ -298,6 +418,38 @@ pub enum ConfiguredDeviceError {
     },
     #[error("invalid virtual device id '{device}': {detail}")]
     InvalidDeviceId { device: String, detail: String },
+    #[error("virtual device '{device}' ({model}) is not attached as a {expected} device")]
+    ModelAttachmentMismatch {
+        device: String,
+        model: String,
+        expected: &'static str,
+    },
+}
+
+fn request_device_id(
+    request: &VirtualDeviceRequest,
+) -> Result<DeviceNodeId, ConfiguredDeviceError> {
+    DeviceNodeId::new(request.id.clone()).map_err(|error| ConfiguredDeviceError::InvalidDeviceId {
+        device: request.id.clone(),
+        detail: std::format!("{error}"),
+    })
+}
+
+fn unknown_model(request: &VirtualDeviceRequest) -> ConfiguredDeviceError {
+    ConfiguredDeviceError::UnknownVirtualDeviceModel {
+        model: request.model.clone(),
+    }
+}
+
+fn attachment_mismatch(
+    request: &VirtualDeviceRequest,
+    expected: &'static str,
+) -> ConfiguredDeviceError {
+    ConfiguredDeviceError::ModelAttachmentMismatch {
+        device: request.id.clone(),
+        model: request.model.clone(),
+        expected,
+    }
 }
 
 fn validate_model_name(name: &str) -> Result<(), ConfiguredDeviceError> {

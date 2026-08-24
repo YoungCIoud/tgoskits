@@ -58,6 +58,8 @@ catalog 由代码显式构造；`ConfiguredDeviceCatalog::new()` 始终为空，
 
 通用设备实现位于 `virtualization/axvm/src/configured/devices/`。新增只使用现有资源类型和固件 contribution 的通用设备时，只增加设备模块，并在该目录的显式注册文件添加 `mod` 与 `register()` 调用；不修改 Axvisor、VM config assembly、四架构 VM-exit 或 FDT/ACPI composer。
 
+PCI endpoint 使用并列的 additive `ConfiguredPciModelRegistration`，constructor 返回配对的纯 `PciFunctionSpec` 和 build-time `PciEndpointModel`，而不是伪装成顶层 `DeviceNodeSpec`。platform 和 PCI registration 共用 model-name namespace；architecture collection按注册类型显式分流，不扫描 model字符串或downcast。当前只有 AArch64 接受该 attachment，其他架构明确拒绝。
+
 `DeviceInstantiationContext` 只暴露架构和默认 wired/MSI 域等小型能力，不暴露架构内部对象、裸 IRQ 或设备管理器。
 
 ## dyn 设备模型
@@ -123,7 +125,11 @@ pub trait DeviceModel: Send + Sync {
 
 `DeviceBuildContext::irq()` 根据 controller ID 找到已注册的 `VirtualInterruptController`，取得 `WiredIrqInput` 并为当前设备创建独立 `IrqLine`。edge 只使用 `pulse()`；level 使用 `assert()/deassert()`；shared-level 按 source 聚合为 wired-OR，source drop 自动撤销断言。
 
-`DeviceBundle` 原子提交设备、controller、endpoint、typed service、grant、poller、lifecycle 和资源 lease。任一步失败都会恢复所有索引。controller bundle 必须先于依赖节点构建；全部节点成功且所有 claim 转为 lease 后才 seal runtime，seal 后拒绝注册。
+`DeviceBundle` 原子提交设备、controller、endpoint、typed service、grant、poller、lifecycle 和资源 lease。任一步失败都会恢复所有索引。bundle 还可在 crate 内部保活不可发现的 registration lease；该能力不形成 runtime service 或公共任意对象容器，当前只用于让 PCI function binding 与 endpoint bundle 同生共死。controller bundle 必须先于依赖节点构建；全部节点成功且所有 claim 转为 lease 后才 seal runtime，seal 后拒绝注册。
+
+虚拟 PCI 使用二阶段解析：architecture plan 先把 host 和各 endpoint 作为独立 graph node 加入，endpoint 显式依赖 host；通用 planner 先解析 host ECAM 和完整 memory aperture，PCI bus builder 再以这两个 resolved range 一次 freeze BDF/BAR topology。纯 `PciFunctionSpec` 不持有 runtime handler；endpoint model 在 `DeviceBuildContext` 中消费 MSI 等资源后才创建 handler，并把 root-complex binding lease 放入同一个 `DeviceBundle`。root 只保存 handler weak binding，bundle 注册、claim finish 或后续 VM preparation 失败时不会留下 stale function。固件和 runtime 读取同一份由 `ResolvedDeviceGraph` 派生的 resolved PCI bus，不扫描 model、不 downcast，也不建立全局 PCI registry。
+
+AArch64 仅在 typed PCI endpoint集合非空时创建 `pci-host`；host依赖VGIC/ITS，endpoint依赖host。1 MiB ECAM和64 MiB 32-bit non-prefetchable aperture进入现有AArch64 auto-MMIO pool，与RAM、控制器、串口和passthrough统一冲突检查。最终DTB从resolved bus派生 `pci-host-ecam-generic` 的 `reg`、`bus-range` 和identity-translated memory `ranges`；本阶段不生成INTx/MSI属性。已有PCI bridge、冲突top-level `reg`或没有DTB的PCI配置明确失败，不覆盖或fallback。
 
 ## 固件模型
 
@@ -149,7 +155,7 @@ vPLIC 在自己的 `Device::read/write` 成功后发布 VSEIP 状态；LoongArch
 
 ## 架构策略
 
-- AArch64 先创建 VGIC host replacement，再加入串口、共享 provider 和配置设备；同一 `ArmVgicConfig` 驱动 VGIC 与 FDT。主线 timer、LR 和物理 SPI 生命周期保持权威。
+- AArch64 先创建 VGIC host replacement，再加入串口、共享 provider 和配置设备；若存在typed PCI endpoint，则在通用graph resolve后一次freeze `Aarch64PciPlan`，构建顺序固定为VGIC/ITS → PCI host → endpoint，runtime和generic ECAM FDT消费同一resolved bus。同一 `ArmVgicConfig` 驱动 VGIC 与 FDT。主线 timer、LR 和物理 SPI 生命周期保持权威。
 - RISC-V 保留 PLIC hart/context 顺序，设备图只提供资源和注册事务。
 - x86 保留 LAPIC、IOAPIC、PIT、APIC access 和 PCI 路由顺序；直接启动 ACPI 与 fw_cfg ACPI 读取同一解析后计划。
 - LoongArch 保留 IOCSR、EXTIOI/PCH-PIC/PCH-MSI 级联和 MMIO fw_cfg；透传扣洞从最终图取得。

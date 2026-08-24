@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Add typed configured PCI endpoint registration and conditionally build the AArch64 generic ECAM host/FDT from resolved device resources.
+
 ### Fixed
 
 - Clear newly allocated IVC shared regions before publishing channel identity.

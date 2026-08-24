@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Add a typed virtual PCI Type-0/ECAM foundation with deterministic BDF/BAR planning and transactional resolved-device-graph integration.
+
 ## [0.6.0](https://github.com/rcore-os/tgoskits/compare/axdevice-v0.5.7...axdevice-v0.6.0) - 2026-08-20
 
 ### Added

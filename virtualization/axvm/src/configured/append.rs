@@ -10,26 +10,89 @@ pub struct DefaultVirtualDeviceIntent {
     pub firmware_identity: Option<DeviceFirmwareBinding>,
 }
 
+#[cfg(any(test, not(target_arch = "aarch64")))]
 pub(crate) fn append_configured_devices(
     config: &crate::config::AxVMConfig,
     nodes: &mut Vec<DeviceNodeSpec>,
     default_controller_node: &DeviceNodeId,
     default_controller: InterruptControllerId,
 ) -> AxVmResult {
+    let configured =
+        collect_configured_devices(config, default_controller_node, default_controller)?;
+    if !configured.pci_endpoints.is_empty() {
+        return Err(AxVmError::unsupported(
+            "attach configured PCI endpoints",
+            "the selected architecture has no virtual PCI host plan",
+        ));
+    }
+    nodes.extend(configured.platform_nodes);
+    Ok(())
+}
+
+pub(crate) struct ConfiguredDevices {
+    pub(crate) platform_nodes: Vec<DeviceNodeSpec>,
+    pub(crate) pci_endpoints: Vec<ConfiguredPciEndpoint>,
+}
+
+pub(crate) fn collect_configured_devices(
+    config: &crate::config::AxVMConfig,
+    default_controller_node: &DeviceNodeId,
+    default_controller: InterruptControllerId,
+) -> AxVmResult<ConfiguredDevices> {
     let base_context = DeviceInstantiationContext::new()
         .with_vm_id(config.id())
         .with_default_wired_controller(default_controller_node.clone(), default_controller);
     let default = default_serial_intent(config, default_controller)?;
-    let request = config
+    let console_request = config
         .virtual_device_requests()
         .iter()
         .find(|request| request.id == "console0")
         .unwrap_or(&default.request);
-    if !crate::machine::is_serial_model(&request.model) {
+    if !crate::machine::is_serial_model(&console_request.model) {
         return Err(AxVmError::invalid_config(
             "console0 must use a registered virtual serial model",
         ));
     }
+
+    let mut configured = ConfiguredDevices {
+        platform_nodes: std::vec![instantiate_console(
+            config,
+            &base_context,
+            &default,
+            console_request,
+        )?],
+        pci_endpoints: Vec::new(),
+    };
+    let mut host_console_owners = usize::from(serial_uses_host_console(console_request, true)?);
+    for request in config
+        .virtual_device_requests()
+        .iter()
+        .filter(|request| request.id != "console0")
+    {
+        let context = device_context(config, &base_context, request, &mut host_console_owners)?;
+        match config
+            .virtual_device_catalog()
+            .instantiate(request, &context)
+            .map_err(configured_error)?
+        {
+            ConfiguredDeviceAttachment::Platform(node) => configured.platform_nodes.push(node),
+            ConfiguredDeviceAttachment::Pci(endpoint) => configured.pci_endpoints.push(endpoint),
+        }
+    }
+    if host_console_owners > 1 {
+        return Err(AxVmError::invalid_config(
+            "only one virtual serial device may own the host console backend",
+        ));
+    }
+    Ok(configured)
+}
+
+fn instantiate_console(
+    config: &crate::config::AxVMConfig,
+    base_context: &DeviceInstantiationContext,
+    default: &DefaultVirtualDeviceIntent,
+    request: &VirtualDeviceRequest,
+) -> AxVmResult<DeviceNodeSpec> {
     let compatible = request.model == default.request.model;
     let (fixed_resources, firmware_binding) = if compatible {
         (
@@ -46,46 +109,31 @@ pub(crate) fn append_configured_devices(
         firmware_binding,
         true,
     );
-    nodes.push(
-        config
-            .virtual_device_catalog()
-            .instantiate_node(request, &context)
-            .map_err(configured_error)?,
-    );
+    config
+        .virtual_device_catalog()
+        .instantiate_node(request, &context)
+        .map_err(configured_error)
+}
 
-    let mut host_console_owners = usize::from(serial_uses_host_console(request, true)?);
-    for request in config
-        .virtual_device_requests()
-        .iter()
-        .filter(|request| request.id != "console0")
-    {
-        let context = if crate::machine::is_serial_model(&request.model) {
-            if serial_uses_host_console(request, false)? {
-                host_console_owners += 1;
-            }
-            base_context.clone().with_serial_defaults(
-                crate::machine::default_serial_profile(&request.model),
-                config.serial_backend_factory(),
-                FixedDeviceBindings::default(),
-                DeviceFirmwareBinding::None,
-                false,
-            )
-        } else {
-            base_context.clone()
-        };
-        nodes.push(
-            config
-                .virtual_device_catalog()
-                .instantiate_node(request, &context)
-                .map_err(configured_error)?,
-        );
-    }
-    if host_console_owners > 1 {
-        return Err(AxVmError::invalid_config(
-            "only one virtual serial device may own the host console backend",
+fn device_context(
+    config: &crate::config::AxVMConfig,
+    base_context: &DeviceInstantiationContext,
+    request: &VirtualDeviceRequest,
+    host_console_owners: &mut usize,
+) -> AxVmResult<DeviceInstantiationContext> {
+    if crate::machine::is_serial_model(&request.model) {
+        if serial_uses_host_console(request, false)? {
+            *host_console_owners += 1;
+        }
+        return Ok(base_context.clone().with_serial_defaults(
+            crate::machine::default_serial_profile(&request.model),
+            config.serial_backend_factory(),
+            FixedDeviceBindings::default(),
+            DeviceFirmwareBinding::None,
+            false,
         ));
     }
-    Ok(())
+    Ok(base_context.clone())
 }
 
 fn default_serial_intent(

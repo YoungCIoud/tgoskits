@@ -42,6 +42,10 @@ mod timer;
 mod vcpu;
 mod vm;
 
+#[cfg(all(test, not(target_arch = "aarch64")))]
+#[path = "arch/aarch64/pci_plan.rs"]
+mod aarch64_pci_plan_tests;
+
 pub mod config;
 
 pub use ax_cpumask::CpuMask;
@@ -52,7 +56,8 @@ pub use axvm_types::{
 };
 pub use configured::{
     ConfiguredDeviceCatalog, ConfiguredDeviceError, ConfiguredModelConstructor,
-    ConfiguredModelRegistration, DefaultVirtualDeviceIntent, DeviceInstantiationContext,
+    ConfiguredModelRegistration, ConfiguredPciEndpoint, ConfiguredPciModelConstructor,
+    ConfiguredPciModelRegistration, DefaultVirtualDeviceIntent, DeviceInstantiationContext,
     FixedDeviceBindings, FixedWiredBinding,
 };
 pub use error::{AxVmError, AxVmResult};
