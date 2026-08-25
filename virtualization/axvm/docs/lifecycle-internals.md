@@ -234,7 +234,10 @@ crate 内部的 `AxVM::prepare_resources_with()` 重建 vCPU/设备/中断结构
 最终调用 `AxVM::prepare_resources_with()` 完成同等重建。即 `reset` 路径
 `reset_transient_resources` 会执行两次（幂等）。幂等性由实现保证：每次调用都是**完全重建、非
 增量**——`devices.take()` 后重置、`address_space.clear()` 后按 `memory_regions`
-全量重映射、`vcpu_list`/`interrupt_controller`/`address_layout` 置 `None`；
+全量重映射（每个区域按自身 `VmRegionKind` 的权限位重装：普通 RAM 为
+READ|WRITE|EXECUTE|USER，固件 CODE 区域 `FirmwareRom` 不含 WRITE，因此 UEFI
+VARS 内容跨 reset 保留而 CODE 始终只读）、`vcpu_list`/`interrupt_controller`/
+`address_layout` 置 `None`；
 重复调用等价于单次调用，不积累状态。外部视角二者都是 warm reboot——lifecycle.md §4
 已写明 start()-from-Stopped 同样"重新初始化 vCPU/设备/中断架构"、"重映射复用同一批 backing page"，
 两份文档一致（不存在"仅重建 runtime"的旧表述）。

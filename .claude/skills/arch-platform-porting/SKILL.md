@@ -140,6 +140,18 @@ Current Axvisor LoongArch QEMU bring-up uses the dynamic UEFI platform path. The
   AMD/SVM QEMU cases because their host CPU exposure differs, but neither case may select a
   Cargo `vmx` or `svm` feature. Both cases must use the same backend-neutral guest baseline so
   their result isolates the runtime CPUID-selected virtualization path.
+- **Axvisor UEFI guest firmware window**: the guest firmware window at `bios_load_addr`
+  defaults to a uniform RAM-backed mapping whose contents are rewritten whenever the loader
+  runs, so OVMF variable writes do not persist. Setting optional `kernel.bios_vars_size`
+  (non-zero, page-aligned) in the guest TOML splits the assembled `[VARS prefix][CODE]` image:
+  the VARS prefix at the window base becomes VM-owned RAM seeded once at VM create and kept
+  across guest resets (stage-2 re-maps restore each region's own permissions), while CODE maps
+  read-only (`VmRegionKind::FirmwareRom`, no stage-2 WRITE) and the whole window is declared
+  `Reserved` in etc/e820 instead of usable RAM. The boundary must not exceed the window region,
+  which must be `MapAlloc`; keep it unset to preserve legacy behavior byte-for-byte. For
+  qemu-acpi-ovmf cases, `AXVISOR_TEST_X86_OVMF_VARS_SIZE` in the build TOML must match the
+  guest's `bios_vars_size`; axbuild verifies it against the assembled OVMF vars prefix before
+  boot.
 - **someboot arch layer**: implement or audit entry, relocation, BSS clearing, stack setup, memory map parsing, paging, trap vectors, timer, IRQ, power, SMP, and address translation.
 - **CPU-local startup**: the final ELF carries exactly one `.percpu.template` plus
   `.percpu.init` and `.percpu.align`; it never carries a linked runtime area or compatibility
