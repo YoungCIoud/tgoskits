@@ -448,7 +448,7 @@ fn parse_smbios_tables(tables: &[u8]) -> Vec<ParsedSmbiosStructure> {
 fn expected_smbios_types(cpu_num: u16) -> Vec<u8> {
     [0u8, 1, 3]
         .into_iter()
-        .chain(core::iter::repeat(4).take(cpu_num as usize))
+        .chain(core::iter::repeat_n(4, cpu_num as usize))
         .chain([127])
         .collect()
 }
@@ -471,8 +471,14 @@ fn smbios_anchor_signature_length_and_checksum_sum_to_zero() {
     assert_eq!(checksum, 0, "all 24 anchor bytes must sum to zero");
 
     let rebuilt = build_smbios_blobs(1);
-    assert_eq!(blobs.anchor, rebuilt.anchor, "anchor build is deterministic");
-    assert_eq!(blobs.tables, rebuilt.tables, "tables build is deterministic");
+    assert_eq!(
+        blobs.anchor, rebuilt.anchor,
+        "anchor build is deterministic"
+    );
+    assert_eq!(
+        blobs.tables, rebuilt.tables,
+        "tables build is deterministic"
+    );
 }
 
 #[test]
@@ -537,7 +543,10 @@ fn smbios_tables_walk_yields_expected_types_handles_and_lengths() {
         "handles must be unique across all structures"
     );
 
-    let walked: usize = structures.iter().map(|structure| structure.total_length).sum();
+    let walked: usize = structures
+        .iter()
+        .map(|structure| structure.total_length)
+        .sum();
     assert_eq!(walked, blobs.tables.len(), "walk must end at blob end");
 }
 
@@ -584,6 +593,8 @@ fn smbios_string_sets_encode_null_terminators_and_empty_set_edge() {
             3 => {
                 assert_eq!(structure.strings, ["TGOSKITS"]);
             }
+            // Processor string sets were validated above.
+            4 => {}
             127 => {
                 assert!(structure.strings.is_empty(), "end-of-table has no strings");
                 assert_eq!(
