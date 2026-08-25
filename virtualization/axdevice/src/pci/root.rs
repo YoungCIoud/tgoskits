@@ -5,13 +5,13 @@
 //! runtime identities, and lifecycle callbacks are introduced by later
 //! integration layers.
 
-use alloc::sync::Arc;
+use alloc::{collections::BTreeMap, string::ToString, sync::Arc};
 use core::{fmt, ops::Range};
 
 use ax_sync::SpinLock;
 
 use super::{
-    FOUR_GIB, PciBarIndex, PciBdf, PciResult, ResolvedPciTopology,
+    EndpointRouteToken, FOUR_GIB, PciBarIndex, PciBdf, PciError, PciResult, ResolvedPciTopology,
     config::{BarWriteAction, FunctionState},
 };
 use crate::{AccessWidth, ConfigOffset};
@@ -33,13 +33,20 @@ impl PciRootState {
             })
             .collect();
         Self {
-            state: SpinLock::new(RootState { functions }),
+            state: SpinLock::new(RootState {
+                functions,
+                bindings: BTreeMap::new(),
+            }),
             topology,
         }
     }
 
     /// Returns the immutable topology that produced this root state.
     pub fn topology(&self) -> &ResolvedPciTopology {
+        &self.topology
+    }
+
+    pub(crate) fn topology_arc(&self) -> &Arc<ResolvedPciTopology> {
         &self.topology
     }
 
@@ -114,25 +121,46 @@ impl PciRootState {
     pub fn resolve_bar(&self, address: u64, width: AccessWidth) -> Option<PciBarRoute> {
         let access_end = address.checked_add(width.size() as u64)?;
         let state = self.state.lock_irqsave();
-        for function in &state.functions {
-            if !function.memory_decode_enabled() {
-                continue;
-            }
-            for bar in function.bars() {
-                let Some(range) = bar.range() else {
-                    continue;
-                };
-                if range.start <= address && access_end <= range.end {
-                    return Some(PciBarRoute {
-                        bdf: function.bdf(),
-                        bar: bar.index(),
-                        offset: address - range.start,
-                        width,
-                    });
-                }
-            }
+        resolve_route(&state.functions, address, access_end, width).map(|(_, route)| route)
+    }
+
+    pub(crate) fn resolve_bound_bar(
+        &self,
+        address: u64,
+        width: AccessWidth,
+    ) -> Option<(EndpointRouteToken, PciBarRoute)> {
+        let access_end = address.checked_add(width.size() as u64)?;
+        let state = self.state.lock_irqsave();
+        let (bdf, route) = resolve_route(&state.functions, address, access_end, width)?;
+        Some((*state.bindings.get(&bdf)?, route))
+    }
+
+    pub(crate) fn bind_endpoint(
+        &self,
+        function_id: &crate::DeviceNodeId,
+        token: EndpointRouteToken,
+    ) -> PciResult {
+        let function =
+            self.topology
+                .function(function_id)
+                .ok_or_else(|| PciError::UnknownFunction {
+                    function: function_id.to_string(),
+                })?;
+        let mut state = self.state.lock_irqsave();
+        if state.bindings.contains_key(&function.bdf()) {
+            return Err(PciError::FunctionAlreadyBound {
+                function: function_id.to_string(),
+            });
         }
-        None
+        state.bindings.insert(function.bdf(), token);
+        Ok(())
+    }
+
+    pub(crate) fn unbind_endpoint(&self, token: EndpointRouteToken) {
+        self.state
+            .lock_irqsave()
+            .bindings
+            .retain(|_, registered| *registered != token);
     }
 
     /// Restores every function's root-owned power-on config and BAR route.
@@ -141,6 +169,35 @@ impl PciRootState {
             function.reset();
         }
     }
+}
+
+fn resolve_route(
+    functions: &[FunctionState],
+    address: u64,
+    access_end: u64,
+    width: AccessWidth,
+) -> Option<(PciBdf, PciBarRoute)> {
+    for function in functions {
+        if !function.memory_decode_enabled() {
+            continue;
+        }
+        for bar in function.bars() {
+            let Some(range) = bar.range() else { continue };
+            if range.start <= address && access_end <= range.end {
+                let bdf = function.bdf();
+                return Some((
+                    bdf,
+                    PciBarRoute {
+                        bdf,
+                        bar: bar.index(),
+                        offset: address - range.start,
+                        width,
+                    },
+                ));
+            }
+        }
+    }
+    None
 }
 
 impl fmt::Debug for PciRootState {
@@ -154,6 +211,7 @@ impl fmt::Debug for PciRootState {
 
 struct RootState {
     functions: alloc::vec::Vec<FunctionState>,
+    bindings: BTreeMap<PciBdf, EndpointRouteToken>,
 }
 
 impl RootState {

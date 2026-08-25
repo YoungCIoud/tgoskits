@@ -6,7 +6,7 @@ use alloc::{
     vec::Vec,
 };
 
-use super::*;
+use super::{resolved::ResolvedPciHost, *};
 use crate::*;
 
 /// Mutable architecture-owned device graph construction surface.
@@ -260,7 +260,7 @@ fn resolve_pci_topologies(
     nodes: &[DeclaredDeviceNode],
     providers: &BTreeMap<PciHostKey, DeclaredPciHost>,
     plan: &VmResourcePlan,
-) -> DeviceManagerResult<BTreeMap<PciHostKey, alloc::sync::Arc<ResolvedPciTopology>>> {
+) -> DeviceManagerResult<BTreeMap<PciHostKey, ResolvedPciHost>> {
     let mut resolved = BTreeMap::new();
     for (key, provider) in providers {
         let (base, size) = plan
@@ -291,7 +291,13 @@ fn resolve_pci_topologies(
         }
         let mut topology = topology.resolve(base..end)?;
         topology.assign_graph_ownership(&provider.host_id, &endpoints);
-        resolved.insert(key.clone(), alloc::sync::Arc::new(topology));
+        resolved.insert(
+            key.clone(),
+            ResolvedPciHost {
+                host_id: provider.host_id.clone(),
+                topology: alloc::sync::Arc::new(topology),
+            },
+        );
     }
     Ok(resolved)
 }

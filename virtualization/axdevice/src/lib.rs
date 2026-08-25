@@ -81,8 +81,9 @@ pub use model::{
     FdtContributionSpec, FdtNodeSpec,
 };
 pub use pci::{
-    ConfigOffset, PciBarIndex, PciBarRoute, PciBdf, PciClass, PciEndpointIdentity, PciError,
-    PciFunctionRequirement, PciFunctionSpec, PciHostKey, PciHostProvider, PciMemoryBar, PciResult,
+    ConfigOffset, EndpointRouteToken, PciBarAccess, PciBarIndex, PciBarRoute, PciBdf, PciClass,
+    PciEndpointIdentity, PciError, PciFunction, PciFunctionRequirement, PciFunctionSpec,
+    PciHostKey, PciHostProvider, PciMemoryBar, PciResult, PciRootBinding, PciRootBindingKey,
     PciRootState, PciSegment, PciTopologyBuilder, ResolvedPciBar, ResolvedPciFunction,
     ResolvedPciTopology,
 };

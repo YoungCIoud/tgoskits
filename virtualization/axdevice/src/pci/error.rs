@@ -47,6 +47,18 @@ pub enum PciError {
         /// Stable function identity.
         function: String,
     },
+    /// Runtime binding named a function absent from the resolved topology.
+    #[error("PCI function {function} is absent from the resolved topology")]
+    UnknownFunction {
+        /// Missing graph function identity.
+        function: String,
+    },
+    /// A resolved function already has an active runtime binding.
+    #[error("PCI function {function} already has an active runtime binding")]
+    FunctionAlreadyBound {
+        /// Already-bound graph function identity.
+        function: String,
+    },
     /// Two functions request the same BDF.
     #[error("PCI BDF {bdf} is requested by both {first} and {second}")]
     DuplicateBdf {
