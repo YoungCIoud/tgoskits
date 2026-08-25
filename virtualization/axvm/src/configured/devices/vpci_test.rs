@@ -56,7 +56,7 @@ impl DeviceModel for VpciTestModel {
         let bar = PciMemoryBar::new(PciBarIndex::new(BAR_INDEX)?, BAR_SIZE as u64)?;
         let requirement = PciFunctionRequirement::new(
             PciHostKey::new(HOST_KEY)?,
-            PciEndpointIdentity::new(VENDOR_ID, DEVICE_ID, PciClass::new(0x06, 0x00, 0x00)),
+            PciEndpointIdentity::new(VENDOR_ID, DEVICE_ID, PciClass::new(0x05, 0x00, 0x00)),
         )
         .with_bar(bar)?;
         DeviceRequirements::new().with_pci_function(requirement)
@@ -201,7 +201,7 @@ mod tests {
         assert_eq!(function.host().as_str(), HOST_KEY);
         let expected = PciFunctionRequirement::new(
             PciHostKey::new(HOST_KEY).unwrap(),
-            PciEndpointIdentity::new(VENDOR_ID, DEVICE_ID, PciClass::new(0x06, 0, 0)),
+            PciEndpointIdentity::new(VENDOR_ID, DEVICE_ID, PciClass::new(0x05, 0, 0)),
         )
         .with_bar(PciMemoryBar::new(PciBarIndex::new(BAR_INDEX).unwrap(), BAR_SIZE as u64).unwrap())
         .unwrap();

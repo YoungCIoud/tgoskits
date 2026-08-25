@@ -1,0 +1,31 @@
+# Backend-neutral Linux guest baseline for the generic vPCI enumeration case.
+# CI supplies the pinned Debian rootfs image and creates `rootfs.img` next to
+# the kernel below. Axvisor's test runner then infers that image for the QEMU
+# disk without selecting a backend-specific guest configuration.
+[base]
+id = 1
+name = "linux-x86-pci-enumeration"
+guest_type = "passthrough"
+cpu_num = 1
+phys_cpu_ids = [1]
+
+[kernel]
+entry_point = 0x8000
+image_location = "memory"
+kernel_path = "${workspace}/tmp/axbuild/images/qemu-x86_64/linux/linux-qemu"
+kernel_load_addr = 0x20_0000
+enable_bios = false
+boot_protocol = "direct"
+cmdline = "console=ttyS0 root=/dev/vda ro rootwait devtmpfs.mount=1 init=/sbin/getty pci=conf1 pci=nomsi irqpoll nox2apic tsc=unstable no_timer_check initcall_blacklist=ahci_pci_driver_init,i8042_init -- -n -l /bin/sh -L 115200 ttyS0"
+memory_regions = [
+    [0x0000_0000, 0x0800_0000, 0x7, 1],
+    [0x0000_0000, 0x0010_0000, 0x7, 0],
+]
+
+[devices]
+passthrough = []
+disabled = []
+
+[[devices.virtual]]
+id = "vpci-test0"
+model = "vpci-test"
