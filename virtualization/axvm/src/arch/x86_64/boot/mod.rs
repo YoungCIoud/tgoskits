@@ -2,7 +2,9 @@
 
 use std::{format, sync::Arc, vec::Vec};
 
-use axdevice::{FwCfgKernelPayload, FwCfgNonRamRegion, FwCfgPlatformConfig, FwCfgRamRegion};
+use axdevice::{
+    E820NonRamType, FwCfgKernelPayload, FwCfgNonRamRegion, FwCfgPlatformConfig, FwCfgRamRegion,
+};
 use axvm_types::GuestPhysAddr;
 use axvmconfig::{VMBootProtocol, VmMemMappingType};
 
@@ -199,7 +201,7 @@ fn load_boot_image_from_memory(loader: &ImageLoaderCore<'_>, bios: Option<&[u8]>
         let load_gpa = loader
             .bios_load_gpa
             .ok_or_else(|| ax_err_type!(NotFound, "boot firmware load address is missing"))?;
-        load_vm_image_from_memory(bios, load_gpa, loader.vm.clone())?;
+        load_boot_firmware_blob(loader, bios, load_gpa)?;
         if should_patch_multiboot_info(&loader.config) {
             load_multiboot_info(loader, bios, load_gpa)?;
         }
@@ -211,7 +213,7 @@ fn load_boot_image_from_memory(loader: &ImageLoaderCore<'_>, bios: Option<&[u8]>
     }
     if should_load_default_boot_image(loader) {
         let load_gpa = builtin_bios_load_gpa(loader.bios_load_gpa)?;
-        load_vm_image_from_memory(multiboot::DEFAULT_BIOS_IMAGE, load_gpa, loader.vm.clone())?;
+        load_boot_firmware_blob(loader, multiboot::DEFAULT_BIOS_IMAGE, load_gpa)?;
         load_multiboot_info(loader, multiboot::DEFAULT_BIOS_IMAGE, load_gpa)?;
     }
     Ok(())
@@ -226,22 +228,17 @@ fn load_boot_image_from_filesystem(loader: &ImageLoaderCore<'_>) -> AxVmResult {
         let load_gpa = loader
             .bios_load_gpa
             .ok_or_else(|| ax_err_type!(NotFound, "boot firmware load address is missing"))?;
+        let bios = crate::boot::images::fs::read_full_image(path, loader.provider)?;
         if should_patch_multiboot_info(&loader.config) {
-            let bios = crate::boot::images::fs::read_full_image(path, loader.provider)?;
             validate_bios_patch_region(&bios)?;
-            load_vm_image_from_memory(&bios, load_gpa, loader.vm.clone())?;
+            load_boot_firmware_blob(loader, &bios, load_gpa)?;
             load_multiboot_info(loader, &bios, load_gpa)
         } else {
-            crate::boot::images::fs::load_vm_image(
-                path,
-                load_gpa,
-                loader.vm.clone(),
-                loader.provider,
-            )
+            load_boot_firmware_blob(loader, &bios, load_gpa)
         }
     } else if should_load_default_boot_image(loader) {
         let load_gpa = builtin_bios_load_gpa(loader.bios_load_gpa)?;
-        load_vm_image_from_memory(multiboot::DEFAULT_BIOS_IMAGE, load_gpa, loader.vm.clone())?;
+        load_boot_firmware_blob(loader, multiboot::DEFAULT_BIOS_IMAGE, load_gpa)?;
         load_multiboot_info(loader, multiboot::DEFAULT_BIOS_IMAGE, load_gpa)
     } else {
         Ok(())
@@ -259,7 +256,8 @@ fn load_uefi_from_configured_path(loader: &ImageLoaderCore<'_>) -> AxVmResult {
         .ok_or_else(|| ax_err_type!(NotFound, "UEFI firmware load addr is missed"))?;
     #[cfg(any(feature = "fs", feature = "host-fs"))]
     {
-        crate::boot::images::fs::load_vm_image(path, load_gpa, loader.vm.clone(), loader.provider)
+        let bios = crate::boot::images::fs::read_full_image(path, loader.provider)?;
+        load_boot_firmware_blob(loader, &bios, load_gpa)
     }
     #[cfg(not(any(feature = "fs", feature = "host-fs")))]
     {
@@ -269,6 +267,63 @@ fn load_uefi_from_configured_path(loader: &ImageLoaderCore<'_>) -> AxVmResult {
             "UEFI firmware path requires the fs feature when no firmware image buffer is available"
         )
     }
+}
+
+/// Returns the writable VARS prefix size configured for the firmware window.
+///
+/// `None` keeps the legacy behavior where the whole blob is loaded as one
+/// uniform chunk.
+fn firmware_vars_boundary(loader: &ImageLoaderCore<'_>) -> Option<usize> {
+    loader.config.kernel.bios_vars_size
+}
+
+/// Splits a boot-firmware blob into the `(GPA, chunk)` writes that install it.
+///
+/// Assembled UEFI images are laid out as `[VARS prefix][CODE]` (see
+/// `assemble_ovmf_image` in scripts/axbuild), so with a configured boundary the
+/// VARS prefix is written at the window base and CODE right above it. Without
+/// a boundary the blob is one chunk at the window base (legacy behavior).
+fn firmware_blob_chunks(
+    blob: &[u8],
+    vars_size: Option<usize>,
+    load_gpa: GuestPhysAddr,
+) -> AxVmResult<Vec<(GuestPhysAddr, &[u8])>> {
+    let Some(vars_size) = vars_size else {
+        return Ok(vec![(load_gpa, blob)]);
+    };
+    let Some((vars, code)) = blob.split_at_checked(vars_size) else {
+        return Err(ax_err_type!(
+            InvalidInput,
+            format!(
+                "firmware image {:#x} bytes is shorter than the bios_vars_size prefix \
+                 {vars_size:#x}",
+                blob.len()
+            )
+        ));
+    };
+    Ok(vec![
+        (load_gpa, vars),
+        (GuestPhysAddr::from(load_gpa.as_usize() + vars_size), code),
+    ])
+}
+
+/// Installs a boot-firmware blob into the firmware window.
+///
+/// The copies go through host-side translated guest buffers and are not
+/// restricted by stage-2 permissions, so seeding VARS and copying CODE works
+/// even though CODE maps read-only to the guest. The loader runs once at VM
+/// create; guest reset never re-runs it, which is what makes VARS contents
+/// reset-persistent.
+fn load_boot_firmware_blob(
+    loader: &ImageLoaderCore<'_>,
+    blob: &[u8],
+    load_gpa: GuestPhysAddr,
+) -> AxVmResult {
+    for (chunk_gpa, chunk) in firmware_blob_chunks(blob, firmware_vars_boundary(loader), load_gpa)?
+    {
+        load_vm_image_from_memory(chunk, chunk_gpa, loader.vm.clone())?;
+    }
+    Ok(())
 }
 
 fn adjust_linux_dma_identity_layout(loader: &mut ImageLoaderCore<'_>) {
@@ -392,6 +447,7 @@ fn prepare_x86_firmware(
         AxVmError::invalid_config(format!("invalid resolved x86 fw_cfg resources: {error}"))
     })?;
     let ram_regions = fw_cfg_ram_regions(loader);
+    let non_ram_regions = fw_cfg_non_ram_regions(loader);
     loader.vm.add_fw_cfg_device(crate::FwCfgDeviceConfig {
         base: GuestPhysAddr::from(fw_cfg_base),
         size: fw_cfg_size,
@@ -402,10 +458,10 @@ fn prepare_x86_firmware(
             .map_err(|_| AxVmError::invalid_config("x86 fw_cfg CPU count exceeds 16 bits"))?,
         platform: FwCfgPlatformConfig {
             ram_regions: ram_regions.clone(),
-            // No non-RAM windows are declared yet: etc/e820 stays RAM-only until a
-            // platform declares e.g. a reserved EFI varstore window through
-            // `non_ram_regions`.
-            non_ram_regions: <Arc<[FwCfgNonRamRegion]>>::default(),
+            // With the writable-vars boundary the firmware window is declared
+            // Reserved so guests never allocate from CODE or the varstore;
+            // legacy configs keep an empty set.
+            non_ram_regions,
             srat_regions: ram_regions,
             acpi,
         },
@@ -414,12 +470,40 @@ fn prepare_x86_firmware(
 }
 
 fn fw_cfg_ram_regions(loader: &ImageLoaderCore<'_>) -> Arc<[FwCfgRamRegion]> {
-    let mut regions = loader
+    let excluded_base = firmware_ram_exclusion_base(loader);
+    fw_cfg_ram_region_list(
+        &loader.config.kernel.memory_regions,
+        &loader.main_memory,
+        excluded_base,
+    )
+}
+
+/// Returns the firmware window base to keep out of the etc/e820 RAM set when a
+/// writable-vars boundary is configured, or `None` for legacy configs.
+fn firmware_ram_exclusion_base(loader: &ImageLoaderCore<'_>) -> Option<usize> {
+    firmware_vars_boundary(loader)?;
+    let base = loader.bios_load_gpa?.as_usize();
+    loader
         .config
         .kernel
         .memory_regions
         .iter()
-        .filter(|region| region.map_type == VmMemMappingType::MapAlloc && region.size != 0)
+        .any(|region| region.gpa == base && region.size > 0)
+        .then_some(base)
+}
+
+fn fw_cfg_ram_region_list(
+    memory_regions: &[axvmconfig::VmMemConfig],
+    main_memory: &VMMemoryRegion,
+    excluded_base: Option<usize>,
+) -> Arc<[FwCfgRamRegion]> {
+    let mut regions = memory_regions
+        .iter()
+        .filter(|region| {
+            region.map_type == VmMemMappingType::MapAlloc
+                && region.size != 0
+                && Some(region.gpa) != excluded_base
+        })
         .map(|region| FwCfgRamRegion {
             base: region.gpa as u64,
             size: region.size as u64,
@@ -427,15 +511,54 @@ fn fw_cfg_ram_regions(loader: &ImageLoaderCore<'_>) -> Arc<[FwCfgRamRegion]> {
         .collect::<Vec<_>>();
     if !regions
         .iter()
-        .any(|region| region.base == loader.main_memory.gpa.as_usize() as u64)
+        .any(|region| region.base == main_memory.gpa.as_usize() as u64)
     {
         regions.push(FwCfgRamRegion {
-            base: loader.main_memory.gpa.as_usize() as u64,
-            size: loader.main_memory.size() as u64,
+            base: main_memory.gpa.as_usize() as u64,
+            size: main_memory.size() as u64,
         });
     }
     regions.sort_by_key(|region| region.base);
     regions.into()
+}
+
+/// Builds the non-RAM windows declared through etc/e820.
+///
+/// With a writable-vars boundary the whole firmware window is declared
+/// `Reserved`: the varstore prefix is guest-writable but must not be handed to
+/// the OS allocator, and CODE is read-only. Legacy configs declare nothing so
+/// the generated e820 stays byte-identical.
+fn fw_cfg_non_ram_regions(loader: &ImageLoaderCore<'_>) -> Arc<[FwCfgNonRamRegion]> {
+    match firmware_window_e820_entry(
+        &loader.config.kernel.memory_regions,
+        loader.bios_load_gpa,
+        firmware_vars_boundary(loader),
+    ) {
+        Some(entry) => Arc::from([entry]),
+        None => <Arc<[FwCfgNonRamRegion]>>::default(),
+    }
+}
+
+/// Locates the configured firmware window and turns it into an `etc/e820`
+/// reserved entry.
+///
+/// Returns `None` when no writable-vars boundary is configured or when no
+/// memory region sits at the firmware load GPA, keeping the legacy empty set.
+fn firmware_window_e820_entry(
+    memory_regions: &[axvmconfig::VmMemConfig],
+    bios_load_gpa: Option<GuestPhysAddr>,
+    vars_size: Option<usize>,
+) -> Option<FwCfgNonRamRegion> {
+    vars_size?;
+    let base = bios_load_gpa?.as_usize();
+    let window = memory_regions
+        .iter()
+        .find(|region| region.gpa == base && region.size > 0)?;
+    Some(FwCfgNonRamRegion {
+        base: window.gpa as u64,
+        size: window.size as u64,
+        memory_type: E820NonRamType::Reserved,
+    })
 }
 
 fn acpi_build_error(error: crate::boot::acpi::AcpiBuildError) -> AxVmError {
@@ -757,6 +880,130 @@ mod tests {
             crate::config::GuestBootPolicy::AdjustKernelForBootProtocol {
                 protocol: VMBootProtocol::Direct,
             }
+        );
+    }
+
+    const WINDOW_BASE: usize = 0xffc0_0000;
+    const VARS_SIZE: usize = 0x84_000;
+
+    #[test]
+    fn uefi_vars_boundary_splits_firmware_blob_at_prefix() {
+        let blob = vec![0xa5; VARS_SIZE + 0x1000];
+        let chunks =
+            firmware_blob_chunks(&blob, Some(VARS_SIZE), GuestPhysAddr::from(WINDOW_BASE)).unwrap();
+
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(
+            chunks[0],
+            (GuestPhysAddr::from(WINDOW_BASE), &blob[..VARS_SIZE])
+        );
+        assert_eq!(
+            chunks[1],
+            (
+                GuestPhysAddr::from(WINDOW_BASE + VARS_SIZE),
+                &blob[VARS_SIZE..]
+            )
+        );
+    }
+
+    #[test]
+    fn legacy_firmware_blob_stays_one_chunk() {
+        let blob = vec![0x5a; 0x2000];
+        let chunks = firmware_blob_chunks(&blob, None, GuestPhysAddr::from(WINDOW_BASE)).unwrap();
+
+        assert_eq!(chunks, [(GuestPhysAddr::from(WINDOW_BASE), &blob[..])]);
+    }
+
+    #[test]
+    fn firmware_blob_shorter_than_vars_prefix_is_rejected() {
+        let blob = vec![0x5a; VARS_SIZE - 1];
+        let error = firmware_blob_chunks(&blob, Some(VARS_SIZE), GuestPhysAddr::from(WINDOW_BASE));
+
+        assert!(error.is_err());
+    }
+
+    fn window_memory_region() -> axvmconfig::VmMemConfig {
+        axvmconfig::VmMemConfig {
+            gpa: WINDOW_BASE,
+            size: 0x40_0000,
+            flags: 0,
+            map_type: VmMemMappingType::MapAlloc,
+        }
+    }
+
+    #[test]
+    fn uefi_vars_boundary_declares_firmware_window_reserved() {
+        let entry = firmware_window_e820_entry(
+            &[window_memory_region()],
+            Some(GuestPhysAddr::from(WINDOW_BASE)),
+            Some(VARS_SIZE),
+        )
+        .unwrap();
+
+        assert_eq!(entry.base, WINDOW_BASE as u64);
+        assert_eq!(entry.size, 0x40_0000);
+        assert_eq!(entry.memory_type, E820NonRamType::Reserved);
+    }
+
+    #[test]
+    fn absent_vars_boundary_declares_no_non_ram_windows() {
+        assert_eq!(
+            firmware_window_e820_entry(
+                &[window_memory_region()],
+                Some(GuestPhysAddr::from(WINDOW_BASE)),
+                None
+            ),
+            None
+        );
+        // Also none when the boundary is set but no matching region exists.
+        assert_eq!(
+            firmware_window_e820_entry(
+                &[],
+                Some(GuestPhysAddr::from(WINDOW_BASE)),
+                Some(VARS_SIZE)
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn uefi_vars_boundary_excludes_window_from_fw_cfg_ram() {
+        let low_ram = axvmconfig::VmMemConfig {
+            gpa: 0,
+            size: 0x200_0000,
+            flags: 0,
+            map_type: VmMemMappingType::MapAlloc,
+        };
+        let main_memory = VMMemoryRegion {
+            gpa: GuestPhysAddr::from(0),
+            hva: axvm_types::HostVirtAddr::from(0),
+            layout: std::alloc::Layout::from_size_align(0x200_0000, 0x200_000).unwrap(),
+            needs_dealloc: false,
+            kind: crate::layout::VmRegionKind::Memory,
+        };
+
+        // Legacy: the firmware window rides in RAM as before.
+        let regions = fw_cfg_ram_region_list(
+            &[low_ram.clone(), window_memory_region()],
+            &main_memory,
+            None,
+        );
+        assert!(
+            regions
+                .iter()
+                .any(|region| region.base == WINDOW_BASE as u64)
+        );
+
+        // With the boundary, the window must not be declared usable RAM.
+        let regions = fw_cfg_ram_region_list(
+            &[low_ram, window_memory_region()],
+            &main_memory,
+            Some(WINDOW_BASE),
+        );
+        assert!(
+            !regions
+                .iter()
+                .any(|region| region.base == WINDOW_BASE as u64)
         );
     }
 }
