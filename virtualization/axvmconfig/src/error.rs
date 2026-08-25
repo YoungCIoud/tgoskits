@@ -44,6 +44,12 @@ pub enum AxVmConfigError {
         /// The boot protocol requiring a firmware load address.
         protocol: VMBootProtocol,
     },
+    /// The firmware variable-store prefix is not a positive page-aligned size.
+    #[error("bios_vars_size must be a non-zero multiple of the 4 KiB page size, but is {size:#x}")]
+    InvalidBiosVarsSize {
+        /// The rejected firmware variable-store prefix size in bytes.
+        size: usize,
+    },
     /// A physical-device selector is not an absolute, concrete device-tree path.
     #[error("physical device path must be absolute and must not select the root: {path}")]
     InvalidPhysicalDevicePath {

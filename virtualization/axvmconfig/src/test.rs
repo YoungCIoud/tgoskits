@@ -59,6 +59,10 @@ fn parses_structured_guest_config() {
         VmMemMappingType::MapIdentical
     );
 
+    // Legacy configs must keep parsing unchanged: no firmware window boundary
+    // unless the operator explicitly declares one.
+    assert_eq!(config.kernel.bios_vars_size, None);
+
     assert_eq!(
         config.devices.passthrough,
         vec![PhysicalDeviceRef {
@@ -71,6 +75,53 @@ fn parses_structured_guest_config() {
             path: "/soc/gpio@2000".into(),
         }]
     );
+}
+
+const UEFI_VARS_CONFIG: &str = r#"
+[base]
+id = 7
+name = "uefi-vars-guest"
+guest_type = "passthrough"
+cpu_num = 1
+
+[kernel]
+entry_point = 0xffff_fff0
+image_location = "memory"
+kernel_path = "bzImage"
+kernel_load_addr = 0x20_0000
+enable_bios = true
+boot_protocol = "uefi"
+uefi_firmware_path = "OVMF_CODE_4M.fd"
+bios_load_addr = 0xffc0_0000
+bios_vars_size = 0x84_000
+memory_regions = [
+    [0x0000_0000, 0x2000_0000, 0x7, 0],
+    [0xffc0_0000, 0x0040_0000, 0x7, 0],
+]
+
+[devices]
+passthrough = []
+disabled = []
+"#;
+
+#[test]
+fn bios_vars_size_parses_when_present() {
+    let config = GuestConfig::from_toml(UEFI_VARS_CONFIG).unwrap();
+
+    assert_eq!(config.kernel.bios_vars_size, Some(0x84_000));
+}
+
+#[test]
+fn bios_vars_size_rejects_unaligned_and_zero() {
+    for invalid in [0, 0x100] {
+        let raw = UEFI_VARS_CONFIG.replace("0x84_000", &format!("{invalid:#x}"));
+        let error = GuestConfig::from_toml(&raw).unwrap_err();
+        assert_eq!(
+            error,
+            AxVmConfigError::InvalidBiosVarsSize { size: invalid },
+            "bios_vars_size={invalid:#x} must be rejected as zero or unaligned"
+        );
+    }
 }
 
 #[test]

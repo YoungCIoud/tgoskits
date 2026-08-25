@@ -321,6 +321,18 @@ pub struct VMKernelConfig {
     pub uefi_firmware_path: Option<String>,
     /// The load address of the BIOS image, `None` if not used.
     pub bios_load_addr: Option<usize>,
+    /// Size in bytes of the writable UEFI variable-store prefix carved from the
+    /// front of the firmware window at `bios_load_addr`.
+    ///
+    /// The assembled firmware image must be laid out as `[VARS prefix][CODE]`,
+    /// matching `assemble_ovmf_image`. When set, AxVM splits the window into a
+    /// read-only CODE suffix and a RAM-backed VARS prefix whose contents are
+    /// seeded once at VM create and survive guest reset. When `None`, the whole
+    /// window keeps the legacy uniform mapping. Must be a non-zero multiple of
+    /// the 4 KiB page size; the caller validates it against the actual window
+    /// region size.
+    #[serde(default)]
+    pub bios_vars_size: Option<usize>,
     /// The file path of the device tree blob (DTB), `None` if not used.
     pub dtb_path: Option<String>,
     /// The load address of the device tree blob (DTB), `None` if not used.
@@ -377,6 +389,14 @@ impl VMKernelConfig {
     }
 
     fn validate_boot_config_for_arch(&self, arch: &str) -> AxVmConfigResult {
+        const BIOS_VARS_PAGE_SIZE: usize = 0x1000;
+
+        if let Some(size) = self.bios_vars_size
+            && (size == 0 || size % BIOS_VARS_PAGE_SIZE != 0)
+        {
+            return Err(AxVmConfigError::InvalidBiosVarsSize { size });
+        }
+
         let protocol = self.effective_boot_protocol();
         if !self.enable_bios {
             if protocol != VMBootProtocol::Direct {
