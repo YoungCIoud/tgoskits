@@ -282,6 +282,19 @@ Current Axvisor LoongArch QEMU bring-up uses the dynamic UEFI platform path. The
    polling policy in `axplat-dyn::PowerIf`, not in the someboot mechanism.
    On x86, encode SIPI as Linux `APIC_DM_STARTUP` (`0x600`); INIT level bits do not belong to SIPI.
    Keep this contract synchronized with `docs/design/someboot-secondary-cpu-startup.md`.
+9. Axvisor x86 guest APs start through INIT-SIPI, not the someboot transport: the emulated vLAPIC
+   accepts an INIT only when `!(trigger == LEVEL ∧ level == DEASSERT)`, puts the not-yet-running
+   target into a per-VM wait-for-SIPI gate owned by `axvm::arch::x86_64::smp`, and a SIPI consumes
+   that marker exactly once before starting the target through the shared
+   `architecture::cpu_up` flow at entry address `vector << 12`. The SIPI real-mode entry state
+   (`CS selector = vector << 8`, `CS base = vector << 12`, `IP = 0`) must be programmed on the
+   target thread inside backend `bind()` — never from the sender thread, whose current-VMCS
+   pointer a `vmptrld` of the AP's VMCS would clobber. INIT/SIPI has no return-value ABI: keep
+   `X86_64Arch`'s CPU-up signaling hooks as no-ops so live sender registers stay intact, and map
+   a `StartFailed` boot outcome back to wait-for-SIPI so the guest's second STARTUP retry works.
+   INIT addressed to an already-running vCPU is logged and ignored (cross-thread reset of live
+   guest registers violates the `AxVCpu !Send/Sync` ownership model). See
+   `docs/design/axvisor-x86-guest-smp-init-sipi.md`.
 
 ## Validation Ladder
 
