@@ -377,3 +377,309 @@ fn pio_dma_fault_does_not_poison_the_next_32_bit_transfer() {
 
     assert_eq!(&memory.bytes[BUFFER..BUFFER + 4], b"QEMU");
 }
+
+struct ParsedSmbiosStructure {
+    structure_type: u8,
+    formatted_length: usize,
+    handle: u16,
+    formatted: Vec<u8>,
+    strings: Vec<String>,
+    total_length: usize,
+}
+
+/// Test-side SMBIOS walker: parses concatenated structures back out of a table
+/// blob independently of any production helper.
+fn parse_smbios_tables(tables: &[u8]) -> Vec<ParsedSmbiosStructure> {
+    let mut structures = Vec::new();
+    let mut offset = 0usize;
+    while offset < tables.len() {
+        assert!(offset + 4 <= tables.len(), "truncated SMBIOS header");
+        let structure_type = tables[offset];
+        let formatted_length = tables[offset + 1] as usize;
+        let handle = u16::from_le_bytes([tables[offset + 2], tables[offset + 3]]);
+        assert!(
+            formatted_length >= 4,
+            "SMBIOS formatted length below header size"
+        );
+        let string_area = offset + formatted_length;
+        assert!(
+            string_area <= tables.len(),
+            "SMBIOS structure exceeds blob length"
+        );
+        let mut cursor = string_area;
+        let terminator = loop {
+            assert!(cursor + 2 <= tables.len(), "unterminated SMBIOS string set");
+            if tables[cursor] == 0 && tables[cursor + 1] == 0 {
+                break cursor + 2;
+            }
+            cursor += 1;
+        };
+
+        let mut strings = Vec::new();
+        let mut start = string_area;
+        for (scan, byte) in tables[string_area..terminator - 1]
+            .iter()
+            .enumerate()
+            .map(|(index, byte)| (string_area + index, *byte))
+        {
+            if byte == 0 {
+                // A leading NUL belongs to the terminating pair of an empty
+                // string set, not to a zero-length string.
+                if scan > start {
+                    strings.push(String::from_utf8_lossy(&tables[start..scan]).into_owned());
+                }
+                start = scan + 1;
+            }
+        }
+
+        structures.push(ParsedSmbiosStructure {
+            structure_type,
+            formatted_length,
+            handle,
+            formatted: tables[offset..string_area].to_vec(),
+            strings,
+            total_length: terminator - offset,
+        });
+        offset = terminator;
+    }
+    structures
+}
+
+fn expected_smbios_types(cpu_num: u16) -> Vec<u8> {
+    [0u8, 1, 3]
+        .into_iter()
+        .chain(core::iter::repeat(4).take(cpu_num as usize))
+        .chain([127])
+        .collect()
+}
+
+#[test]
+fn smbios_anchor_signature_length_and_checksum_sum_to_zero() {
+    let blobs = build_smbios_blobs(1);
+    assert_eq!(blobs.anchor.len(), 24);
+    assert_eq!(&blobs.anchor[..5], b"_SM3_");
+    assert_eq!(blobs.anchor[6], 24);
+    assert_eq!(blobs.anchor[7], 3, "major version");
+    assert_eq!(blobs.anchor[8], 0, "minor version");
+    assert_eq!(blobs.anchor[9], 0, "document revision");
+    assert_eq!(blobs.anchor[10], 1, "entry point revision");
+
+    let checksum = blobs
+        .anchor
+        .iter()
+        .fold(0u8, |sum, byte| sum.wrapping_add(*byte));
+    assert_eq!(checksum, 0, "all 24 anchor bytes must sum to zero");
+
+    let rebuilt = build_smbios_blobs(1);
+    assert_eq!(blobs.anchor, rebuilt.anchor, "anchor build is deterministic");
+    assert_eq!(blobs.tables, rebuilt.tables, "tables build is deterministic");
+}
+
+#[test]
+fn smbios_anchor_max_structure_size_matches_largest_walked_structure() {
+    for cpu_num in [0u16, 1, 4] {
+        let blobs = build_smbios_blobs(cpu_num);
+        let largest = parse_smbios_tables(&blobs.tables)
+            .iter()
+            .map(|structure| structure.total_length as u32)
+            .max()
+            .unwrap();
+        assert_eq!(
+            u32::from_le_bytes(blobs.anchor[0x0c..0x10].try_into().unwrap()),
+            largest,
+            "anchor max-structure-size mismatch for cpu_num={cpu_num}"
+        );
+    }
+}
+
+#[test]
+fn smbios_tables_walk_yields_expected_types_handles_and_lengths() {
+    let cpu_num = 4u16;
+    let blobs = build_smbios_blobs(cpu_num);
+    let structures = parse_smbios_tables(&blobs.tables);
+
+    assert_eq!(
+        structures
+            .iter()
+            .map(|structure| structure.structure_type)
+            .collect::<Vec<_>>(),
+        expected_smbios_types(cpu_num),
+        "structure emission order"
+    );
+
+    let spec_minimum_lengths = |structure_type: u8| match structure_type {
+        0 => 0x18,
+        1 => 0x1B,
+        3 => 0x15,
+        4 => 0x2A,
+        127 => 4usize,
+        other => panic!("unexpected structure type {other}"),
+    };
+    for structure in &structures {
+        assert_eq!(
+            structure.formatted_length,
+            spec_minimum_lengths(structure.structure_type),
+            "type {} formatted length",
+            structure.structure_type
+        );
+    }
+
+    let mut handles = structures
+        .iter()
+        .map(|structure| structure.handle)
+        .collect::<Vec<_>>();
+    assert_eq!(handles.len(), structures.len());
+    handles.sort_unstable();
+    handles.dedup();
+    assert_eq!(
+        handles.len(),
+        structures.len(),
+        "handles must be unique across all structures"
+    );
+
+    let walked: usize = structures.iter().map(|structure| structure.total_length).sum();
+    assert_eq!(walked, blobs.tables.len(), "walk must end at blob end");
+}
+
+#[test]
+fn smbios_string_sets_encode_null_terminators_and_empty_set_edge() {
+    let cpu_num = 2u16;
+    let blobs = build_smbios_blobs(cpu_num);
+    assert_eq!(&blobs.tables[blobs.tables.len() - 2..], &[0, 0]);
+
+    let structures = parse_smbios_tables(&blobs.tables);
+    let processor_strings = structures
+        .iter()
+        .filter(|structure| structure.structure_type == 4)
+        .map(|structure| structure.strings.clone())
+        .collect::<Vec<_>>();
+    for (index, strings) in processor_strings.iter().enumerate() {
+        assert_eq!(
+            strings,
+            &[
+                alloc::format!("CPU {index}"),
+                String::from("TGOSKITS"),
+                String::from("Virtual CPU"),
+            ]
+        );
+    }
+    for structure in structures {
+        match structure.structure_type {
+            0 => {
+                assert_eq!(structure.strings, ["TGOSKITS", "1.0", "01/01/2024"]);
+            }
+            1 => {
+                assert_eq!(
+                    structure.strings,
+                    [
+                        "TGOSKITS",
+                        "TGOSKITS Virtual Machine",
+                        "1.0",
+                        "0",
+                        "Default",
+                        "TGOSKITS",
+                    ]
+                );
+            }
+            3 => {
+                assert_eq!(structure.strings, ["TGOSKITS"]);
+            }
+            127 => {
+                assert!(structure.strings.is_empty(), "end-of-table has no strings");
+                assert_eq!(
+                    structure.total_length,
+                    structure.formatted_length + 2,
+                    "type 127 ends right after its double-NUL terminator"
+                );
+            }
+            other => panic!("unexpected structure type {other}"),
+        }
+    }
+}
+
+#[test]
+fn smbios_type4_count_matches_vcpu_number_with_unique_socket_labels() {
+    for cpu_num in [1u16, 4] {
+        let structures = parse_smbios_tables(&build_smbios_blobs(cpu_num).tables);
+        let processors = structures
+            .iter()
+            .filter(|structure| structure.structure_type == 4)
+            .collect::<Vec<_>>();
+        assert_eq!(processors.len(), cpu_num as usize);
+
+        let mut handles = processors.iter().map(|p| p.handle).collect::<Vec<_>>();
+        handles.sort_unstable();
+        handles.dedup();
+        assert_eq!(handles.len(), cpu_num as usize, "per-cpu handles distinct");
+
+        for (index, processor) in processors.iter().enumerate() {
+            assert_eq!(processor.strings[0], alloc::format!("CPU {index}"));
+            assert_eq!(processor.formatted[0x05], 3, "processor type: CPU");
+            assert_eq!(
+                u16::from_le_bytes(processor.formatted[0x14..0x16].try_into().unwrap()),
+                2000,
+                "max speed"
+            );
+            assert_eq!(processor.formatted[0x18], 0x41, "populated and enabled");
+            assert_eq!(processor.formatted[0x23], 1, "core count");
+            assert_eq!(processor.formatted[0x24], 1, "cores enabled");
+            assert_eq!(processor.formatted[0x25], 1, "thread count");
+        }
+    }
+}
+
+#[test]
+fn smbios_type127_is_last_structure_of_table() {
+    for cpu_num in [0u16, 1, 5] {
+        let structures = parse_smbios_tables(&build_smbios_blobs(cpu_num).tables);
+        assert_eq!(
+            structures
+                .iter()
+                .filter(|structure| structure.structure_type == 127)
+                .count(),
+            1,
+            "exactly one end-of-table structure"
+        );
+        let last = structures.last().unwrap();
+        assert_eq!(last.structure_type, 127);
+        assert_eq!(last.formatted_length, 4);
+        assert_eq!(last.total_length, 6);
+    }
+}
+
+#[test]
+fn fw_cfg_file_dir_sizes_match_built_smbios_blobs() {
+    let fw_cfg = FwCfg::new(
+        GuestPhysAddr::from_usize(0),
+        0x20,
+        FwCfgKernelPayload::unsplit(Arc::from(&b"kernel"[..])),
+        None,
+        None,
+        4,
+        FwCfgPlatformConfig::default(),
+    );
+
+    let dir = &fw_cfg.file_dir;
+    let count = u32::from_be_bytes(dir[..4].try_into().unwrap()) as usize;
+    let record_size = 4 + 2 + 2 + FW_CFG_FILE_NAME_SIZE;
+    let mut found = Vec::new();
+    for record in dir[4..].chunks_exact(record_size).take(count) {
+        let size = u32::from_be_bytes(record[..4].try_into().unwrap()) as usize;
+        let name = String::from_utf8_lossy(&record[8..]).into_owned();
+        found.push((name, size));
+    }
+    assert_eq!(found.len(), count);
+
+    let anchor_size = found
+        .iter()
+        .find(|(name, _)| name.starts_with("etc/smbios/smbios-anchor\0"))
+        .map(|(_, size)| *size)
+        .unwrap();
+    let tables_size = found
+        .iter()
+        .find(|(name, _)| name.starts_with("etc/smbios/smbios-tables\0"))
+        .map(|(_, size)| *size)
+        .unwrap();
+    assert_eq!(anchor_size, fw_cfg.smbios_anchor.len());
+    assert_eq!(tables_size, fw_cfg.smbios_tables.len());
+}

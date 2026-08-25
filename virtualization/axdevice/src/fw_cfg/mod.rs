@@ -151,8 +151,7 @@ impl FwCfg {
             .iter()
             .fold(0u64, |acc, region| acc.saturating_add(region.size));
         let memmap = build_memmap(&platform.ram_regions);
-        let smbios_tables = build_smbios_tables();
-        let smbios_anchor = build_smbios_anchor();
+        let smbios = build_smbios_blobs(cpu_num);
         let acpi = platform.acpi;
         let mut boot_kernel = Vec::with_capacity(kernel.total_len());
         boot_kernel.extend_from_slice(kernel.setup());
@@ -166,12 +165,12 @@ impl FwCfg {
             FwCfgFile {
                 name: "etc/smbios/smbios-anchor",
                 selector: FW_CFG_SMBIOS_ANCHOR,
-                size: smbios_anchor.len() as u32,
+                size: smbios.anchor.len() as u32,
             },
             FwCfgFile {
                 name: "etc/smbios/smbios-tables",
                 selector: FW_CFG_SMBIOS_TABLES,
-                size: smbios_tables.len() as u32,
+                size: smbios.tables.len() as u32,
             },
             FwCfgFile {
                 name: ACPI_TABLE_FILE,
@@ -221,8 +220,8 @@ impl FwCfg {
             cmdline,
             file_dir,
             memmap,
-            smbios_tables,
-            smbios_anchor,
+            smbios_tables: smbios.tables,
+            smbios_anchor: smbios.anchor,
             acpi_tables: acpi.tables,
             acpi_rsdp: acpi.rsdp,
             acpi_loader: acpi.loader,
