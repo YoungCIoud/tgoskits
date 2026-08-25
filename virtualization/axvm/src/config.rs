@@ -96,6 +96,8 @@ pub struct AxVMConfig {
     pass_through_ports: Vec<HostPortAssignment>,
     address_space_policy: AddressSpacePolicy,
     memory_regions: Vec<VmMemConfig>,
+    /// Writable UEFI variable-store prefix carved from the firmware window.
+    bios_vars_size: Option<usize>,
     boot_policy: GuestBootPolicy,
     // Physical interrupt sources forwarded to the guest in passthrough mode.
     passthrough_irq_list: Vec<PassthroughInterrupt>,
@@ -125,6 +127,9 @@ pub struct AxVMConfigParams {
     pub pass_through_ports: Vec<HostPortAssignment>,
     pub address_space_policy: AddressSpacePolicy,
     pub memory_regions: Vec<VmMemConfig>,
+    /// Writable UEFI variable-store prefix carved from the firmware window at
+    /// `image_config.bios_load_gpa`. `None` keeps the legacy uniform window.
+    pub bios_vars_size: Option<usize>,
     pub boot_policy: GuestBootPolicy,
     /// Machine-owned virtual serial resources.
     pub serial_profile: Option<GuestSerialProfile>,
@@ -153,6 +158,7 @@ impl AxVMConfig {
             pass_through_ports: params.pass_through_ports,
             address_space_policy: params.address_space_policy,
             memory_regions: params.memory_regions,
+            bios_vars_size: params.bios_vars_size,
             boot_policy: params.boot_policy,
             passthrough_irq_list: Vec::new(),
             excluded_passthrough_irq_sources: Vec::new(),
@@ -276,6 +282,25 @@ impl AxVMConfig {
     /// Replaces configurations related to VM memory regions.
     pub fn set_memory_regions(&mut self, memory_regions: Vec<VmMemConfig>) {
         self.memory_regions = memory_regions;
+    }
+
+    /// Returns the writable UEFI variable-store prefix size of the firmware
+    /// window, or `None` when the window keeps the legacy uniform mapping.
+    pub fn bios_vars_size(&self) -> Option<usize> {
+        self.bios_vars_size
+    }
+
+    /// Replaces the writable UEFI variable-store prefix size of the firmware
+    /// window.
+    pub fn set_bios_vars_size(&mut self, bios_vars_size: Option<usize>) {
+        self.bios_vars_size = bios_vars_size;
+    }
+
+    /// Returns the `(window base GPA, VARS prefix bytes)` boundary used to split
+    /// the firmware window, or `None` when either side is unconfigured.
+    pub fn firmware_window_boundary(&self) -> Option<(GuestPhysAddr, usize)> {
+        let vars_size = self.bios_vars_size?;
+        Some((self.image_config.bios_load_gpa?, vars_size))
     }
 
     /// Returns the policy used to adjust runtime boot image addresses.

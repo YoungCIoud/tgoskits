@@ -224,6 +224,7 @@ pub(crate) fn build_axvm_config(cfg: &GuestConfig) -> Result<AxVMConfig> {
         pass_through_ports: Vec::new(),
         address_space_policy: cfg.base.guest_type.address_space_policy(),
         memory_regions: cfg.kernel.memory_regions.clone(),
+        bios_vars_size: cfg.kernel.bios_vars_size,
         boot_policy: GuestBootPolicy::KeepConfigured,
         serial_profile: Some(serial_profile),
         serial_backend_factory: Some(crate::guest_console::serial_backend_factory(cfg.base.id)),
@@ -234,6 +235,7 @@ pub(crate) fn build_axvm_config(cfg: &GuestConfig) -> Result<AxVMConfig> {
 
 fn sync_axvm_config_from_crate_config(vm_config: &mut AxVMConfig, cfg: &GuestConfig) {
     vm_config.set_memory_regions(cfg.kernel.memory_regions.clone());
+    vm_config.set_bios_vars_size(cfg.kernel.bios_vars_size);
 }
 
 #[cfg(all(
