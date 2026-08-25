@@ -18,8 +18,10 @@ pub(crate) struct CpuUpExit {
 /// Failure of one secondary-vCPU boot attempt.
 #[derive(Debug)]
 pub(crate) enum SecondaryCpuBootFailure {
-    /// Architecture-visible CPU ID did not resolve to a VM-local vCPU.
-    UnresolvedTarget(u64),
+    /// Architecture-visible CPU ID did not resolve to a VM-local vCPU. The
+    /// unresolvable ID is logged by [`boot_secondary_cpu`] and carries no
+    /// further decision value for callers.
+    UnresolvedTarget,
     /// The target vCPU rejected or failed the boot attempt.
     Boot(VcpuOnError),
 }
@@ -57,7 +59,7 @@ pub(crate) fn boot_secondary_cpu(
             "VM[{vm_id}] cannot resolve architecture CPU target {} to a VM-local vCPU",
             exit.target_cpu
         );
-        return Err(SecondaryCpuBootFailure::UnresolvedTarget(exit.target_cpu));
+        return Err(SecondaryCpuBootFailure::UnresolvedTarget);
     };
 
     match crate::runtime::vcpus::vcpu_on(
@@ -91,19 +93,16 @@ pub(crate) trait CpuUpOps: Architecture {
     fn report_cpu_up_failure(vcpu: &crate::vcpu::AxVCpu<Self::VCpu>) {
         vcpu.set_return_value(usize::MAX);
     }
-
-    fn target_vcpu_id(vm: &crate::AxVMRef, target_cpu: u64) -> Option<usize> {
-        usize::try_from(target_cpu)
-            .ok()
-            .and_then(|arch_cpu_id| vm.vcpu_id_for_arch_cpu_id(arch_cpu_id))
-    }
 }
 
 pub(crate) fn handle<A: CpuUpOps>(
     vm: &crate::AxVMRef,
     vcpu: &crate::vcpu::AxVCpu<A::VCpu>,
     exit: CpuUpExit,
-) -> AxVmResult<BoundVcpuExit<A::DeferredRunWork>> {
+) -> AxVmResult<(
+    BoundVcpuExit<A::DeferredRunWork>,
+    Result<usize, SecondaryCpuBootFailure>,
+)> {
     let vm_id = vm.id();
     let vcpu_id = vcpu.id();
     info!(
@@ -111,17 +110,21 @@ pub(crate) fn handle<A: CpuUpOps>(
         exit.target_cpu, exit.entry_point, exit.arg
     );
 
-    match boot_secondary_cpu(vm, exit) {
+    let outcome = boot_secondary_cpu(vm, exit);
+    match &outcome {
         Ok(_) => A::set_cpu_up_success(vcpu),
         Err(_) => A::report_cpu_up_failure(vcpu),
     }
 
-    Ok(BoundVcpuExit::Complete(VcpuRunAction {
-        waits_for_event: false,
-        stop_reason: None,
-        resets_vm: false,
-        exits_vcpu: false,
-    }))
+    Ok((
+        BoundVcpuExit::Complete(VcpuRunAction {
+            waits_for_event: false,
+            stop_reason: None,
+            resets_vm: false,
+            exits_vcpu: false,
+        }),
+        outcome,
+    ))
 }
 
 #[cfg(all(test, feature = "host-test"))]

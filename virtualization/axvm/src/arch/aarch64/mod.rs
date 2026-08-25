@@ -171,7 +171,8 @@ impl ArchOps for Aarch64Arch {
                     entry_point: arm_guest_phys_addr_to_ax(entry_point),
                     arg,
                 },
-            ),
+            )
+            .map(|(bound, _)| bound),
             ArmVmExit::SystemDown => {
                 warn!("VM[{}] run VCpu[{}] SystemDown", vm.id(), vcpu.id());
                 Ok(BoundVcpuExit::Complete(VcpuRunAction {

@@ -41,11 +41,15 @@ mod pci_config;
 mod pic;
 pub(crate) mod port;
 mod resource_pools;
+mod smp;
 mod vm;
 use exit::*;
 pub(crate) use vm::X86VmPlan;
 
-use crate::architecture::sysreg::{self, SysRegReadExit, SysRegWriteExit};
+use crate::architecture::{
+    cpu_up::CpuUpOps,
+    sysreg::{self, SysRegReadExit, SysRegWriteExit},
+};
 
 const RFLAGS_INTERRUPT_FLAG: u64 = 1 << 9;
 
@@ -59,6 +63,25 @@ impl ArchOps for X86_64Arch {
 
     fn has_hardware_support() -> bool {
         x86_vcpu::initialize_hardware_support().is_ok()
+    }
+
+    fn set_vcpu_on_args(vcpu: &crate::vm::AxVCpuRef<Self::VCpu>, _vcpu_id: usize, arg: usize) {
+        // The x86 CPU-up argument carries the SIPI start vector. There is no
+        // handoff GPR ABI, so the vector is recorded on the backend and the
+        // AP's real-mode entry state is programmed at bind time.
+        let Ok(start_vector) = u8::try_from(arg) else {
+            warn!("invalid x86 CPU-up argument {arg:#x}: expected a SIPI start vector");
+            return;
+        };
+        vcpu.get_arch_vcpu().set_sipi_vector(start_vector);
+    }
+
+    fn enter_runtime(vm: &crate::AxVM) -> AxVmResult {
+        smp::enter_runtime(vm.id())
+    }
+
+    fn exit_runtime(vm: &crate::AxVM) -> AxVmResult {
+        smp::exit_runtime(vm.id())
     }
 
     fn before_first_run(vm: &crate::AxVMRef, vcpu: &crate::vm::AxVCpuRef<Self::VCpu>) {
@@ -252,6 +275,16 @@ fn x86_halt_action() -> VcpuRunAction {
     }
 }
 
+impl CpuUpOps for X86_64Arch {
+    // INIT/SIPI delivery carries no return-value ABI with the sending guest:
+    // both signaling hooks stay no-ops so live sender registers are never
+    // clobbered by a CPU-up attempt. The boot outcome is consumed by smp.rs
+    // to decide SIPI-retry eligibility instead.
+    fn set_cpu_up_success(_vcpu: &crate::vcpu::AxVCpu<Self::VCpu>) {}
+
+    fn report_cpu_up_failure(_vcpu: &crate::vcpu::AxVCpu<Self::VCpu>) {}
+}
+
 pub(crate) struct AxvmX86HostOps;
 
 impl X86VlapicHostOps for AxvmX86HostOps {
@@ -315,6 +348,18 @@ impl X86VlapicHostOps for AxvmX86HostOps {
         vector: X86InterruptVector,
     ) -> X86VlapicResult {
         manager::inject_interrupt(vm_id, vcpu_id, vector as usize).map_err(ax_error_to_vlapic)
+    }
+
+    fn request_ap_init(vm_id: X86VmId, vcpu_id: X86VcpuId) -> X86VlapicResult {
+        smp::handle_ap_init_request(vm_id, vcpu_id).map_err(ax_error_to_vlapic)
+    }
+
+    fn request_sipi_startup(
+        vm_id: X86VmId,
+        vcpu_id: X86VcpuId,
+        start_vector: u8,
+    ) -> X86VlapicResult {
+        smp::handle_sipi_startup_request(vm_id, vcpu_id, start_vector).map_err(ax_error_to_vlapic)
     }
 
     fn inject_pit_irq(vm_id: X86VmId, vcpu_id: X86VcpuId) -> X86VlapicResult {
@@ -418,6 +463,10 @@ impl AxvmX86Vcpu {
 
     fn set_gpr_rsp(&mut self, width: X86AccessWidth, value: u64) {
         self.0.set_gpr_rsp(width, value);
+    }
+
+    fn set_sipi_vector(&mut self, start_vector: u8) {
+        self.0.set_sipi_vector(start_vector);
     }
 }
 

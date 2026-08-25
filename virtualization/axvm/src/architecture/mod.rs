@@ -2,7 +2,11 @@
 
 pub(crate) mod capabilities;
 #[cfg_attr(
-    not(any(target_arch = "aarch64", target_arch = "riscv64")),
+    not(any(
+        target_arch = "aarch64",
+        target_arch = "riscv64",
+        target_arch = "x86_64"
+    )),
     expect(
         dead_code,
         reason = "CPU-up is an intentionally absent capability on this target"

@@ -134,7 +134,8 @@ impl ArchOps for Riscv64Arch {
                     entry_point: riscv_guest_phys_addr_to_ax(entry_point),
                     arg,
                 },
-            ),
+            )
+            .map(|(bound, _)| bound),
             RiscvVmExit::CpuDown { state } => {
                 warn!(
                     "VM[{}] run VCpu[{}] CpuDown state {state:#x}",
