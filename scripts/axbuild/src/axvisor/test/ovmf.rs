@@ -57,6 +57,17 @@ pub(super) struct OvmfEvidence {
     guest: FirmwareFileEvidence,
 }
 
+impl OvmfEvidence {
+    /// Size in bytes of the writable VARS prefix inside the assembled guest
+    /// image; zero for a monolithic CODE-only build.
+    pub(super) fn vars_prefix_len(&self) -> usize {
+        match self.layout {
+            OvmfLayout::SplitCodeVars => self.vars.size as usize,
+            OvmfLayout::MonolithicCode => 0,
+        }
+    }
+}
+
 impl fmt::Display for OvmfEvidence {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let vars_usage = match self.layout {
@@ -66,8 +77,8 @@ impl fmt::Display for OvmfEvidence {
         write!(
             formatter,
             "Axvisor x86 OVMF firmware evidence:\nlayout: {}\nOstool CODE: path={} size={} \
-             sha256={}\nOstool VARS: path={} size={} sha256={} usage={}\nguest image: path={} \
-             size={} sha256={}",
+             sha256={}\nOstool VARS: path={} size={} sha256={} usage={}\nvars prefix: \
+             {:#x}\nguest image: path={} size={} sha256={}",
             self.layout,
             self.code.path.display(),
             self.code.size,
@@ -76,6 +87,7 @@ impl fmt::Display for OvmfEvidence {
             self.vars.size,
             self.vars.sha256,
             vars_usage,
+            self.vars_prefix_len(),
             self.guest.path.display(),
             self.guest.size,
             self.guest.sha256,
@@ -203,6 +215,7 @@ mod tests {
         assert_eq!(image.len(), OVMF_SIZE);
         assert_eq!(&image[..vars.len()], vars);
         assert_eq!(&image[vars.len()..], code);
+        assert_eq!(evidence.vars_prefix_len(), vars.len());
         assert_eq!(evidence.code.path, code_path);
         assert_eq!(evidence.code.size, code.len() as u64);
         assert_eq!(evidence.code.sha256, file_sha256(&code_path).unwrap());
@@ -234,6 +247,7 @@ mod tests {
         let evidence = prepare_x86_ovmf_from_firmware(&output_path, &firmware).unwrap();
 
         assert_eq!(evidence.layout, OvmfLayout::MonolithicCode);
+        assert_eq!(evidence.vars_prefix_len(), 0);
         assert!(evidence.to_string().contains("usage=unused"));
         assert_eq!(fs::metadata(output_path).unwrap().len(), OVMF_SIZE as u64);
     }

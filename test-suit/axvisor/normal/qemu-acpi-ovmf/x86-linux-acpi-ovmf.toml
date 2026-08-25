@@ -16,6 +16,10 @@ enable_bios = true
 boot_protocol = "uefi"
 uefi_firmware_path = "${workspace}/tmp/axbuild/axvisor/qemu-acpi-ovmf/OVMF_CODE_4M.fd"
 bios_load_addr = 0xffc0_0000
+# Writable UEFI varstore prefix carved from the 4 MiB firmware window. Must
+# match AXVISOR_TEST_X86_OVMF_VARS_SIZE in the build TOML, which axbuild
+# cross-checks against the assembled OVMF image before boot.
+bios_vars_size = 0x84_000
 cmdline = "console=ttyS0 rdinit=/init devtmpfs.mount=1 loglevel=7 nox2apic no_timer_check initcall_blacklist=ahci_pci_driver_init axvisor.acpi_case=ovmf"
 memory_regions = [
   [0x0000_0000, 0x2000_0000, 0x7, 0],

@@ -20,6 +20,7 @@ use crate::{axvisor::rootfs, context::ResolvedAxvisorRequest, rootfs::inject::re
 
 const OUTPUT_ENV: &str = "AXVISOR_TEST_BUSYBOX_INITRAMFS";
 const OVMF_OUTPUT_ENV: &str = "AXVISOR_TEST_X86_OVMF_OUTPUT";
+const OVMF_VARS_SIZE_ENV: &str = "AXVISOR_TEST_X86_OVMF_VARS_SIZE";
 const BUSYBOX_PATH: &str = "/bin/busybox";
 const INIT_SCRIPT: &[u8] = br#"#!/bin/busybox sh
 /bin/busybox mount -t devtmpfs devtmpfs /dev 2>/dev/null || true
@@ -134,8 +135,47 @@ pub(super) async fn prepare_configured_busybox_initramfs(
         let output_path = resolve_output_path(workspace_root, configured_output, OVMF_OUTPUT_ENV)?;
         let evidence = super::ovmf::prepare_x86_ovmf(&output_path).await?;
         println!("{evidence}");
+        if let Some(configured_size) = cargo.env.get(OVMF_VARS_SIZE_ENV) {
+            ensure!(
+                request.arch == "x86_64",
+                "{OVMF_VARS_SIZE_ENV} is only valid for x86_64 Axvisor tests"
+            );
+            check_ovmf_vars_size(evidence.vars_prefix_len(), configured_size)?;
+        }
     }
     Ok(())
+}
+
+/// Cross-checks the guest TOML's `bios_vars_size` knob (declared through
+/// `{OVMF_VARS_SIZE_ENV}`) against the VARS prefix actually assembled into the
+/// firmware image, so a mismatch fails the build before QEMU ever boots.
+fn check_ovmf_vars_size(assembled: usize, configured_size: &str) -> anyhow::Result<()> {
+    let configured = parse_byte_size(configured_size)
+        .with_context(|| format!("invalid {OVMF_VARS_SIZE_ENV} value {configured_size:?}"))?;
+    ensure!(
+        configured > 0 && configured % 0x1000 == 0,
+        "{OVMF_VARS_SIZE_ENV}={configured:#x} must be a non-zero multiple of 4 KiB to match \
+         bios_vars_size validation"
+    );
+    ensure!(
+        configured == assembled,
+        "{OVMF_VARS_SIZE_ENV}={configured:#x} does not match the assembled OVMF vars prefix \
+         {assembled:#x}; update bios_vars_size in the guest TOML or the build env"
+    );
+    Ok(())
+}
+
+fn parse_byte_size(raw: &str) -> anyhow::Result<usize> {
+    // Accept the `0x84_000` digit-separator style used across guest TOMLs.
+    let cleaned = raw.trim().replace('_', "");
+    let parsed = cleaned
+        .strip_prefix("0x")
+        .or_else(|| cleaned.strip_prefix("0X"))
+        .map_or_else(
+            || cleaned.parse::<usize>(),
+            |hex| usize::from_str_radix(hex, 16),
+        )?;
+    Ok(parsed)
 }
 
 fn resolve_output_path(
@@ -359,6 +399,24 @@ mod tests {
         );
         assert!(resolve_output_path(root.path(), "../outside", OUTPUT_ENV).is_err());
         assert!(resolve_output_path(root.path(), "/tmp/outside", OUTPUT_ENV).is_err());
+    }
+
+    #[test]
+    fn ovmf_vars_size_check_accepts_only_matching_page_aligned_sizes() {
+        check_ovmf_vars_size(0x84_000, "0x84000").unwrap();
+        check_ovmf_vars_size(0x84_000, "0x84_000").unwrap();
+        assert!(check_ovmf_vars_size(0x84_000, "0x80000").is_err());
+        assert!(check_ovmf_vars_size(0x84_000, "0x100").is_err());
+        assert!(check_ovmf_vars_size(0, "0").is_err());
+        assert!(check_ovmf_vars_size(0x84_000, "not-a-number").is_err());
+    }
+
+    #[test]
+    fn parse_byte_size_supports_hex_and_decimal() {
+        assert_eq!(parse_byte_size("0x84000").unwrap(), 0x84_000);
+        assert_eq!(parse_byte_size("0X1000").unwrap(), 0x1000);
+        assert_eq!(parse_byte_size("528384").unwrap(), 528_384);
+        assert!(parse_byte_size("-1").is_err());
     }
 
     #[test]
