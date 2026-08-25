@@ -814,15 +814,15 @@ impl AxVMResources {
         let memory_regions = self.memory_regions.clone();
         self.address_space.clear();
         for region in &memory_regions {
+            // Re-map with each region's own ownership class so firmware ROM
+            // stays read-only across guest resets instead of silently
+            // regaining WRITE permission.
             self.address_space
                 .map_linear(
                     region.gpa,
                     region.host_paddr(),
                     region.size(),
-                    MappingFlags::READ
-                        | MappingFlags::WRITE
-                        | MappingFlags::EXECUTE
-                        | MappingFlags::USER,
+                    region.kind.owned_mapping_flags(),
                 )
                 .map_err(|error| {
                     AxVmError::from_addrspace("restore guest memory mapping", error)
@@ -1139,12 +1139,20 @@ pub struct VMMemoryRegion {
     pub layout: Layout,
     /// Whether this region was allocated by the allocator and needs to be deallocated
     pub needs_dealloc: bool,
+    /// Ownership class driving the stage-2 permissions used when this region
+    /// is mapped at create time and re-mapped on guest reset.
+    pub kind: VmRegionKind,
 }
 
 impl VMMemoryRegion {
     /// Returns the size of the memory region.
     pub fn size(&self) -> usize {
         self.layout.size()
+    }
+
+    /// Returns the ownership class of this region.
+    pub fn kind(&self) -> VmRegionKind {
+        self.kind
     }
 
     /// Returns the host physical address backing this guest memory region.
@@ -2041,6 +2049,15 @@ impl AxVM {
         layout: Layout,
         gpa: Option<GuestPhysAddr>,
     ) -> AxVmResult<&[u8]> {
+        self.alloc_memory_region_with_kind(layout, gpa, VmRegionKind::Memory)
+    }
+
+    fn alloc_memory_region_with_kind(
+        &self,
+        layout: Layout,
+        gpa: Option<GuestPhysAddr>,
+        kind: VmRegionKind,
+    ) -> AxVmResult<&[u8]> {
         assert!(
             layout.size() > 0,
             "Cannot allocate zero-sized memory region"
@@ -2062,21 +2079,14 @@ impl AxVM {
         if let Err(err) = self.with_resources_mut(|resources| {
             resources
                 .address_space
-                .map_linear(
-                    gpa,
-                    hpa,
-                    layout.size(),
-                    MappingFlags::READ
-                        | MappingFlags::WRITE
-                        | MappingFlags::EXECUTE
-                        | MappingFlags::USER,
-                )
+                .map_linear(gpa, hpa, layout.size(), kind.owned_mapping_flags())
                 .map_err(|error| AxVmError::from_addrspace("map allocated guest memory", error))?;
             resources.memory_regions.push(VMMemoryRegion {
                 gpa,
                 hva,
                 layout,
                 needs_dealloc: true, // This region was allocated and needs to be freed
+                kind,
             });
             Ok(())
         }) {
@@ -2124,10 +2134,7 @@ impl AxVM {
                     gpa,
                     gpa.as_usize().into(),
                     layout.size(),
-                    MappingFlags::READ
-                        | MappingFlags::WRITE
-                        | MappingFlags::EXECUTE
-                        | MappingFlags::USER,
+                    VmRegionKind::Memory.owned_mapping_flags(),
                 )
                 .map_err(|error| AxVmError::from_addrspace("map reserved guest memory", error))?;
             let hva = gpa.as_usize().into();
@@ -2136,6 +2143,7 @@ impl AxVM {
                 hva,
                 layout,
                 needs_dealloc: false, // This is a reserved region, not allocated
+                kind: VmRegionKind::Memory,
             });
             Ok(())
         })

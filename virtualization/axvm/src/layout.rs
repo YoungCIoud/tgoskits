@@ -40,6 +40,24 @@ pub enum VmRegionKind {
     EmulatedDevice,
     /// The range is reserved from passthrough mapping.
     Reserved,
+    /// The range holds guest-visible firmware CODE: readable and executable
+    /// but never writable through stage 2. Backing frames stay VM-owned so the
+    /// mapping can be restored with identical permissions on guest reset.
+    FirmwareRom,
+}
+
+/// Stage-2 flags installed for normal VM-owned guest RAM.
+///
+/// Single source of truth for RAM permissions across create-time allocation
+/// and reset-time re-mapping.
+pub(crate) fn ram_mapping_flags() -> MappingFlags {
+    MappingFlags::READ | MappingFlags::WRITE | MappingFlags::EXECUTE | MappingFlags::USER
+}
+
+/// Stage-2 flags installed for firmware ROM windows: everything RAM gets
+/// except WRITE, so guest stores into CODE never stick.
+pub(crate) fn firmware_rom_mapping_flags() -> MappingFlags {
+    MappingFlags::READ | MappingFlags::EXECUTE | MappingFlags::USER
 }
 
 /// A final stage-2 linear mapping planned for the VM.
@@ -629,6 +647,16 @@ impl VmRegionKind {
             Self::BootDescription => "boot description",
             Self::EmulatedDevice => "emulated device",
             Self::Reserved => "reserved",
+            Self::FirmwareRom => "firmware rom",
+        }
+    }
+
+    /// Stage-2 mapping flags used when installing or restoring mappings for
+    /// VM-owned ranges of this ownership class.
+    pub(crate) fn owned_mapping_flags(self) -> MappingFlags {
+        match self {
+            Self::FirmwareRom => firmware_rom_mapping_flags(),
+            _ => ram_mapping_flags(),
         }
     }
 }
@@ -641,6 +669,62 @@ mod tests {
 
     const GUEST_BASE: usize = 0;
     const GUEST_SIZE: usize = 0x1_0000;
+
+    fn planned_region_kinds(
+        owned_regions: &[GuestOwnedRegion],
+    ) -> std::vec::Vec<(usize, usize, VmRegionKind)> {
+        build_address_layout(
+            AddressSpacePolicy::Passthrough,
+            GUEST_BASE,
+            GUEST_SIZE,
+            &[],
+            &[],
+            owned_regions,
+            &[],
+        )
+        .unwrap()
+        .owned_regions()
+        .map(|region| (region.gpa.as_usize(), region.size, region.kind))
+        .collect()
+    }
+
+    #[test]
+    fn firmware_rom_region_maps_without_write_flag() {
+        let flags = VmRegionKind::FirmwareRom.owned_mapping_flags();
+
+        assert!(
+            !flags.contains(MappingFlags::WRITE),
+            "firmware CODE must never be stage-2 writable: {flags:?}"
+        );
+        assert!(flags.contains(MappingFlags::READ));
+        assert!(flags.contains(MappingFlags::EXECUTE));
+        assert!(flags.contains(MappingFlags::USER));
+
+        // The planner must carry the ownership class through so create-time
+        // mappings and reset-time re-maps restore the same permissions.
+        assert_eq!(
+            planned_region_kinds(&[GuestOwnedRegion::new(
+                0x1000,
+                0x2000,
+                VmRegionKind::FirmwareRom
+            )]),
+            [(0x1000, 0x2000, VmRegionKind::FirmwareRom)]
+        );
+    }
+
+    #[test]
+    fn absent_boundary_keeps_legacy_layout() {
+        // Without a firmware window boundary every VM-owned range stays plain
+        // guest RAM with full read/write/execute/user permissions.
+        assert_eq!(
+            VmRegionKind::Memory.owned_mapping_flags(),
+            MappingFlags::READ | MappingFlags::WRITE | MappingFlags::EXECUTE | MappingFlags::USER
+        );
+        assert_eq!(
+            planned_region_kinds(&[GuestOwnedRegion::new(0x1000, 0x2000, VmRegionKind::Memory)]),
+            [(0x1000, 0x2000, VmRegionKind::Memory)]
+        );
+    }
 
     #[test]
     fn virtualized_policy_only_maps_explicit_passthrough() {

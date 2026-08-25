@@ -140,6 +140,7 @@ mod tests {
     };
 
     use super::*;
+    use crate::layout::VmRegionKind;
 
     #[derive(Default)]
     struct FakeMemoryMapper {
@@ -163,6 +164,7 @@ mod tests {
                 hva: gpa.as_usize().into(),
                 layout,
                 needs_dealloc: true,
+                kind: VmRegionKind::Memory,
             });
             Ok(())
         }
@@ -180,6 +182,7 @@ mod tests {
                 hva: gpa.as_usize().into(),
                 layout,
                 needs_dealloc: false,
+                kind: VmRegionKind::Memory,
             });
             Ok(())
         }

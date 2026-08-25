@@ -108,7 +108,9 @@ impl AxVMResources {
             .memory_regions
             .iter()
             .map(|region| {
-                GuestOwnedRegion::new(region.gpa.as_usize(), region.size(), VmRegionKind::Memory)
+                // The ownership class (plain RAM vs firmware ROM) decides the
+                // stage-2 permission rule applied to this range.
+                GuestOwnedRegion::new(region.gpa.as_usize(), region.size(), region.kind())
             })
             .collect::<Vec<_>>();
 
