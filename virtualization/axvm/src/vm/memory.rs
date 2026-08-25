@@ -5,7 +5,7 @@ use std::{alloc::Layout, vec::Vec};
 use axvm_types::{GuestPhysAddr, VmMemConfig, VmMemMappingType};
 
 use super::{AxVM, VMMemoryRegion};
-use crate::{AxVmResult, ax_err_type};
+use crate::{AxVmResult, ax_err_type, layout::VmRegionKind};
 
 const VM_MEMORY_ALIGN: usize = 2 * 1024 * 1024;
 
@@ -43,6 +43,9 @@ pub(crate) trait MemoryRegionMapper {
     fn prepared_memory_regions(&self) -> Vec<VMMemoryRegion>;
     fn allocate_memory_region(&self, layout: Layout, gpa: Option<GuestPhysAddr>) -> AxVmResult<()>;
     fn map_reserved_memory_region(&self, layout: Layout, gpa: Option<GuestPhysAddr>) -> AxVmResult;
+    /// Allocates fresh backing frames for guest-visible firmware CODE and maps
+    /// them without stage-2 WRITE permission.
+    fn map_firmware_rom_region(&self, layout: Layout, gpa: Option<GuestPhysAddr>) -> AxVmResult;
 }
 
 impl MemoryRegionMapper for AxVM {
@@ -57,16 +60,81 @@ impl MemoryRegionMapper for AxVM {
     fn map_reserved_memory_region(&self, layout: Layout, gpa: Option<GuestPhysAddr>) -> AxVmResult {
         self.map_reserved_memory_region(layout, gpa)
     }
+
+    fn map_firmware_rom_region(&self, layout: Layout, gpa: Option<GuestPhysAddr>) -> AxVmResult {
+        self.map_firmware_rom_region(layout, gpa)
+    }
+}
+
+/// Turns configured memory regions into mapping plans.
+///
+/// When a firmware window boundary `(window base GPA, VARS prefix bytes)` is
+/// configured, the matching region splits into a RAM-backed VARS prefix plan
+/// plus a firmware-ROM CODE suffix plan; every other region maps unchanged.
+/// Without a boundary the plans mirror the configuration one-to-one (legacy
+/// behavior).
+pub(crate) fn plan_memory_regions(
+    configs: &[VmMemConfig],
+    firmware_window: Option<(GuestPhysAddr, usize)>,
+) -> AxVmResult<Vec<MemoryRegionPlan>> {
+    let Some((window_base, vars_size)) = firmware_window else {
+        return configs.iter().map(MemoryRegionPlan::from_config).collect();
+    };
+
+    let mut plans = Vec::with_capacity(configs.len() + 1);
+    let mut window_split = false;
+    for config in configs {
+        if config.gpa != window_base.as_usize() {
+            plans.push(MemoryRegionPlan::from_config(config)?);
+            continue;
+        }
+        if config.map_type != VmMemMappingType::MapAlloc {
+            return Err(ax_err_type!(
+                InvalidInput,
+                std::format!(
+                    "bios_vars_size requires the firmware window at {:#x} to use MapAlloc, but it \
+                     uses {:?}",
+                    config.gpa,
+                    config.map_type
+                )
+            ));
+        }
+        if config.size <= vars_size {
+            return Err(ax_err_type!(
+                InvalidInput,
+                std::format!(
+                    "firmware window {:#x} ({:#x} bytes) must be larger than bios_vars_size \
+                     ({vars_size:#x} bytes) to leave a CODE suffix",
+                    config.gpa,
+                    config.size
+                )
+            ));
+        }
+        plans.push(MemoryRegionPlan::split_prefix(config, vars_size)?);
+        plans.push(MemoryRegionPlan::split_suffix(config, vars_size)?);
+        window_split = true;
+    }
+    if !window_split {
+        return Err(ax_err_type!(
+            InvalidInput,
+            std::format!(
+                "bios_vars_size requires a firmware window memory region at {:#x}, but none was \
+                 configured",
+                window_base.as_usize()
+            )
+        ));
+    }
+    Ok(plans)
 }
 
 pub(crate) struct MemoryLayoutBuilder<'a, M: MemoryRegionMapper + ?Sized> {
     mapper: &'a M,
-    configs: &'a [VmMemConfig],
+    plans: &'a [MemoryRegionPlan],
 }
 
 impl<'a, M: MemoryRegionMapper + ?Sized> MemoryLayoutBuilder<'a, M> {
-    pub(crate) const fn new(mapper: &'a M, configs: &'a [VmMemConfig]) -> Self {
-        Self { mapper, configs }
+    pub(crate) const fn new(mapper: &'a M, plans: &'a [MemoryRegionPlan]) -> Self {
+        Self { mapper, plans }
     }
 
     pub(crate) fn prepare(&self) -> AxVmResult<PreparedMemoryLayout> {
@@ -75,11 +143,13 @@ impl<'a, M: MemoryRegionMapper + ?Sized> MemoryLayoutBuilder<'a, M> {
             return PreparedMemoryLayout::new(existing);
         }
 
-        for config in self.configs {
-            let plan = MemoryRegionPlan::from_config(config)?;
+        for plan in self.plans {
             if plan.maps_reserved_memory() {
                 self.mapper
                     .map_reserved_memory_region(plan.layout(), plan.configured_gpa())?;
+            } else if plan.kind() == VmRegionKind::FirmwareRom {
+                self.mapper
+                    .map_firmware_rom_region(plan.layout(), plan.configured_gpa())?;
             } else {
                 self.mapper
                     .allocate_memory_region(plan.layout(), plan.configured_gpa())?;
@@ -96,10 +166,45 @@ pub(crate) struct MemoryRegionPlan {
     configured_gpa: Option<GuestPhysAddr>,
     layout: Layout,
     map_type: VmMemMappingType,
+    kind: VmRegionKind,
 }
 
 impl MemoryRegionPlan {
     pub(crate) fn from_config(config: &VmMemConfig) -> AxVmResult<Self> {
+        Self::from_parts(config, VmRegionKind::Memory)
+    }
+
+    /// Plans the RAM-backed VARS prefix `[base, base + vars_size)` of a split
+    /// firmware window.
+    fn split_prefix(config: &VmMemConfig, vars_size: usize) -> AxVmResult<Self> {
+        let prefix = VmMemConfig {
+            gpa: config.gpa,
+            size: vars_size,
+            ..config.clone()
+        };
+        Self::from_parts(&prefix, VmRegionKind::Memory)
+    }
+
+    /// Plans the firmware-ROM CODE suffix `[base + vars_size, end)` of a split
+    /// firmware window.
+    fn split_suffix(config: &VmMemConfig, vars_size: usize) -> AxVmResult<Self> {
+        let suffix = VmMemConfig {
+            gpa: config.gpa.checked_add(vars_size).ok_or_else(|| {
+                ax_err_type!(
+                    InvalidInput,
+                    std::format!(
+                        "firmware window base {:#x} overflows when split at {vars_size:#x}",
+                        config.gpa
+                    )
+                )
+            })?,
+            size: config.size - vars_size,
+            ..config.clone()
+        };
+        Self::from_parts(&suffix, VmRegionKind::FirmwareRom)
+    }
+
+    fn from_parts(config: &VmMemConfig, kind: VmRegionKind) -> AxVmResult<Self> {
         let layout = Layout::from_size_align(config.size, VM_MEMORY_ALIGN).map_err(|err| {
             ax_err_type!(
                 InvalidInput,
@@ -116,6 +221,7 @@ impl MemoryRegionPlan {
             configured_gpa,
             layout,
             map_type: config.map_type.clone(),
+            kind,
         })
     }
 
@@ -129,6 +235,11 @@ impl MemoryRegionPlan {
 
     pub(crate) const fn maps_reserved_memory(&self) -> bool {
         matches!(self.map_type, VmMemMappingType::MapReserved)
+    }
+
+    /// Returns the ownership class installed for this mapping.
+    pub(crate) const fn kind(&self) -> VmRegionKind {
+        self.kind
     }
 }
 
@@ -146,6 +257,8 @@ mod tests {
     struct FakeMemoryMapper {
         regions: RefCell<Vec<VMMemoryRegion>>,
         map_reserved_calls: Cell<usize>,
+        allocate_calls: Cell<usize>,
+        firmware_rom_calls: Cell<usize>,
     }
 
     impl MemoryRegionMapper for FakeMemoryMapper {
@@ -158,6 +271,7 @@ mod tests {
             layout: Layout,
             gpa: Option<GuestPhysAddr>,
         ) -> AxVmResult<()> {
+            self.allocate_calls.set(self.allocate_calls.get() + 1);
             let gpa = gpa.unwrap_or_else(|| GuestPhysAddr::from(0x5000_0000));
             self.regions.borrow_mut().push(VMMemoryRegion {
                 gpa,
@@ -183,6 +297,25 @@ mod tests {
                 layout,
                 needs_dealloc: false,
                 kind: VmRegionKind::Memory,
+            });
+            Ok(())
+        }
+
+        fn map_firmware_rom_region(
+            &self,
+            layout: Layout,
+            gpa: Option<GuestPhysAddr>,
+        ) -> AxVmResult {
+            self.firmware_rom_calls
+                .set(self.firmware_rom_calls.get() + 1);
+            let gpa =
+                gpa.ok_or_else(|| ax_err_type!(InvalidInput, "firmware ROM GPA is required"))?;
+            self.regions.borrow_mut().push(VMMemoryRegion {
+                gpa,
+                hva: gpa.as_usize().into(),
+                layout,
+                needs_dealloc: true,
+                kind: VmRegionKind::FirmwareRom,
             });
             Ok(())
         }
@@ -242,7 +375,8 @@ mod tests {
             flags: 0,
             map_type: VmMemMappingType::MapReserved,
         }];
-        let builder = MemoryLayoutBuilder::new(&mapper, &configs);
+        let plans = plan_memory_regions(&configs, None).unwrap();
+        let builder = MemoryLayoutBuilder::new(&mapper, &plans);
 
         let layout = builder.prepare().unwrap();
         let again = builder.prepare().unwrap();
@@ -251,5 +385,130 @@ mod tests {
         assert_eq!(layout.regions().len(), 1);
         assert_eq!(again.regions().len(), 1);
         assert_eq!(mapper.map_reserved_calls.get(), 1);
+    }
+
+    const WINDOW_BASE: usize = 0xffc0_0000;
+    const WINDOW_SIZE: usize = 0x40_0000;
+    const VARS_SIZE: usize = 0x84_000;
+
+    fn window_config() -> VmMemConfig {
+        VmMemConfig {
+            gpa: WINDOW_BASE,
+            size: WINDOW_SIZE,
+            flags: 0,
+            map_type: VmMemMappingType::MapAlloc,
+        }
+    }
+
+    fn split_window_plans(configs: &[VmMemConfig]) -> AxVmResult<std::vec::Vec<MemoryRegionPlan>> {
+        plan_memory_regions(configs, Some((GuestPhysAddr::from(WINDOW_BASE), VARS_SIZE)))
+    }
+
+    #[test]
+    fn absent_boundary_keeps_legacy_plans() {
+        let configs = vec![window_config()];
+        let plans = plan_memory_regions(&configs, None).unwrap();
+
+        assert_eq!(plans.len(), 1);
+        assert_eq!(
+            plans[0].configured_gpa(),
+            Some(GuestPhysAddr::from(WINDOW_BASE))
+        );
+        assert_eq!(plans[0].kind(), VmRegionKind::Memory);
+    }
+
+    #[test]
+    fn firmware_window_splits_into_vars_prefix_and_rom_suffix() {
+        let configs = vec![window_config()];
+        let plans = split_window_plans(&configs).unwrap();
+
+        assert_eq!(plans.len(), 2);
+        let vars = &plans[0];
+        let code = &plans[1];
+        assert_eq!(
+            vars.configured_gpa(),
+            Some(GuestPhysAddr::from(WINDOW_BASE))
+        );
+        assert_eq!(vars.layout().size(), VARS_SIZE);
+        assert_eq!(vars.kind(), VmRegionKind::Memory);
+        assert_eq!(
+            code.configured_gpa(),
+            Some(GuestPhysAddr::from(WINDOW_BASE + VARS_SIZE))
+        );
+        assert_eq!(code.layout().size(), WINDOW_SIZE - VARS_SIZE);
+        assert_eq!(code.kind(), VmRegionKind::FirmwareRom);
+    }
+
+    #[test]
+    fn firmware_window_split_leaves_other_regions_alone() {
+        let low_ram = VmMemConfig {
+            gpa: 0x0,
+            size: 0x200_0000,
+            flags: 0,
+            map_type: VmMemMappingType::MapAlloc,
+        };
+        let configs = vec![low_ram, window_config()];
+        let plans = split_window_plans(&configs).unwrap();
+
+        assert_eq!(plans.len(), 3);
+        assert_eq!(plans[0].kind(), VmRegionKind::Memory);
+        assert_eq!(plans[0].layout().size(), 0x200_0000);
+        assert_eq!(plans[2].kind(), VmRegionKind::FirmwareRom);
+    }
+
+    #[test]
+    fn firmware_window_split_rejects_unusable_windows() {
+        let missing_base = vec![];
+        assert!(split_window_plans(&missing_base).is_err());
+
+        let reserved_window = VmMemConfig {
+            map_type: VmMemMappingType::MapReserved,
+            ..window_config()
+        };
+        assert!(split_window_plans(&[reserved_window]).is_err());
+
+        let tiny_window = VmMemConfig {
+            size: VARS_SIZE - 0x1000,
+            ..window_config()
+        };
+        assert!(split_window_plans(&[tiny_window]).is_err());
+    }
+
+    #[test]
+    fn vars_frames_survive_region_rebuild() {
+        let mapper = FakeMemoryMapper::default();
+        let configs = vec![
+            VmMemConfig {
+                gpa: 0x0,
+                size: 0x200_0000,
+                flags: 0,
+                map_type: VmMemMappingType::MapAlloc,
+            },
+            window_config(),
+        ];
+        let plans = split_window_plans(&configs).unwrap();
+        let builder = MemoryLayoutBuilder::new(&mapper, &plans);
+
+        builder.prepare().unwrap();
+        let again = builder.prepare().unwrap();
+
+        // A rebuild (guest reset) must reuse the seeded frames instead of
+        // re-allocating or re-mapping CODE as writable RAM.
+        assert_eq!(mapper.allocate_calls.get(), 2); // guest RAM + VARS prefix
+        assert_eq!(mapper.firmware_rom_calls.get(), 1); // CODE suffix only
+        assert_eq!(again.regions().len(), 3);
+        let kinds = again
+            .regions()
+            .iter()
+            .map(|region| region.kind())
+            .collect::<std::vec::Vec<_>>();
+        assert_eq!(
+            kinds,
+            [
+                VmRegionKind::Memory,
+                VmRegionKind::Memory,
+                VmRegionKind::FirmwareRom
+            ]
+        );
     }
 }

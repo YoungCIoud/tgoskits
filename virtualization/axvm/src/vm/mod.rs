@@ -2052,6 +2052,17 @@ impl AxVM {
         self.alloc_memory_region_with_kind(layout, gpa, VmRegionKind::Memory)
     }
 
+    /// Allocates fresh backing frames for guest-visible firmware CODE and maps
+    /// them without stage-2 WRITE permission.
+    pub(crate) fn map_firmware_rom_region(
+        &self,
+        layout: Layout,
+        gpa: Option<GuestPhysAddr>,
+    ) -> AxVmResult {
+        self.alloc_memory_region_with_kind(layout, gpa, VmRegionKind::FirmwareRom)
+            .map(|_| ())
+    }
+
     fn alloc_memory_region_with_kind(
         &self,
         layout: Layout,
@@ -2108,7 +2119,9 @@ impl AxVM {
     /// Prepares all memory regions configured for this VM.
     pub fn prepare_memory_layout(&self) -> AxVmResult<PreparedMemoryLayout> {
         let memory_regions = self.with_config(|config| config.memory_regions().to_vec());
-        let layout = memory::MemoryLayoutBuilder::new(self, &memory_regions).prepare()?;
+        let firmware_window = self.with_config(|config| config.firmware_window_boundary());
+        let plans = memory::plan_memory_regions(&memory_regions, firmware_window)?;
+        let layout = memory::MemoryLayoutBuilder::new(self, &plans).prepare()?;
         let main_memory = layout.main_memory();
         let boot_plan = boot::BootImagePlan::new(main_memory.gpa, main_memory.is_identical());
         self.with_config(|config| boot_plan.apply_to_config(config));
