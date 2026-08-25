@@ -36,6 +36,7 @@ mod fw_cfg;
 mod graph;
 mod interrupt;
 mod model;
+mod pci;
 // Keep the LoongArch-only implementation out of other production targets, but
 // compile its unit tests on the host so output-port behavior is covered by CI.
 #[cfg(any(target_arch = "loongarch64", test))]
@@ -78,6 +79,11 @@ pub use loongarch_pch_pic::{
 pub use model::{
     AcpiContributionSpec, AcpiDeviceSpec, DeviceFirmwareProperty, DeviceFirmwareSpec, DeviceModel,
     FdtContributionSpec, FdtNodeSpec,
+};
+pub use pci::{
+    ConfigOffset, PciBarIndex, PciBarRoute, PciBdf, PciClass, PciEndpointIdentity, PciError,
+    PciFunctionSpec, PciMemoryBar, PciResult, PciRootState, PciSegment, PciTopologyBuilder,
+    ResolvedPciBar, ResolvedPciFunction, ResolvedPciTopology,
 };
 pub use registration::{
     DeviceBundle, DeviceLifecycle, DeviceRegistration, DmaPollableDeviceOps, PollableDeviceOps,
