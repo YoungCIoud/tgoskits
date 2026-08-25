@@ -11,6 +11,20 @@ pub enum DeviceGraphError {
         /// Duplicate stable node identifier.
         node: String,
     },
+    /// The same typed PCI host key was registered twice.
+    #[error("PCI host provider {host} is registered more than once")]
+    DuplicatePciHost {
+        /// Duplicate provider key.
+        host: String,
+    },
+    /// A PCI endpoint selected a host provider that is not registered.
+    #[error("PCI endpoint {endpoint} requires unavailable host {host}")]
+    PciHostUnavailable {
+        /// Endpoint graph identity.
+        endpoint: String,
+        /// Missing typed provider key.
+        host: String,
+    },
     /// A node references a parent or dependency that is absent.
     #[error("device graph node {node} references missing node {dependency}")]
     MissingDependency {

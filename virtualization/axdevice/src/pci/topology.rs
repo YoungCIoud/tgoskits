@@ -94,6 +94,8 @@ impl PciTopologyBuilder {
                 multifunction_devices.contains(&bdf.device()),
             )?;
             functions.push(ResolvedPciFunction {
+                owner: id.clone(),
+                host: id.clone(),
                 id,
                 identity: spec.identity,
                 bdf,
@@ -128,6 +130,8 @@ impl fmt::Debug for PciTopologyBuilder {
 /// One immutable, resolved PCI function.
 pub struct ResolvedPciFunction {
     id: DeviceNodeId,
+    owner: DeviceNodeId,
+    host: DeviceNodeId,
     identity: PciEndpointIdentity,
     bdf: PciBdf,
     bars: Vec<ResolvedBarPlan>,
@@ -138,6 +142,16 @@ impl ResolvedPciFunction {
     /// Returns the stable function identity.
     pub const fn id(&self) -> &DeviceNodeId {
         &self.id
+    }
+
+    /// Returns the graph node owning this function's state.
+    pub const fn owner(&self) -> &DeviceNodeId {
+        &self.owner
+    }
+
+    /// Returns the graph node owning this function's PCI host.
+    pub const fn host(&self) -> &DeviceNodeId {
+        &self.host
     }
 
     /// Returns the PCI identity fields.
@@ -169,6 +183,8 @@ impl fmt::Debug for ResolvedPciFunction {
         formatter
             .debug_struct("ResolvedPciFunction")
             .field("id", &self.id)
+            .field("owner", &self.owner)
+            .field("host", &self.host)
             .field("identity", &self.identity)
             .field("bdf", &self.bdf)
             .field("bars", &self.bars)
@@ -221,6 +237,21 @@ impl ResolvedPciTopology {
 
     pub(crate) fn function_plans(&self) -> &[ResolvedPciFunction] {
         &self.functions
+    }
+
+    pub(crate) fn assign_graph_ownership(
+        &mut self,
+        host: &DeviceNodeId,
+        endpoint_ids: &BTreeSet<DeviceNodeId>,
+    ) {
+        for function in &mut self.functions {
+            function.host = host.clone();
+            function.owner = if endpoint_ids.contains(&function.id) {
+                function.id.clone()
+            } else {
+                host.clone()
+            };
+        }
     }
 }
 

@@ -87,7 +87,7 @@ impl PciEndpointIdentity {
 }
 
 /// Unresolved Type-0 function declaration consumed by [`PciTopologyBuilder`](super::PciTopologyBuilder).
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct PciFunctionSpec {
     pub(crate) id: DeviceNodeId,
     pub(crate) identity: PciEndpointIdentity,

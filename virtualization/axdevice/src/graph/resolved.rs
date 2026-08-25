@@ -1,6 +1,6 @@
 //! Immutable resolved device graph.
 
-use alloc::{sync::Arc, vec::Vec};
+use alloc::{collections::BTreeMap, sync::Arc, vec::Vec};
 
 use super::{builder::*, *};
 use crate::*;
@@ -81,12 +81,14 @@ pub struct ResolvedDeviceGraph {
     nodes: Vec<ResolvedDeviceNode>,
     resources: VmResourcePlan,
     fixed_leases: Vec<ResourceLease>,
+    pci_topologies: BTreeMap<PciHostKey, Arc<ResolvedPciTopology>>,
 }
 
 impl ResolvedDeviceGraph {
     pub(crate) fn new(
         nodes: Vec<ResolvedDeviceNode>,
         resources: VmResourcePlan,
+        pci_topologies: BTreeMap<PciHostKey, Arc<ResolvedPciTopology>>,
     ) -> DeviceManagerResult<Self> {
         let mut fixed_leases = Vec::new();
         for node in nodes.iter().filter(|node| !node.builds_at_runtime()) {
@@ -101,6 +103,7 @@ impl ResolvedDeviceGraph {
             nodes,
             resources,
             fixed_leases,
+            pci_topologies,
         })
     }
 
@@ -127,6 +130,11 @@ impl ResolvedDeviceGraph {
     /// Returns the canonical VM resource plan used by firmware and runtime.
     pub const fn resource_plan(&self) -> &VmResourcePlan {
         &self.resources
+    }
+
+    /// Returns the immutable PCI topology published for one typed host.
+    pub fn pci_topology(&self, host: &PciHostKey) -> Option<&ResolvedPciTopology> {
+        self.pci_topologies.get(host).map(Arc::as_ref)
     }
 
     /// Rejects a runtime model that declares platform nodes but no FDT form.
