@@ -4,7 +4,7 @@ use axvm_types::GuestPhysAddr;
 
 use crate::{
     AxVmResult,
-    architecture::{Architecture, BoundVcpuExit, VcpuRunAction},
+    architecture::{ArchOps, Architecture, BoundVcpuExit, VcpuRunAction},
     runtime::vcpus::VcpuOnError,
 };
 
@@ -95,14 +95,20 @@ pub(crate) trait CpuUpOps: Architecture {
     }
 }
 
+/// Result of one CPU-up request: the bound exit for the sending vCPU plus the
+/// secondary-boot outcome. Hypercall transports (PSCI/SBI) unwrap the exit;
+/// interrupt-driven transports (x86 INIT-SIPI) also read the outcome to decide
+/// SIPI-retry eligibility.
+pub(crate) type CpuUpOutcome<A> = (
+    BoundVcpuExit<<A as ArchOps>::DeferredRunWork>,
+    Result<usize, SecondaryCpuBootFailure>,
+);
+
 pub(crate) fn handle<A: CpuUpOps>(
     vm: &crate::AxVMRef,
     vcpu: &crate::vcpu::AxVCpu<A::VCpu>,
     exit: CpuUpExit,
-) -> AxVmResult<(
-    BoundVcpuExit<A::DeferredRunWork>,
-    Result<usize, SecondaryCpuBootFailure>,
-)> {
+) -> AxVmResult<CpuUpOutcome<A>> {
     let vm_id = vm.id();
     let vcpu_id = vcpu.id();
     info!(
