@@ -31,6 +31,35 @@ export TERM=vt100
 export PS1='~ # '
 cd /root
 
+run_x86_smp_check() {
+  success_marker=$1
+  failed=0
+  # Secondary-CPU discovery depends on the MADT: without a readable APIC
+  # table Linux would not know CPU1 exists even if the VMM starts it.
+  if [ ! -r /sys/firmware/acpi/tables/APIC ]; then
+    echo "missing readable ACPI table: APIC"
+    failed=1
+  fi
+  online=$(/bin/busybox cat /sys/devices/system/cpu/online 2>/dev/null)
+  if [ "$online" != "0-1" ]; then
+    echo "unexpected online CPU set: $online"
+    failed=1
+  fi
+  if [ ! -e /sys/devices/system/cpu/cpu1 ]; then
+    echo "missing /sys/devices/system/cpu/cpu1"
+    failed=1
+  fi
+  if ! /bin/busybox grep -q 'IO-APIC' /proc/interrupts; then
+    echo "Linux did not initialize an IOAPIC"
+    failed=1
+  fi
+  if [ "$failed" -ne 0 ]; then
+    echo AXVISOR_X86_SMP_FAILED
+  else
+    echo "$success_marker"
+  fi
+}
+
 run_x86_acpi_check() {
   success_marker=$1
   failed=0
@@ -64,6 +93,9 @@ run_x86_acpi_check() {
 
 cmdline=$(/bin/busybox cat /proc/cmdline)
 case "$cmdline" in
+  # The SMP arm must precede the acpi_case arms: the SMP guest cmdline also
+  # carries axvisor.acpi_case=direct to describe its boot mode.
+  *axvisor.smp_case=x86*) run_x86_smp_check AXVISOR_X86_SMP_PASSED; exec /bin/busybox sh -i ;;
   *axvisor.acpi_case=direct*) run_x86_acpi_check AXVISOR_X86_DIRECT_ACPI_PASSED; exec /bin/busybox sh -i ;;
   *axvisor.acpi_case=ovmf*) run_x86_acpi_check AXVISOR_X86_OVMF_ACPI_PASSED; exec /bin/busybox sh -i ;;
   *axvisor.acpi_case=off*)
@@ -395,6 +427,25 @@ mod tests {
             init.windows(b"AXVISOR_X86_OVMF_ACPI_PASSED".len())
                 .any(|window| window == b"AXVISOR_X86_OVMF_ACPI_PASSED")
         );
+        assert!(
+            init.windows(b"AXVISOR_X86_SMP_PASSED".len())
+                .any(|window| window == b"AXVISOR_X86_SMP_PASSED")
+        );
+        assert!(
+            init.windows(b"AXVISOR_X86_SMP_FAILED".len())
+                .any(|window| window == b"AXVISOR_X86_SMP_FAILED")
+        );
+        // The SMP guest cmdline carries both markers, so the dispatch must
+        // try the SMP case before the ACPI-only cases.
+        let smp_arm = init
+            .windows(b"axvisor.smp_case=x86*)".len())
+            .position(|window| window == b"axvisor.smp_case=x86*)")
+            .unwrap();
+        let acpi_arm = init
+            .windows(b"axvisor.acpi_case=direct*)".len())
+            .position(|window| window == b"axvisor.acpi_case=direct*)")
+            .unwrap();
+        assert!(smp_arm < acpi_arm);
         for applet in ["cat", "date", "dmesg", "grep", "mount", "sh", "sleep"] {
             assert_eq!(entries.get(&format!("bin/{applet}")).unwrap(), b"busybox");
         }
