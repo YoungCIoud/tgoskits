@@ -92,6 +92,7 @@ impl PciTopologyBuilder {
                 spec.identity,
                 &bars,
                 multifunction_devices.contains(&bdf.device()),
+                &spec.config_bytes,
             )?;
             functions.push(ResolvedPciFunction {
                 owner: id.clone(),

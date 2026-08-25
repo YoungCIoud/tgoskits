@@ -6,6 +6,7 @@ use super::{
     PciBdf, PciEndpointIdentity, PciResult,
     address::CONFIG_SPACE_SIZE,
     bar::{BarState, ResolvedBarPlan},
+    function::PciConfigByte,
 };
 
 const COMMAND_MEMORY_SPACE_ENABLE: u8 = 0x02;
@@ -21,6 +22,7 @@ impl PowerOnConfig {
         identity: PciEndpointIdentity,
         bars: &[ResolvedBarPlan],
         multifunction: bool,
+        config_bytes: &[PciConfigByte],
     ) -> PciResult<Self> {
         if identity.vendor_id() == u16::MAX {
             return Err(super::PciError::InvalidEndpointIdentity {
@@ -38,6 +40,11 @@ impl PowerOnConfig {
         bytes[10] = class.subclass();
         bytes[11] = class.base();
         bytes[14] = if multifunction { 0x80 } else { 0 };
+        for patch in config_bytes {
+            let offset = usize::from(patch.offset.value());
+            bytes[offset] = patch.value;
+            write_mask[offset] = patch.write_mask;
+        }
         for bar in bars {
             let offset = bar.index.config_offset();
             bytes[offset..offset + 4]
@@ -173,7 +180,7 @@ mod tests {
             size: bar.size(),
             address: 0x2000_0000,
         };
-        let power_on = PowerOnConfig::build(identity, &[plan], false).unwrap();
+        let power_on = PowerOnConfig::build(identity, &[plan], false, &[]).unwrap();
         let mut state = FunctionState::new(PciBdf::bus_zero(1), power_on, &[plan]);
 
         state.write_non_bar(0, 4, 0);

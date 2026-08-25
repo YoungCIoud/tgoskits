@@ -3,7 +3,14 @@
 use alloc::vec::Vec;
 
 use super::{PciError, PciMemoryBar, PciResult};
-use crate::{DeviceNodeId, ResourceRequest};
+use crate::{ConfigOffset, DeviceNodeId, ResourceRequest};
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PciConfigByte {
+    pub(crate) offset: ConfigOffset,
+    pub(crate) value: u8,
+    pub(crate) write_mask: u8,
+}
 
 /// PCI class-code triplet for a Type-0 function.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -93,6 +100,7 @@ pub struct PciFunctionSpec {
     pub(crate) identity: PciEndpointIdentity,
     pub(crate) bdf: ResourceRequest<super::PciBdf>,
     pub(crate) bars: Vec<PciMemoryBar>,
+    pub(crate) config_bytes: Vec<PciConfigByte>,
 }
 
 impl PciFunctionSpec {
@@ -103,6 +111,7 @@ impl PciFunctionSpec {
             identity,
             bdf: ResourceRequest::Auto,
             bars: Vec::new(),
+            config_bytes: Vec::new(),
         }
     }
 
@@ -135,6 +144,53 @@ impl PciFunctionSpec {
             });
         }
         self.bars.push(bar);
+        Ok(self)
+    }
+
+    /// Defines one platform-owned conventional config byte and its write mask.
+    ///
+    /// This is intended for fixed host-bridge compatibility fields. BAR bytes
+    /// cannot be overridden because their state is owned by the root BAR
+    /// state machine.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PciError::InvalidConfigPatch`] when the offset belongs to
+    /// core identity, status, or BAR state, or when the byte is duplicated.
+    pub fn with_platform_config_byte(
+        mut self,
+        offset: ConfigOffset,
+        value: u8,
+        write_mask: u8,
+    ) -> PciResult<Self> {
+        let offset_value = offset.value();
+        if (0x10..0x28).contains(&offset_value) {
+            return Err(PciError::InvalidConfigPatch {
+                offset: offset_value,
+                detail: "BAR bytes are owned by the BAR state machine",
+            });
+        }
+        if !matches!(offset_value, 4 | 5 | 0x0e) && offset_value < 0x40 {
+            return Err(PciError::InvalidConfigPatch {
+                offset: offset_value,
+                detail: "core identity and status fields cannot be overridden",
+            });
+        }
+        if self
+            .config_bytes
+            .iter()
+            .any(|existing| existing.offset == offset)
+        {
+            return Err(PciError::InvalidConfigPatch {
+                offset: offset.value(),
+                detail: "config byte is already defined",
+            });
+        }
+        self.config_bytes.push(PciConfigByte {
+            offset,
+            value,
+            write_mask,
+        });
         Ok(self)
     }
 }

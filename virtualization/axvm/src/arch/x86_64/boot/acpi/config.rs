@@ -109,6 +109,43 @@ impl X86FirmwarePlan {
 
         let serials = x86_serial_plans(graph)?;
         let specials = resolve_x86_specials(&firmware.specials, &serials)?;
+        let pci_topology = graph
+            .pci_topology(&crate::arch::x86_64::pci_config::host_key())
+            .ok_or(X86FirmwarePlanError::MissingDevice {
+                node_id: crate::arch::x86_64::pci_config::PCI_HOST_NODE,
+            })?;
+        let pci_aperture = pci_topology.memory_aperture();
+        let pci_size = pci_aperture
+            .end
+            .checked_sub(pci_aperture.start)
+            .ok_or_else(|| X86FirmwarePlanError::InvalidValue {
+                field: "PCI memory aperture",
+                value: "empty or reversed".into(),
+            })?;
+        if specials.pci_memory != (pci_aperture.start, pci_size) {
+            return Err(X86FirmwarePlanError::InvalidValue {
+                field: "PCI firmware/runtime aperture",
+                value: "ACPI contribution differs from resolved PCI topology".into(),
+            });
+        }
+        let pci_memory_end =
+            pci_aperture
+                .end
+                .checked_sub(1)
+                .ok_or_else(|| X86FirmwarePlanError::InvalidValue {
+                    field: "PCI memory aperture",
+                    value: "cannot encode inclusive end".into(),
+                })?;
+        let pci_memory_start =
+            u32::try_from(pci_aperture.start).map_err(|_| X86FirmwarePlanError::InvalidValue {
+                field: "PCI memory aperture start",
+                value: format!("{:#x}", pci_aperture.start),
+            })?;
+        let pci_memory_end =
+            u32::try_from(pci_memory_end).map_err(|_| X86FirmwarePlanError::InvalidValue {
+                field: "PCI memory aperture end",
+                value: format!("{pci_memory_end:#x}"),
+            })?;
         let (io_apic_base, io_apic_size) = specials.ioapic;
         if io_apic_size == 0 {
             return Err(X86FirmwarePlanError::InvalidValue {
@@ -150,8 +187,8 @@ impl X86FirmwarePlan {
                         cacheable: true,
                     },
                     X86PciMemoryWindow {
-                        start: 0xc000_0000,
-                        end: 0xfebf_ffff,
+                        start: pci_memory_start,
+                        end: pci_memory_end,
                         cacheable: false,
                     },
                 ],
@@ -233,6 +270,7 @@ struct ResolvedX86Specials {
     fw_cfg: [(u16, u16); 2],
     pm_timer: (u16, u16),
     sci: crate::boot::acpi::ResolvedAcpiInterrupt,
+    pci_memory: (u64, u64),
 }
 
 fn resolve_x86_specials(
@@ -305,13 +343,22 @@ fn resolve_x86_specials(
     }
 
     let pci = named_special(specials, "PCI0", "PCI host bridge")?;
+    let [
+        ResolvedAcpiRegister::Pio { .. },
+        ResolvedAcpiRegister::Mmio {
+            base: pci_memory_base,
+            size: pci_memory_size,
+        },
+    ] = pci.registers.as_slice()
+    else {
+        return invalid_special_shape(pci, "one CF8/CFC PIO window and one memory aperture");
+    };
     if pci.kind != ResolvedAcpiSpecialKind::PciHostBridge
         || pci.hid.as_deref() != Some("PNP0A03")
-        || !all_pio_registers(pci, 1)
         || !pci.interrupts.is_empty()
         || !pci.properties.is_empty()
     {
-        return invalid_special_shape(pci, "PNP0A03 bridge with one PIO window");
+        return invalid_special_shape(pci, "PNP0A03 bridge with CF8/CFC and memory aperture");
     }
 
     let fw_cfg = named_special(specials, "FWCF", "fw_cfg transport")?;
@@ -360,6 +407,7 @@ fn resolve_x86_specials(
         fw_cfg: [(*selector_base, *selector_size), (*dma_base, *dma_size)],
         pm_timer: (*pm_timer_base, *pm_timer_size),
         sci: *sci,
+        pci_memory: (*pci_memory_base, *pci_memory_size),
     })
 }
 

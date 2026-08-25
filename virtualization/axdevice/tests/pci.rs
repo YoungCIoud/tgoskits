@@ -263,6 +263,24 @@ fn rejects_misaligned_and_qword_config_accesses() {
 }
 
 #[test]
+fn platform_config_bytes_cannot_override_core_identity_or_bars() {
+    let function = PciFunctionSpec::new(
+        node("platform"),
+        PciEndpointIdentity::new(0x1234, 0x5678, PciClass::new(0x06, 0, 0)),
+    );
+    assert!(matches!(
+        function
+            .clone()
+            .with_platform_config_byte(ConfigOffset::new(0).unwrap(), 0, u8::MAX),
+        Err(PciError::InvalidConfigPatch { offset: 0, .. })
+    ));
+    assert!(matches!(
+        function.with_platform_config_byte(ConfigOffset::new(0x10).unwrap(), 0, u8::MAX),
+        Err(PciError::InvalidConfigPatch { offset: 0x10, .. })
+    ));
+}
+
+#[test]
 fn command_register_only_accepts_memory_space_enable() {
     let (root, endpoint_bdf, bar_base) = root_with_bar();
 

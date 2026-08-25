@@ -35,6 +35,14 @@ pub enum PciError {
         /// Diagnostic reason.
         detail: &'static str,
     },
+    /// A platform-owned config byte conflicts with core-owned state.
+    #[error("invalid PCI config patch at {offset:#x}: {detail}")]
+    InvalidConfigPatch {
+        /// Conventional config byte offset.
+        offset: u16,
+        /// Rejected invariant.
+        detail: &'static str,
+    },
     /// The root memory aperture is malformed.
     #[error("invalid PCI host aperture: {detail}")]
     InvalidHostAperture {

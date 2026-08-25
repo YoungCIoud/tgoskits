@@ -1,93 +1,88 @@
-//! Minimal Q35 PCI configuration mechanism used by x86 guest firmware.
+//! x86 PCI configuration-mechanism #1 and memory-aperture adapters.
 
-use alloc::boxed::Box;
+use alloc::{boxed::Box, sync::Arc};
 
-use ax_sync::SpinLock as Mutex;
+use ax_sync::SpinLock;
 use axdevice_base::*;
+
+use crate::{
+    ConfigOffset, DeviceLifecycle, DeviceManagerResult, PciBdf, PciRootBinding, PciRootState,
+    PciSegment,
+};
 
 const CONFIG_ADDRESS_ENABLE: u32 = 1 << 31;
 const CONFIG_ADDRESS_PORT: u16 = 0xcf8;
 const CONFIG_DATA_PORT: u16 = 0xcfc;
-const CONFIG_SPACE_SIZE: usize = 256;
 
-/// Q35-compatible PCI configuration mechanism #1 with a host bridge and LPC bridge.
-pub struct X86PciConfigDevice {
-    state: Mutex<PciConfigState>,
+/// CF8/CFC frontend that only decodes x86 port accesses.
+pub struct X86PciConfigFrontend {
+    address: SpinLock<u32>,
+    root: Arc<PciRootState>,
     resources: Box<[Resource]>,
 }
 
-struct PciConfigState {
-    address: u32,
-    host_bridge: PciFunction,
-    lpc_bridge: PciFunction,
-}
-
-struct PciFunction {
-    config: [u8; CONFIG_SPACE_SIZE],
-    write_mask: [u8; CONFIG_SPACE_SIZE],
-}
-
-impl X86PciConfigDevice {
+impl X86PciConfigFrontend {
     /// Base of the PCI configuration address/data port window.
     pub const PORT_BASE: u16 = CONFIG_ADDRESS_PORT;
     /// Size of the combined address/data port window.
     pub const PORT_SIZE: u16 = 8;
-
-    /// Creates the minimal Q35 topology required by OVMF.
-    pub fn new() -> Self {
+    /// Creates a frontend for one generic PCI root.
+    pub fn new(root: Arc<PciRootState>) -> Self {
         Self {
-            state: Mutex::new(PciConfigState::new()),
+            address: SpinLock::new(0),
+            root,
             resources: alloc::vec![Resource::PortRange {
                 base: Self::PORT_BASE,
-                size: Self::PORT_SIZE,
+                size: Self::PORT_SIZE
             }]
             .into_boxed_slice(),
         }
     }
 
-    fn access_size(width: AccessWidth) -> Result<usize, DeviceError> {
-        match width {
-            AccessWidth::Byte | AccessWidth::Word | AccessWidth::Dword => Ok(width.size()),
-            AccessWidth::Qword => Err(DeviceError::Unsupported {
-                operation: "access x86 PCI configuration ports",
-                detail: "PCI configuration mechanism #1 supports accesses up to 32 bits".into(),
-            }),
-        }
-    }
-
-    fn decode_access(access: &DeviceAccess) -> Result<(u16, usize), DeviceError> {
+    fn decode_access(access: &DeviceAccess) -> DeviceResult<(u16, usize)> {
         if access.bus() != BusKind::Port {
             return Err(DeviceError::OutOfRange {
                 addr: access.address(),
             });
         }
-        let size = Self::access_size(access.width())?;
+        if access.width() == AccessWidth::Qword {
+            return Err(DeviceError::Unsupported {
+                operation: "access x86 PCI configuration port",
+                detail: "CF8/CFC supports byte, word, and dword accesses only".into(),
+            });
+        }
         let port = u16::try_from(access.address()).map_err(|_| DeviceError::OutOfRange {
             addr: access.address(),
         })?;
-        Ok((port, size))
+        Ok((port, access.width().size()))
+    }
+
+    fn selection(&self, data_offset: usize, size: usize) -> Option<(PciBdf, ConfigOffset)> {
+        let address = *self.address.lock_irqsave();
+        if address & CONFIG_ADDRESS_ENABLE == 0 || data_offset.checked_add(size)? > 4 {
+            return None;
+        }
+        let register = (address as usize & 0xfc).checked_add(data_offset)?;
+        let bdf = PciBdf::new(
+            PciSegment::new(0),
+            (address >> 16) as u8,
+            ((address >> 11) & 0x1f) as u8,
+            ((address >> 8) & 0x7) as u8,
+        )
+        .ok()?;
+        Some((bdf, ConfigOffset::new(u16::try_from(register).ok()?).ok()?))
     }
 }
 
-impl Default for X86PciConfigDevice {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Device for X86PciConfigDevice {
+impl Device for X86PciConfigFrontend {
     fn name(&self) -> &str {
         "x86-pci-config"
     }
-
     fn resources(&self) -> &[Resource] {
         &self.resources
     }
-
     fn read(&self, access: &DeviceAccess, _context: &mut dyn DeviceContext) -> DeviceResult<u64> {
         let (port, size) = Self::decode_access(access)?;
-        let mut state = self.state.lock_irqsave();
-
         if (CONFIG_ADDRESS_PORT..CONFIG_DATA_PORT).contains(&port) {
             let offset = usize::from(port - CONFIG_ADDRESS_PORT);
             if offset + size > 4 {
@@ -95,25 +90,26 @@ impl Device for X86PciConfigDevice {
                     addr: access.address(),
                 });
             }
-            return Ok(read_bytes(&state.address.to_le_bytes(), offset, size));
+            return Ok(read_bytes(
+                &self.address.lock_irqsave().to_le_bytes(),
+                offset,
+                size,
+            ));
         }
-
         if (CONFIG_DATA_PORT..CONFIG_DATA_PORT + 4).contains(&port) {
-            let data_offset = usize::from(port - CONFIG_DATA_PORT);
-            let Some((bus, device, function, register)) = state.selection(data_offset, size) else {
+            let offset = usize::from(port - CONFIG_DATA_PORT);
+            let Some((bdf, register)) = self.selection(offset, size) else {
                 return Ok(all_ones(size));
             };
-            let Some(config) = state.function_mut(bus, device, function) else {
-                return Ok(all_ones(size));
-            };
-            Ok(config.read(register, size))
-        } else {
-            Err(DeviceError::OutOfRange {
-                addr: access.address(),
-            })
+            return self
+                .root
+                .read_config(bdf, register, access.width())
+                .map_err(pci_access_error);
         }
+        Err(DeviceError::OutOfRange {
+            addr: access.address(),
+        })
     }
-
     fn write(
         &self,
         access: &DeviceAccess,
@@ -121,8 +117,6 @@ impl Device for X86PciConfigDevice {
         _context: &mut dyn DeviceContext,
     ) -> DeviceResult {
         let (port, size) = Self::decode_access(access)?;
-        let mut state = self.state.lock_irqsave();
-
         if (CONFIG_ADDRESS_PORT..CONFIG_DATA_PORT).contains(&port) {
             let offset = usize::from(port - CONFIG_ADDRESS_PORT);
             if offset + size > 4 {
@@ -130,107 +124,107 @@ impl Device for X86PciConfigDevice {
                     addr: access.address(),
                 });
             }
-            let mut address = state.address.to_le_bytes();
-            write_bytes(&mut address, offset, size, value, &[u8::MAX; 4]);
-            state.address = u32::from_le_bytes(address);
+            let mut address = self.address.lock_irqsave();
+            let mut bytes = address.to_le_bytes();
+            write_bytes(&mut bytes, offset, size, value);
+            *address = u32::from_le_bytes(bytes);
             return Ok(());
         }
-
         if (CONFIG_DATA_PORT..CONFIG_DATA_PORT + 4).contains(&port) {
-            let data_offset = usize::from(port - CONFIG_DATA_PORT);
-            if let Some((bus, device, function, register)) = state.selection(data_offset, size)
-                && let Some(config) = state.function_mut(bus, device, function)
-            {
-                config.write(register, size, value);
+            let offset = usize::from(port - CONFIG_DATA_PORT);
+            if let Some((bdf, register)) = self.selection(offset, size) {
+                self.root
+                    .write_config(bdf, register, access.width(), value)
+                    .map_err(pci_access_error)?;
             }
-            Ok(())
-        } else {
-            Err(DeviceError::OutOfRange {
-                addr: access.address(),
-            })
+            return Ok(());
         }
+        Err(DeviceError::OutOfRange {
+            addr: access.address(),
+        })
     }
 }
 
-impl PciConfigState {
-    fn new() -> Self {
+/// Single top-level MMIO device owning a PCI root's complete memory aperture.
+pub struct PciMemoryApertureDevice {
+    binding: Arc<PciRootBinding>,
+    resources: Box<[Resource]>,
+}
+impl PciMemoryApertureDevice {
+    /// Creates the aperture adapter from the graph-resolved range.
+    pub fn new(base: u64, size: u64, binding: Arc<PciRootBinding>) -> Self {
         Self {
-            address: 0,
-            host_bridge: PciFunction::host_bridge(),
-            lpc_bridge: PciFunction::lpc_bridge(),
+            binding,
+            resources: alloc::vec![Resource::MmioRange { base, size }].into_boxed_slice(),
         }
     }
-
-    fn selection(&self, data_offset: usize, size: usize) -> Option<(u8, u8, u8, usize)> {
-        if self.address & CONFIG_ADDRESS_ENABLE == 0 {
-            return None;
-        }
-        let register = (self.address as usize & 0xfc) + data_offset;
-        if register.checked_add(size)? > CONFIG_SPACE_SIZE {
-            return None;
-        }
-        Some((
-            (self.address >> 16) as u8,
-            ((self.address >> 11) & 0x1f) as u8,
-            ((self.address >> 8) & 0x7) as u8,
-            register,
-        ))
+}
+impl Device for PciMemoryApertureDevice {
+    fn name(&self) -> &str {
+        "pci-memory-aperture"
     }
-
-    fn function_mut(&mut self, bus: u8, device: u8, function: u8) -> Option<&mut PciFunction> {
-        match (bus, device, function) {
-            (0, 0, 0) => Some(&mut self.host_bridge),
-            (0, 0x1f, 0) => Some(&mut self.lpc_bridge),
-            _ => None,
+    fn resources(&self) -> &[Resource] {
+        &self.resources
+    }
+    fn read(&self, access: &DeviceAccess, _context: &mut dyn DeviceContext) -> DeviceResult<u64> {
+        if access.bus() != BusKind::Mmio {
+            return Err(DeviceError::OutOfRange {
+                addr: access.address(),
+            });
+        }
+        match self.binding.read_bar(access.address(), access.width()) {
+            Err(DeviceError::NotFound) => Ok(all_ones(access.width().size())),
+            result => result,
+        }
+    }
+    fn write(
+        &self,
+        access: &DeviceAccess,
+        value: u64,
+        _context: &mut dyn DeviceContext,
+    ) -> DeviceResult {
+        if access.bus() != BusKind::Mmio {
+            return Err(DeviceError::OutOfRange {
+                addr: access.address(),
+            });
+        }
+        match self
+            .binding
+            .write_bar(access.address(), access.width(), value)
+        {
+            Err(DeviceError::NotFound) => Ok(()),
+            result => result,
         }
     }
 }
 
-impl PciFunction {
-    fn host_bridge() -> Self {
-        Self::new(0x8086, 0x29c0, 0x06, 0x00, 0x00, 0x00)
+/// Lifecycle adapter restoring only root-owned PCI config and BAR state.
+pub struct PciRootLifecycle(Arc<PciRootState>);
+impl PciRootLifecycle {
+    /// Creates a lifecycle adapter for one generic PCI root.
+    pub const fn new(root: Arc<PciRootState>) -> Self {
+        Self(root)
     }
-
-    fn lpc_bridge() -> Self {
-        let mut function = Self::new(0x8086, 0x2918, 0x06, 0x01, 0x00, 0x80);
-        function.config[0x40] = 0x01;
-        function.write_mask[0x40] = 0x80;
-        function.write_mask[0x41] = 0xff;
-        function.write_mask[0x44] = 0x87;
-        function
+}
+impl DeviceLifecycle for PciRootLifecycle {
+    fn reset(&self) -> DeviceManagerResult {
+        self.0.reset();
+        Ok(())
     }
-
-    fn new(
-        vendor_id: u16,
-        device_id: u16,
-        class: u8,
-        subclass: u8,
-        programming_interface: u8,
-        header_type: u8,
-    ) -> Self {
-        let mut function = Self {
-            config: [0; CONFIG_SPACE_SIZE],
-            write_mask: [0; CONFIG_SPACE_SIZE],
-        };
-        function.config[0..2].copy_from_slice(&vendor_id.to_le_bytes());
-        function.config[2..4].copy_from_slice(&device_id.to_le_bytes());
-        function.config[9] = programming_interface;
-        function.config[10] = subclass;
-        function.config[11] = class;
-        function.config[14] = header_type;
-        function.write_mask[4] = 0x07;
-        function
+    fn suspend(&self) -> DeviceManagerResult {
+        Ok(())
     }
-
-    fn read(&self, offset: usize, size: usize) -> u64 {
-        read_bytes(&self.config, offset, size)
-    }
-
-    fn write(&mut self, offset: usize, size: usize, value: u64) {
-        write_bytes(&mut self.config, offset, size, value, &self.write_mask);
+    fn resume(&self) -> DeviceManagerResult {
+        Ok(())
     }
 }
 
+fn pci_access_error(error: crate::PciError) -> DeviceError {
+    DeviceError::InvalidInput {
+        operation: "access x86 PCI configuration",
+        detail: alloc::format!("{error}"),
+    }
+}
 fn read_bytes(bytes: &[u8], offset: usize, size: usize) -> u64 {
     bytes[offset..offset + size]
         .iter()
@@ -239,82 +233,117 @@ fn read_bytes(bytes: &[u8], offset: usize, size: usize) -> u64 {
             value | (u64::from(*byte) << (index * 8))
         })
 }
-
-fn write_bytes(bytes: &mut [u8], offset: usize, size: usize, value: u64, masks: &[u8]) {
-    for index in 0..size {
-        let mask = masks[offset + index];
-        let update = (value >> (index * 8)) as u8;
-        bytes[offset + index] = (bytes[offset + index] & !mask) | (update & mask);
+fn write_bytes(bytes: &mut [u8], offset: usize, size: usize, value: u64) {
+    for (index, byte) in bytes[offset..offset + size].iter_mut().enumerate() {
+        *byte = (value >> (index * 8)) as u8;
     }
 }
-
 fn all_ones(size: usize) -> u64 {
     u64::MAX >> ((8 - size) * 8)
 }
 
 #[cfg(test)]
 mod tests {
-    use axdevice_base::{DeviceContext, DeviceId, DeviceVcpuId};
-
     use super::*;
+    use crate::{
+        PciClass, PciEndpointIdentity, PciFunctionSpec, PciTopologyBuilder, ResourceRequest,
+    };
 
-    struct NoMemory;
-
-    impl DeviceContext for NoMemory {
-        fn device_id(&self) -> DeviceId {
-            DeviceId::new(0)
-        }
+    fn bdf(device: u8) -> PciBdf {
+        PciBdf::new(PciSegment::new(0), 0, device, 0).unwrap()
     }
 
-    fn write(device: &X86PciConfigDevice, port: u16, width: AccessWidth, value: u64) {
-        device
+    fn frontend() -> X86PciConfigFrontend {
+        let mut topology = PciTopologyBuilder::new();
+        let host = PciFunctionSpec::new(
+            crate::DeviceNodeId::new("host").unwrap(),
+            PciEndpointIdentity::new(0x8086, 0x29c0, PciClass::new(0x06, 0, 0)),
+        )
+        .with_bdf(ResourceRequest::Fixed(bdf(0)));
+        let lpc = PciFunctionSpec::new(
+            crate::DeviceNodeId::new("lpc").unwrap(),
+            PciEndpointIdentity::new(0x8086, 0x2918, PciClass::new(0x06, 1, 0)),
+        )
+        .with_bdf(ResourceRequest::Fixed(bdf(0x1f)))
+        .with_platform_config_byte(ConfigOffset::new(0x0e).unwrap(), 0x80, 0)
+        .unwrap()
+        .with_platform_config_byte(ConfigOffset::new(0x40).unwrap(), 1, 0x80)
+        .unwrap()
+        .with_platform_config_byte(ConfigOffset::new(0x41).unwrap(), 0, 0xff)
+        .unwrap()
+        .with_platform_config_byte(ConfigOffset::new(0x44).unwrap(), 0, 0x87)
+        .unwrap();
+        topology.add_function(host).unwrap();
+        topology.add_function(lpc).unwrap();
+        X86PciConfigFrontend::new(Arc::new(PciRootState::new(Arc::new(
+            topology.resolve(0xc000_0000..0xd000_0000).unwrap(),
+        ))))
+    }
+
+    fn access(port: u16, width: AccessWidth) -> DeviceAccess {
+        DeviceAccess::new(DeviceVcpuId::new(0), BusKind::Port, u64::from(port), width)
+    }
+
+    fn write(frontend: &X86PciConfigFrontend, port: u16, width: AccessWidth, value: u64) {
+        frontend
             .write(
-                &DeviceAccess::new(DeviceVcpuId::new(0), BusKind::Port, u64::from(port), width),
+                &access(port, width),
                 value,
-                &mut NoMemory,
+                &mut NoopDeviceContext::new(DeviceId::new(0)),
             )
             .unwrap();
     }
 
-    fn read(device: &X86PciConfigDevice, port: u16, width: AccessWidth) -> u64 {
-        device
+    fn read(frontend: &X86PciConfigFrontend, port: u16, width: AccessWidth) -> u64 {
+        frontend
             .read(
-                &DeviceAccess::new(DeviceVcpuId::new(0), BusKind::Port, u64::from(port), width),
-                &mut NoMemory,
+                &access(port, width),
+                &mut NoopDeviceContext::new(DeviceId::new(0)),
             )
             .unwrap()
     }
 
     #[test]
-    fn q35_identity_and_lpc_pm_base_are_guest_owned() {
-        let device = X86PciConfigDevice::new();
+    fn generic_root_preserves_q35_identity_and_lpc_pm_fields() {
+        let frontend = frontend();
         write(
-            &device,
+            &frontend,
             CONFIG_ADDRESS_PORT,
             AccessWidth::Dword,
             0x8000_0000,
         );
         assert_eq!(
-            read(&device, CONFIG_DATA_PORT, AccessWidth::Dword),
+            read(&frontend, CONFIG_DATA_PORT, AccessWidth::Dword),
             0x29c0_8086
         );
 
         write(
-            &device,
+            &frontend,
             CONFIG_ADDRESS_PORT,
             AccessWidth::Dword,
             0x8000_f840,
         );
-        write(&device, CONFIG_DATA_PORT, AccessWidth::Dword, 0x601);
-        assert_eq!(read(&device, CONFIG_DATA_PORT, AccessWidth::Dword), 0x601);
+        write(&frontend, CONFIG_DATA_PORT, AccessWidth::Dword, 0x601);
+        assert_eq!(read(&frontend, CONFIG_DATA_PORT, AccessWidth::Dword), 0x601);
 
         write(
-            &device,
+            &frontend,
             CONFIG_ADDRESS_PORT,
             AccessWidth::Dword,
             0x8000_f844,
         );
-        write(&device, CONFIG_DATA_PORT, AccessWidth::Byte, 0x80);
-        assert_eq!(read(&device, CONFIG_DATA_PORT, AccessWidth::Byte), 0x80);
+        write(&frontend, CONFIG_DATA_PORT, AccessWidth::Byte, 0x80);
+        assert_eq!(read(&frontend, CONFIG_DATA_PORT, AccessWidth::Byte), 0x80);
+
+        write(
+            &frontend,
+            CONFIG_ADDRESS_PORT,
+            AccessWidth::Dword,
+            0x8000_0800,
+        );
+        assert_eq!(
+            read(&frontend, CONFIG_DATA_PORT, AccessWidth::Dword),
+            u32::MAX.into()
+        );
     }
 }
