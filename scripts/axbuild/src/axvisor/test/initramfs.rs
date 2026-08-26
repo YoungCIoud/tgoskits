@@ -62,25 +62,6 @@ run_x86_acpi_check() {
   fi
 }
 
-cmdline=$(/bin/busybox cat /proc/cmdline)
-case "$cmdline" in
-  *axvisor.acpi_case=direct*) run_x86_acpi_check AXVISOR_X86_DIRECT_ACPI_PASSED; exec /bin/busybox sh -i ;;
-  *axvisor.acpi_case=ovmf*) run_x86_acpi_check AXVISOR_X86_OVMF_ACPI_PASSED; exec /bin/busybox sh -i ;;
-  *axvisor.pci_case=enumeration*) run_pci_enumeration_check AXVISOR_X86_VPCI_ENUMERATION_PASSED; exec /bin/busybox sh -i ;;
-  *axvisor.acpi_case=off*)
-    if [ -d /sys/firmware/acpi/tables ]; then
-      echo AXVISOR_X86_ACPI_FAILED
-    else
-      echo AXVISOR_X86_MP_FALLBACK_PASSED
-    fi
-    exec /bin/busybox sh -i
-    ;;
-  *axvisor.timer_case=gicv3-its*) success_marker=AXVISOR_GICV3_ITS_TIMER_STRESS_PASSED; require_its=1 ;;
-  *axvisor.timer_case=gicv2*) success_marker=AXVISOR_GICV2_TIMER_STRESS_PASSED; require_its=0 ;;
-  *axvisor.timer_case=gicv3*) success_marker=AXVISOR_GICV3_TIMER_STRESS_PASSED; require_its=0 ;;
-  *) echo AXVISOR_GUEST_ASSERTION_CASE_UNKNOWN; exec /bin/busybox sh -i ;;
-esac
-
 run_pci_enumeration_check() {
   success_marker=$1
   failed=0
@@ -157,6 +138,26 @@ run_pci_enumeration_check() {
     echo "$success_marker"
   fi
 }
+
+cmdline=$(/bin/busybox cat /proc/cmdline)
+case "$cmdline" in
+  *axvisor.acpi_case=direct*) run_x86_acpi_check AXVISOR_X86_DIRECT_ACPI_PASSED; exec /bin/busybox sh -i ;;
+  *axvisor.acpi_case=ovmf*) run_x86_acpi_check AXVISOR_X86_OVMF_ACPI_PASSED; exec /bin/busybox sh -i ;;
+  *axvisor.pci_case=enumeration*) run_pci_enumeration_check AXVISOR_X86_VPCI_ENUMERATION_PASSED; exec /bin/busybox sh -i ;;
+  *axvisor.acpi_case=off*)
+    if [ -d /sys/firmware/acpi/tables ]; then
+      echo AXVISOR_X86_ACPI_FAILED
+    else
+      echo AXVISOR_X86_MP_FALLBACK_PASSED
+    fi
+    exec /bin/busybox sh -i
+    ;;
+  *axvisor.timer_case=gicv3-its*) success_marker=AXVISOR_GICV3_ITS_TIMER_STRESS_PASSED; require_its=1 ;;
+  *axvisor.timer_case=gicv2*) success_marker=AXVISOR_GICV2_TIMER_STRESS_PASSED; require_its=0 ;;
+  *axvisor.timer_case=gicv3*) success_marker=AXVISOR_GICV3_TIMER_STRESS_PASSED; require_its=0 ;;
+  *) echo AXVISOR_GUEST_ASSERTION_CASE_UNKNOWN; exec /bin/busybox sh -i ;;
+esac
+
 
 start=$(/bin/busybox date +%s)
 last=$start

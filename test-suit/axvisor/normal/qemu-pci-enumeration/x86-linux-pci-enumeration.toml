@@ -19,7 +19,7 @@ ramdisk_path = "${workspace}/tmp/axbuild/axvisor/qemu-pci-enumeration/initramfs-
 ramdisk_load_addr = 0x0800_0000
 enable_bios = false
 boot_protocol = "direct"
-cmdline = "console=ttyS0 rdinit=/init devtmpfs.mount=1 loglevel=7 nox2apic no_timer_check initcall_blacklist=ahci_pci_driver_init axvisor.pci_case=enumeration"
+cmdline = "console=ttyS0 rdinit=/init devtmpfs.mount=1 loglevel=7 nox2apic no_timer_check initcall_blacklist=ahci_pci_driver_init,virtio_pci_driver_init axvisor.pci_case=enumeration"
 memory_regions = [
     [0x0000_0000, 0x2000_0000, 0x7, 0],
 ]
