@@ -141,10 +141,10 @@ impl DeviceBundle {
     }
 
     /// Adds one device as this graph node's resolved PCI function.
-    pub fn add_pci_function<T>(&mut self, function: Arc<T>) -> DeviceManagerResult<usize>
-    where
-        T: PciFunction + 'static,
-    {
+    pub fn add_pci_function(
+        &mut self,
+        function: Arc<dyn PciFunction>,
+    ) -> DeviceManagerResult<usize> {
         if self.pci_function.is_some() {
             return Err(DeviceManagerError::ResourceConflict {
                 operation: "declare bundled PCI function",
@@ -153,7 +153,6 @@ impl DeviceBundle {
         }
         let device: Arc<dyn Device> = function.clone();
         let device_index = self.add_device(device);
-        let function: Arc<dyn PciFunction> = function;
         self.pci_function = Some(BundlePciFunction {
             device_index,
             function,

@@ -80,13 +80,21 @@ struct VpciTestFunction {
 
 impl VpciTestFunction {
     fn new() -> DeviceManagerResult<Self> {
+        Self::with_bar_size(BAR_SIZE as u64)
+    }
+
+    fn with_bar_size(size: u64) -> DeviceManagerResult<Self> {
         let mut backing = Vec::new();
         backing
-            .try_reserve_exact(BAR_SIZE)
+            .try_reserve_exact(usize::try_from(size).map_err(|_| {
+                DeviceManagerError::OutOfMemory {
+                    operation: "allocate vpci-test BAR backing",
+                }
+            })?)
             .map_err(|_| DeviceManagerError::OutOfMemory {
                 operation: "allocate vpci-test BAR backing",
             })?;
-        backing.resize(BAR_SIZE, 0);
+        backing.resize(usize::try_from(size).unwrap(), 0);
         Ok(Self {
             backing: Mutex::new(backing),
         })
@@ -214,6 +222,41 @@ mod tests {
         let second = VpciTestFunction::new().unwrap();
         first.backing.lock().unwrap()[0] = 0xa5;
         assert_eq!(second.backing.lock().unwrap()[0], 0);
+    }
+
+    #[test]
+    fn unknown_options_are_rejected_through_the_catalog_path() {
+        let context = DeviceInstantiationContext::new();
+
+        // The model takes no options at all.
+        let empty = VirtualDeviceRequest {
+            id: "vpci-test0".into(),
+            model: MODEL.into(),
+            options: Default::default(),
+        };
+        assert!(create_device_node(id("vpci-test0"), &empty, &context).is_ok());
+
+        // Any option key is unknown for this fixture and must fail loudly.
+        let unknown = VirtualDeviceRequest {
+            id: "vpci-test0".into(),
+            model: MODEL.into(),
+            options: "bdf = 1".parse().unwrap(),
+        };
+        match create_device_node(id("vpci-test0"), &unknown, &context) {
+            Err(ConfiguredDeviceError::InvalidOptions { detail, .. }) => {
+                assert!(detail.contains("unknown field"));
+            }
+            Err(error) => panic!("expected InvalidOptions, got {error}"),
+            Ok(_) => panic!("unknown options must be rejected"),
+        }
+    }
+
+    #[test]
+    fn oversized_backing_allocation_fails_explicitly() {
+        match VpciTestFunction::with_bar_size(u64::MAX) {
+            Err(DeviceManagerError::OutOfMemory { .. }) => {}
+            _ => panic!("oversized backing must fail with OutOfMemory"),
+        }
     }
 
     struct HostModel {

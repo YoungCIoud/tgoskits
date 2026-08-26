@@ -110,6 +110,44 @@ fn rejects_fixed_requests_for_nonzero_functions() {
 }
 
 #[test]
+fn rejects_auto_bar_larger_than_the_aperture() {
+    let bar0 = PciBarIndex::new(0).unwrap();
+    let mut builder = PciTopologyBuilder::new();
+    builder
+        .add_function(
+            function("oversized")
+                .with_bar(PciMemoryBar::new(bar0, 0x100_0000).unwrap())
+                .unwrap(),
+        )
+        .unwrap();
+    assert!(matches!(
+        builder.resolve(APERTURE_START..APERTURE_END),
+        Err(PciError::BarApertureExhausted { .. })
+    ));
+}
+
+#[test]
+fn rejects_fixed_bars_at_size_misaligned_addresses() {
+    let bar0 = PciBarIndex::new(0).unwrap();
+    let mut builder = PciTopologyBuilder::new();
+    builder
+        .add_function(
+            function("misaligned")
+                .with_bar(
+                    PciMemoryBar::new(bar0, BAR_SIZE)
+                        .unwrap()
+                        .with_address(ResourceRequest::Fixed(APERTURE_START + 8)),
+                )
+                .unwrap(),
+        )
+        .unwrap();
+    assert!(matches!(
+        builder.resolve(APERTURE_START..APERTURE_END),
+        Err(PciError::InvalidBar { .. })
+    ));
+}
+
+#[test]
 fn rejects_fixed_bdf_conflicts_and_reserved_requests() {
     let mut duplicate = PciTopologyBuilder::new();
     duplicate

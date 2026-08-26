@@ -244,3 +244,141 @@ impl Drop for PciBindingLease {
         drop(endpoint);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use axdevice_base::{DeviceAccess, Resource};
+
+    use super::*;
+    use crate::PciError;
+
+    struct StubFunction;
+
+    impl Device for StubFunction {
+        fn name(&self) -> &str {
+            "stub-pci-function"
+        }
+        fn resources(&self) -> &[Resource] {
+            &[]
+        }
+        fn read(
+            &self,
+            _access: &DeviceAccess,
+            _context: &mut dyn DeviceContext,
+        ) -> DeviceResult<u64> {
+            Err(DeviceError::NotFound)
+        }
+        fn write(
+            &self,
+            _access: &DeviceAccess,
+            _value: u64,
+            _context: &mut dyn DeviceContext,
+        ) -> DeviceResult {
+            Ok(())
+        }
+    }
+
+    impl PciFunction for StubFunction {
+        fn read_bar(
+            &self,
+            _access: PciBarAccess,
+            _context: &mut dyn DeviceContext,
+        ) -> DeviceResult<u64> {
+            Ok(0)
+        }
+        fn write_bar(
+            &self,
+            _access: PciBarAccess,
+            _value: u64,
+            _context: &mut dyn DeviceContext,
+        ) -> DeviceResult {
+            Ok(())
+        }
+    }
+
+    fn router() -> EndpointRouter {
+        EndpointRouter {
+            state: SpinLock::new(EndpointRouterState::default()),
+        }
+    }
+
+    #[test]
+    fn rebind_mints_a_new_generation_and_rejects_stale_tokens() {
+        let router = router();
+        let function: Arc<dyn PciFunction> = Arc::new(StubFunction);
+        let device = DeviceId::new(7);
+
+        let first = router.activate(device, Arc::clone(&function)).unwrap();
+        assert_eq!(first.generation, 1);
+        assert!(router.endpoint(first).is_ok());
+
+        let removed = router.invalidate(first).unwrap();
+        assert!(Arc::ptr_eq(&removed, &function));
+        let second = router.activate(device, Arc::clone(&function)).unwrap();
+        assert_eq!(second.generation, 2);
+
+        // The old generation can never dispatch again, before or after the
+        // new binding exists.
+        assert!(matches!(
+            router.endpoint(first),
+            Err(DeviceError::InvalidState { .. })
+        ));
+        drop(router.endpoint(second).unwrap());
+    }
+
+    #[test]
+    fn invalidate_returns_none_for_unknown_or_stale_tokens() {
+        let router = router();
+        let function: Arc<dyn PciFunction> = Arc::new(StubFunction);
+        let device = DeviceId::new(3);
+
+        let token = router.activate(device, Arc::clone(&function)).unwrap();
+        let forged = EndpointRouteToken {
+            device,
+            generation: token.generation + 1,
+        };
+        assert!(router.invalidate(forged).is_none());
+        assert!(router.endpoint(token).is_ok());
+        assert_eq!(
+            router.invalidate(token).map(|arc| Arc::strong_count(&arc)),
+            Some(2)
+        );
+        assert!(router.invalidate(token).is_none());
+    }
+
+    #[test]
+    fn root_rejects_a_second_binding_for_the_same_function() {
+        use crate::{PciClass, PciEndpointIdentity, PciFunctionSpec, PciTopologyBuilder};
+
+        let mut builder = PciTopologyBuilder::new();
+        builder
+            .add_function(PciFunctionSpec::new(
+                DeviceNodeId::new("endpoint").unwrap(),
+                PciEndpointIdentity::new(0x1af4, 0x1110, PciClass::new(0xff, 0, 0)),
+            ))
+            .unwrap();
+        let topology = Arc::new(builder.resolve(0xc000_0000..0xc100_0000).unwrap());
+        let root = PciRootState::new(Arc::clone(&topology));
+        let function_id = DeviceNodeId::new("endpoint").unwrap();
+
+        let router = router();
+        let function: Arc<dyn PciFunction> = Arc::new(StubFunction);
+        let first = router
+            .activate(DeviceId::new(1), Arc::clone(&function))
+            .unwrap();
+        root.bind_endpoint(&function_id, first).unwrap();
+        assert!(matches!(
+            root.bind_endpoint(&function_id, first),
+            Err(PciError::FunctionAlreadyBound { .. })
+        ));
+
+        // Unbind invalidates the route; the same token never revives.
+        drop(router.invalidate(first));
+        root.unbind_endpoint(first);
+        assert_eq!(root.resolve_bound_bar(0xc000_0000, AccessWidth::Byte), None);
+        let second = router
+            .activate(DeviceId::new(1), Arc::clone(&function))
+            .unwrap();
+        root.bind_endpoint(&function_id, second).unwrap();
+    }
+}
