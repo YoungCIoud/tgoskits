@@ -191,9 +191,6 @@ runner = "kvm-intel"
 timeout_minutes = 45
 command = '''
 cargo xtask image pull qemu-x86_64 --extract-dir tmp/axbuild/images
-cargo xtask image pull rootfs-x86_64-debian.img --extract-dir tmp/axbuild/rootfs
-mkdir -p tmp/axbuild/images/qemu-x86_64/linux
-ln -sfn ../../../rootfs/rootfs-x86_64-debian.img tmp/axbuild/images/qemu-x86_64/linux/rootfs.img
 cargo xtask axvisor test qemu --arch x86_64 --test-case pci-enumeration-vmx
 '''
 
@@ -210,9 +207,6 @@ runner = "kvm-amd"
 timeout_minutes = 45
 command = '''
 cargo xtask image pull qemu-x86_64 --extract-dir tmp/axbuild/images
-cargo xtask image pull rootfs-x86_64-debian.img --extract-dir tmp/axbuild/rootfs
-mkdir -p tmp/axbuild/images/qemu-x86_64/linux
-ln -sfn ../../../rootfs/rootfs-x86_64-debian.img tmp/axbuild/images/qemu-x86_64/linux/rootfs.img
 cargo xtask axvisor test qemu --arch x86_64 --test-case pci-enumeration-svm
 '''
 

@@ -66,6 +66,7 @@ cmdline=$(/bin/busybox cat /proc/cmdline)
 case "$cmdline" in
   *axvisor.acpi_case=direct*) run_x86_acpi_check AXVISOR_X86_DIRECT_ACPI_PASSED; exec /bin/busybox sh -i ;;
   *axvisor.acpi_case=ovmf*) run_x86_acpi_check AXVISOR_X86_OVMF_ACPI_PASSED; exec /bin/busybox sh -i ;;
+  *axvisor.pci_case=enumeration*) run_pci_enumeration_check AXVISOR_X86_VPCI_ENUMERATION_PASSED; exec /bin/busybox sh -i ;;
   *axvisor.acpi_case=off*)
     if [ -d /sys/firmware/acpi/tables ]; then
       echo AXVISOR_X86_ACPI_FAILED
@@ -79,6 +80,83 @@ case "$cmdline" in
   *axvisor.timer_case=gicv3*) success_marker=AXVISOR_GICV3_TIMER_STRESS_PASSED; require_its=0 ;;
   *) echo AXVISOR_GUEST_ASSERTION_CASE_UNKNOWN; exec /bin/busybox sh -i ;;
 esac
+
+run_pci_enumeration_check() {
+  success_marker=$1
+  failed=0
+  # The managed rootfs images ship no pciutils, so this check consumes the
+  # kernel-published sysfs PCI state directly (the same source `lspci` reads).
+  bdf=""
+  count=0
+  for dev in /sys/bus/pci/devices/*; do
+    [ -d "$dev" ] || continue
+    vendor=$(/bin/busybox cat "$dev/vendor")
+    device=$(/bin/busybox cat "$dev/device")
+    class=$(/bin/busybox cat "$dev/class")
+    if [ "$vendor" = "0x1af4" ] && [ "$device" = "0x1110" ] && [ "$class" = "0x050000" ]; then
+      bdf=${dev##*/}
+      count=$((count + 1))
+    fi
+  done
+  echo "guest kernel: $(/bin/busybox uname -r)"
+  if [ "$count" -ne 1 ]; then
+    echo "expected exactly one 0500:1af4:1110 function, found $count"
+    failed=1
+  else
+    endpoint=/sys/bus/pci/devices/$bdf
+    if [ -L "$endpoint/driver" ]; then
+      echo "vPCI endpoint unexpectedly bound to a driver"
+      failed=1
+    fi
+    # The kernel publishes `resource` entries as bare hex columns; tolerate an
+    # optional 0x prefix and turn malformed input into an explicit failure so
+    # the case reports FAILED instead of dying inside arithmetic.
+    resource_line=$(/bin/busybox sed -n '3p' "$endpoint/resource")
+    set -- $resource_line
+    if [ $# -lt 3 ]; then
+      echo "BAR2 resource entry is missing or unreadable"
+      failed=1
+    else
+      v1=${1#0x}
+      v2=${2#0x}
+      v3=${3#0x}
+      case "$v1$v2$v3" in
+        *[!0-9a-fA-F]*)
+          echo "BAR2 resource entry is malformed: $resource_line"
+          failed=1
+          ;;
+        *)
+          bar_start=$((0x$v1))
+          bar_end=$((0x$v2))
+          bar_flags=$((0x$v3))
+          bar_size=$((bar_end - bar_start + 1))
+          echo "vPCI endpoint $bdf BAR2 [$bar_start-$bar_end] flags $bar_flags"
+          if [ "$bar_size" -ne 65536 ]; then
+            echo "BAR2 is not a 64 KiB memory resource"
+            failed=1
+          fi
+          if [ $((bar_flags & 0x200)) -eq 0 ]; then
+            echo "BAR2 is not a memory resource"
+            failed=1
+          fi
+          if [ $((bar_flags & 0x2000)) -ne 0 ]; then
+            echo "BAR2 unexpectedly prefetchable"
+            failed=1
+          fi
+          if [ -e "$endpoint/capabilities/msi" ] || [ -e "$endpoint/capabilities/msix" ]; then
+            echo "vPCI endpoint unexpectedly advertises MSI/MSI-X"
+            failed=1
+          fi
+          ;;
+        esac
+      fi
+    fi
+  if [ "$failed" -ne 0 ]; then
+    echo AXVISOR_X86_VPCI_ENUMERATION_FAILED
+  else
+    echo "$success_marker"
+  fi
+}
 
 start=$(/bin/busybox date +%s)
 last=$start
@@ -238,7 +316,9 @@ fn build_busybox_initramfs(
         archive.append_regular("bin/busybox", busybox)?;
         archive.append_regular(loader_archive_path, loader)?;
         archive.append_regular("init", INIT_SCRIPT)?;
-        for applet in ["cat", "date", "dmesg", "grep", "mount", "sh", "sleep"] {
+        for applet in [
+            "cat", "date", "dmesg", "grep", "mount", "sed", "sh", "sleep",
+        ] {
             archive.append_symlink(&format!("bin/{applet}"), "busybox")?;
         }
         archive.finish()?;
@@ -395,7 +475,17 @@ mod tests {
             init.windows(b"AXVISOR_X86_OVMF_ACPI_PASSED".len())
                 .any(|window| window == b"AXVISOR_X86_OVMF_ACPI_PASSED")
         );
-        for applet in ["cat", "date", "dmesg", "grep", "mount", "sh", "sleep"] {
+        assert!(
+            init.windows(b"AXVISOR_X86_VPCI_ENUMERATION_PASSED".len())
+                .any(|window| window == b"AXVISOR_X86_VPCI_ENUMERATION_PASSED")
+        );
+        assert!(
+            init.windows(b"AXVISOR_X86_VPCI_ENUMERATION_FAILED".len())
+                .any(|window| window == b"AXVISOR_X86_VPCI_ENUMERATION_FAILED")
+        );
+        for applet in [
+            "cat", "date", "dmesg", "grep", "mount", "sed", "sh", "sleep",
+        ] {
             assert_eq!(entries.get(&format!("bin/{applet}")).unwrap(), b"busybox");
         }
     }

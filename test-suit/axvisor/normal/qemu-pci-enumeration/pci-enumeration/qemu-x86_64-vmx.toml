@@ -14,10 +14,6 @@ args = [
     "1",
     "-accel",
     "kvm",
-    "-device",
-    "nvme,drive=disk0,serial=tgoskits,max_ioqpairs=64,msix_qsize=65,addr=03.0",
-    "-drive",
-    "id=disk0,if=none,format=raw,file=${workspace}/tmp/axbuild/rootfs/rootfs-x86_64-debian.img",
     "-m",
     "1G",
     "-net",
@@ -31,42 +27,10 @@ fail_regex = [
     "(?i)kernel panic",
     "(?i)page fault",
     "(?i)vm exit failure",
+    "(?i)failed to initialize guest VM",
     "(?m)^AXVISOR_X86_VPCI_ENUMERATION_FAILED\\s*$",
     "(?m)^AXVISOR_GUEST_ASSERTION_CASE_UNKNOWN\\s*$",
 ]
 success_regex = ["(?m)^AXVISOR_X86_VPCI_ENUMERATION_PASSED\\s*$"]
-shell_prefix = "axvisor:/$"
-shell_init_cmd = """
-set -u
-export LC_ALL=C
-echo "pciutils: $(lspci --version)"
-bdf=$(lspci -D -n | awk '$2 == "0500:" && $3 == "1af4:1110" { print $1 }')
-failed=0
-if [ "$(printf '%s\\n' "$bdf" | sed '/^$/d' | wc -l)" -ne 1 ]; then
-  echo "expected one 0500:1af4:1110 function, got: $bdf"
-  failed=1
-else
-  if [ -L "/sys/bus/pci/devices/$bdf/driver" ]; then
-    echo "vPCI endpoint unexpectedly has a Linux driver"
-    failed=1
-  fi
-  lspci -D -n -s "$bdf"
-  verbose=$(lspci -vv -s "${bdf#0000:}")
-  echo "$verbose"
-  if ! echo "$verbose" | grep -Eq 'Region 2: Memory .*32-bit[, ]+non-prefetchable.*\\[size=64K\\]'; then
-    echo "BAR2 is not a 64 KiB 32-bit non-prefetchable memory resource"
-    failed=1
-  fi
-  if echo "$verbose" | grep -Eq 'MSI|MSI-X'; then
-    echo "vPCI endpoint unexpectedly advertises MSI/MSI-X"
-    failed=1
-  fi
-fi
-if [ "$failed" -ne 0 ]; then
-  echo AXVISOR_X86_VPCI_ENUMERATION_FAILED
-else
-  echo AXVISOR_X86_VPCI_ENUMERATION_PASSED
-fi
-"""
 to_bin = true
 uefi = true
