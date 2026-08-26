@@ -98,6 +98,18 @@ fn resolves_auto_bdfs_deterministically_and_skips_reservations() {
 }
 
 #[test]
+fn rejects_fixed_requests_for_nonzero_functions() {
+    let mut builder = PciTopologyBuilder::new();
+    builder
+        .add_function(function("endpoint").with_bdf(ResourceRequest::Fixed(bdf(3, 1))))
+        .unwrap();
+    assert!(matches!(
+        builder.resolve(APERTURE_START..APERTURE_END),
+        Err(PciError::UnsupportedFunctionPlacement { .. })
+    ));
+}
+
+#[test]
 fn rejects_fixed_bdf_conflicts_and_reserved_requests() {
     let mut duplicate = PciTopologyBuilder::new();
     duplicate

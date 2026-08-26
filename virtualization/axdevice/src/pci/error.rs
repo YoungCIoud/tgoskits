@@ -85,10 +85,11 @@ pub enum PciError {
         /// Rejected function identity.
         function: String,
     },
-    /// A non-zero function has no function zero at the same device.
-    #[error("PCI function {bdf} has no function zero at the same device")]
-    MissingFunctionZero {
-        /// Orphan BDF.
+    /// A fixed request targets a non-zero function, which this phase does
+    /// not place.
+    #[error("PCI function placement {bdf} is unsupported: this phase places function 0 only")]
+    UnsupportedFunctionPlacement {
+        /// Rejected BDF.
         bdf: PciBdf,
     },
     /// No BDF remains on the supported root bus.

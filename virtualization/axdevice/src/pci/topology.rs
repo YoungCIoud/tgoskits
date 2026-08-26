@@ -73,9 +73,7 @@ impl PciTopologyBuilder {
     pub fn resolve(self, memory_aperture: Range<u64>) -> PciResult<ResolvedPciTopology> {
         validate_memory_aperture(&memory_aperture)?;
         let bdfs = resolve_bdfs(&self.functions, &self.reservations)?;
-        validate_function_zero(&bdfs)?;
         let bar_addresses = resolve_bar_addresses(&memory_aperture, &self.functions)?;
-        let multifunction_devices = multifunction_devices(&bdfs);
         let mut functions = Vec::with_capacity(self.functions.len());
         for (id, spec) in self.functions {
             let bdf = bdfs[&id];
@@ -88,12 +86,7 @@ impl PciTopologyBuilder {
                     address: bar_addresses[&(id.clone(), bar.index())],
                 })
                 .collect::<Vec<_>>();
-            let power_on = PowerOnConfig::build(
-                spec.identity,
-                &bars,
-                multifunction_devices.contains(&bdf.device()),
-                &spec.config_bytes,
-            )?;
+            let power_on = PowerOnConfig::build(spec.identity, &bars, &spec.config_bytes)?;
             functions.push(ResolvedPciFunction {
                 owner: id.clone(),
                 host: id.clone(),
@@ -289,6 +282,9 @@ fn resolve_bdfs(
     for (id, spec) in functions {
         if let ResourceRequest::Fixed(bdf) = spec.bdf {
             validate_supported_bdf(bdf)?;
+            if bdf.function() != 0 {
+                return Err(PciError::UnsupportedFunctionPlacement { bdf });
+            }
             if reservations.contains(&bdf) {
                 return Err(PciError::BdfReserved {
                     bdf,
@@ -336,26 +332,4 @@ fn validate_supported_bdf(bdf: PciBdf) -> PciResult {
         });
     }
     Ok(())
-}
-
-fn validate_function_zero(bdfs: &BTreeMap<DeviceNodeId, PciBdf>) -> PciResult {
-    let present = bdfs.values().copied().collect::<BTreeSet<_>>();
-    for bdf in bdfs.values().copied().filter(|bdf| bdf.function() != 0) {
-        if !present.contains(&bdf.function_zero()) {
-            return Err(PciError::MissingFunctionZero { bdf });
-        }
-    }
-    Ok(())
-}
-
-fn multifunction_devices(bdfs: &BTreeMap<DeviceNodeId, PciBdf>) -> BTreeSet<u8> {
-    let mut counts = [0u8; DEVICE_COUNT as usize];
-    for bdf in bdfs.values() {
-        counts[usize::from(bdf.device())] += 1;
-    }
-    counts
-        .iter()
-        .enumerate()
-        .filter_map(|(device, count)| (*count > 1).then_some(device as u8))
-        .collect()
 }

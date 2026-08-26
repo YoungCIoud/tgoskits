@@ -90,13 +90,6 @@ impl PciBdf {
             function: 0,
         }
     }
-
-    pub(crate) const fn function_zero(self) -> Self {
-        Self {
-            function: 0,
-            ..self
-        }
-    }
 }
 
 impl fmt::Display for PciBdf {

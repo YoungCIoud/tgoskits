@@ -57,20 +57,104 @@ impl X86PciConfigFrontend {
         Ok((port, access.width().size()))
     }
 
-    fn selection(&self, data_offset: usize, size: usize) -> Option<(PciBdf, ConfigOffset)> {
+    /// Classifies one data-port access against the latched CF8 address.
+    ///
+    /// Returns `Ok(None)` for a disabled enable bit or an out-of-range
+    /// register window (PCI-compatible absent-function behavior), and a
+    /// structured [`DeviceError::OutOfRange`] when the access leaves the
+    /// 4-byte data window.
+    fn selection(
+        &self,
+        data_offset: usize,
+        size: usize,
+    ) -> Result<Option<(PciBdf, ConfigOffset)>, DeviceError> {
         let address = *self.address.lock_irqsave();
-        if address & CONFIG_ADDRESS_ENABLE == 0 || data_offset.checked_add(size)? > 4 {
-            return None;
+        if address & CONFIG_ADDRESS_ENABLE == 0 {
+            return Ok(None);
         }
-        let register = (address as usize & 0xfc).checked_add(data_offset)?;
-        let bdf = PciBdf::new(
+        let crosses_window = data_offset
+            .checked_add(size)
+            .map(|end| end > 4)
+            .unwrap_or(true);
+        if crosses_window {
+            return Err(DeviceError::OutOfRange {
+                addr: u64::from(CONFIG_DATA_PORT + data_offset as u16),
+            });
+        }
+        let Some(register) = (address as usize & 0xfc).checked_add(data_offset) else {
+            return Ok(None);
+        };
+        let Ok(register) = u16::try_from(register) else {
+            return Ok(None);
+        };
+        let bdf = match PciBdf::new(
             PciSegment::new(0),
             (address >> 16) as u8,
             ((address >> 11) & 0x1f) as u8,
             ((address >> 8) & 0x7) as u8,
-        )
-        .ok()?;
-        Some((bdf, ConfigOffset::new(u16::try_from(register).ok()?).ok()?))
+        ) {
+            Ok(bdf) => bdf,
+            Err(_) => return Ok(None),
+        };
+        let Ok(register) = ConfigOffset::new(register) else {
+            return Ok(None);
+        };
+        Ok(Some((bdf, register)))
+    }
+
+    /// Reads one data-window access, splitting unaligned lanes into
+    /// single-byte config reads like the legacy frontend and real bridges.
+    fn read_data_window(
+        &self,
+        bdf: PciBdf,
+        register: ConfigOffset,
+        data_offset: usize,
+        size: usize,
+        width: AccessWidth,
+    ) -> DeviceResult<u64> {
+        if data_offset.is_multiple_of(size) {
+            return self
+                .root
+                .read_config(bdf, register, width)
+                .map_err(pci_access_error);
+        }
+        let mut value = 0;
+        for index in 0..size {
+            let lane =
+                ConfigOffset::new(register.value() + index as u16).map_err(pci_access_error)?;
+            let byte = self
+                .root
+                .read_config(bdf, lane, AccessWidth::Byte)
+                .map_err(pci_access_error)?;
+            value |= byte << (index * 8);
+        }
+        Ok(value)
+    }
+
+    /// Writes one data-window access with the same lane-splitting rule.
+    fn write_data_window(
+        &self,
+        bdf: PciBdf,
+        register: ConfigOffset,
+        data_offset: usize,
+        size: usize,
+        width: AccessWidth,
+        value: u64,
+    ) -> DeviceResult {
+        if data_offset.is_multiple_of(size) {
+            return self
+                .root
+                .write_config(bdf, register, width, value)
+                .map_err(pci_access_error);
+        }
+        for index in 0..size {
+            let lane =
+                ConfigOffset::new(register.value() + index as u16).map_err(pci_access_error)?;
+            self.root
+                .write_config(bdf, lane, AccessWidth::Byte, value >> (index * 8))
+                .map_err(pci_access_error)?;
+        }
+        Ok(())
     }
 }
 
@@ -98,13 +182,13 @@ impl Device for X86PciConfigFrontend {
         }
         if (CONFIG_DATA_PORT..CONFIG_DATA_PORT + 4).contains(&port) {
             let offset = usize::from(port - CONFIG_DATA_PORT);
-            let Some((bdf, register)) = self.selection(offset, size) else {
-                return Ok(all_ones(size));
+            let size = access.width().size();
+            return match self.selection(offset, size)? {
+                None => Ok(all_ones(size)),
+                Some((bdf, register)) => {
+                    self.read_data_window(bdf, register, offset, size, access.width())
+                }
             };
-            return self
-                .root
-                .read_config(bdf, register, access.width())
-                .map_err(pci_access_error);
         }
         Err(DeviceError::OutOfRange {
             addr: access.address(),
@@ -132,12 +216,13 @@ impl Device for X86PciConfigFrontend {
         }
         if (CONFIG_DATA_PORT..CONFIG_DATA_PORT + 4).contains(&port) {
             let offset = usize::from(port - CONFIG_DATA_PORT);
-            if let Some((bdf, register)) = self.selection(offset, size) {
-                self.root
-                    .write_config(bdf, register, access.width(), value)
-                    .map_err(pci_access_error)?;
-            }
-            return Ok(());
+            let size = access.width().size();
+            return match self.selection(offset, size)? {
+                None => Ok(()),
+                Some((bdf, register)) => {
+                    self.write_data_window(bdf, register, offset, size, access.width(), value)
+                }
+            };
         }
         Err(DeviceError::OutOfRange {
             addr: access.address(),
@@ -345,5 +430,94 @@ mod tests {
             read(&frontend, CONFIG_DATA_PORT, AccessWidth::Dword),
             u32::MAX.into()
         );
+    }
+
+    #[test]
+    fn qword_data_port_access_is_rejected_as_unsupported() {
+        let frontend = frontend();
+        let error = read_error(&frontend, CONFIG_DATA_PORT, AccessWidth::Qword);
+        assert!(matches!(error, DeviceError::Unsupported { .. }));
+    }
+
+    #[test]
+    fn cross_window_data_port_accesses_return_structured_errors() {
+        let frontend = frontend();
+        write(
+            &frontend,
+            CONFIG_ADDRESS_PORT,
+            AccessWidth::Dword,
+            0x8000_0000,
+        );
+        // A dword access at CFE and a word at CFF leave the 4-byte data window.
+        for port in [
+            CONFIG_DATA_PORT + 2, // dword straddle
+            CONFIG_DATA_PORT + 3, // word straddle
+        ] {
+            let read_error = read_error(&frontend, port, AccessWidth::Dword);
+            assert!(matches!(read_error, DeviceError::OutOfRange { .. }));
+            let write_error = write_error(&frontend, port, AccessWidth::Dword, 0);
+            assert!(matches!(write_error, DeviceError::OutOfRange { .. }));
+        }
+    }
+
+    #[test]
+    fn unaligned_word_access_merges_config_bytes_like_the_legacy_frontend() {
+        let frontend = frontend();
+        // Select vendor/device register 0; a word starting at CFD covers bytes
+        // 1 and 2 (vendor-high 0x80, device-low 0xc0) and must merge
+        // little-endian instead of failing.
+        write(
+            &frontend,
+            CONFIG_ADDRESS_PORT,
+            AccessWidth::Dword,
+            0x8000_0000,
+        );
+        assert_eq!(
+            read(&frontend, CONFIG_DATA_PORT + 1, AccessWidth::Word),
+            0xc080
+        );
+
+        // The same byte lanes are written independently and honor write
+        // masks: both selected lanes are read-only for this function, so the
+        // write has no effect instead of failing the guest access.
+        write(
+            &frontend,
+            CONFIG_ADDRESS_PORT,
+            AccessWidth::Dword,
+            0x8000_0004,
+        );
+        write(&frontend, CONFIG_DATA_PORT + 1, AccessWidth::Word, 0xffff);
+        assert_eq!(read(&frontend, CONFIG_DATA_PORT + 1, AccessWidth::Word), 0);
+        write(
+            &frontend,
+            CONFIG_ADDRESS_PORT,
+            AccessWidth::Dword,
+            0x8000_0004,
+        );
+        assert_eq!(read(&frontend, CONFIG_DATA_PORT, AccessWidth::Byte), 0);
+    }
+
+    fn read_error(frontend: &X86PciConfigFrontend, port: u16, width: AccessWidth) -> DeviceError {
+        frontend
+            .read(
+                &access(port, width),
+                &mut NoopDeviceContext::new(DeviceId::new(0)),
+            )
+            .unwrap_err()
+    }
+
+    fn write_error(
+        frontend: &X86PciConfigFrontend,
+        port: u16,
+        width: AccessWidth,
+        value: u64,
+    ) -> DeviceError {
+        frontend
+            .write(
+                &access(port, width),
+                value,
+                &mut NoopDeviceContext::new(DeviceId::new(0)),
+            )
+            .unwrap_err()
     }
 }

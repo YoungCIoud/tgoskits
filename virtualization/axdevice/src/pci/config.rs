@@ -21,7 +21,6 @@ impl PowerOnConfig {
     pub(crate) fn build(
         identity: PciEndpointIdentity,
         bars: &[ResolvedBarPlan],
-        multifunction: bool,
         config_bytes: &[PciConfigByte],
     ) -> PciResult<Self> {
         if identity.vendor_id() == u16::MAX {
@@ -39,7 +38,7 @@ impl PowerOnConfig {
         bytes[9] = class.programming_interface();
         bytes[10] = class.subclass();
         bytes[11] = class.base();
-        bytes[14] = if multifunction { 0x80 } else { 0 };
+        bytes[14] = 0;
         for patch in config_bytes {
             let offset = usize::from(patch.offset.value());
             bytes[offset] = patch.value;
@@ -180,7 +179,7 @@ mod tests {
             size: bar.size(),
             address: 0x2000_0000,
         };
-        let power_on = PowerOnConfig::build(identity, &[plan], false, &[]).unwrap();
+        let power_on = PowerOnConfig::build(identity, &[plan], &[]).unwrap();
         let mut state = FunctionState::new(PciBdf::bus_zero(1), power_on, &[plan]);
 
         state.write_non_bar(0, 4, 0);

@@ -39,6 +39,19 @@ impl PciBarAccess {
 }
 
 /// Endpoint-owned behavior reached after authenticated PCI routing.
+///
+/// # Device context contract
+///
+/// Callbacks run strictly outside the root lock, after the runtime validated
+/// the [`EndpointRouteToken`] and pinned the endpoint with a strong reference.
+/// They currently receive an identity-correct but capability-free
+/// [`NoopDeviceContext`] carrying the endpoint's final [`DeviceId`]: grants
+/// registered through the bundle (guest memory, timers, wake, stop) are not
+/// reachable from this path yet. Routing and dispatch ownership stays with
+/// [`DeviceRuntime`](crate::DeviceRuntime); the first grant-bearing endpoint
+/// must extend that seam in its own design together with a
+/// grant-through-BAR-callback regression test. The route token itself never
+/// carries or mints capabilities.
 pub trait PciFunction: Device {
     /// Reads one complete memory BAR access.
     fn read_bar(&self, access: PciBarAccess, context: &mut dyn DeviceContext) -> DeviceResult<u64>;
