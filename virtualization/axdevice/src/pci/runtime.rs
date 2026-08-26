@@ -224,6 +224,10 @@ impl PciRootBinding {
 }
 
 /// Typed service key published only by a PCI host bundle.
+///
+/// Bindings stay enumerable through `DeviceRuntime::services()` for
+/// diagnostics and host-side verification; endpoint models never receive a
+/// `DeviceRuntime`, so route resolution remains dependency-scoped.
 pub struct PciRootBindingKey;
 
 impl ServiceKey for PciRootBindingKey {
@@ -239,6 +243,10 @@ pub(crate) struct PciBindingLease {
 
 impl Drop for PciBindingLease {
     fn drop(&mut self) {
+        // Teardown order from the design (§7.1): invalidate the binding
+        // generation first so new validations fail, then withdraw the root
+        // route, and only then release the strong endpoint reference kept
+        // since dispatch validation - in-flight callbacks finish safely.
         let endpoint = self.binding.router.invalidate(self.token);
         self.binding.root.unbind_endpoint(self.token);
         drop(endpoint);

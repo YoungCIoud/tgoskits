@@ -16,6 +16,9 @@ mod root;
 mod runtime;
 mod topology;
 
+pub(crate) use config::read_bytes;
+pub(crate) use root::all_ones;
+
 pub(crate) const FOUR_GIB: u64 = 1 << 32;
 
 pub use address::{ConfigOffset, PciBarIndex, PciBdf, PciSegment};

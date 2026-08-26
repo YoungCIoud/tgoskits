@@ -65,6 +65,12 @@ impl PciTopologyBuilder {
     /// Resolves all fixed requests, performs deterministic automatic
     /// placement, validates the complete topology, and freezes it.
     ///
+    /// The resolved functions carry placeholder `owner`/`host` identities
+    /// (each pointing at itself) until graph resolution assigns real
+    /// ownership; production callers must go through
+    /// `DeclaredDeviceGraph::resolve`, which always assigns ownership inside
+    /// its transaction before publication.
+    ///
     /// # Errors
     ///
     /// Returns a typed [`PciError`] for malformed host apertures, BDF

@@ -7,7 +7,7 @@ use axdevice_base::*;
 
 use crate::{
     ConfigOffset, DeviceLifecycle, DeviceManagerResult, PciBdf, PciRootBinding, PciRootState,
-    PciSegment,
+    PciSegment, all_ones, read_bytes,
 };
 
 const CONFIG_ADDRESS_ENABLE: u32 = 1 << 31;
@@ -310,21 +310,10 @@ fn pci_access_error(error: crate::PciError) -> DeviceError {
         detail: alloc::format!("{error}"),
     }
 }
-fn read_bytes(bytes: &[u8], offset: usize, size: usize) -> u64 {
-    bytes[offset..offset + size]
-        .iter()
-        .enumerate()
-        .fold(0, |value, (index, byte)| {
-            value | (u64::from(*byte) << (index * 8))
-        })
-}
 fn write_bytes(bytes: &mut [u8], offset: usize, size: usize, value: u64) {
     for (index, byte) in bytes[offset..offset + size].iter_mut().enumerate() {
         *byte = (value >> (index * 8)) as u8;
     }
-}
-fn all_ones(size: usize) -> u64 {
-    u64::MAX >> ((8 - size) * 8)
 }
 
 #[cfg(test)]

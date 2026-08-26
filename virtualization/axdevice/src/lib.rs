@@ -81,12 +81,12 @@ pub use model::{
     FdtContributionSpec, FdtNodeSpec,
 };
 pub use pci::{
-    ConfigOffset, EndpointRouteToken, PciBarAccess, PciBarIndex, PciBarRoute, PciBdf, PciClass,
-    PciEndpointIdentity, PciError, PciFunction, PciFunctionRequirement, PciFunctionSpec,
-    PciHostKey, PciHostProvider, PciMemoryBar, PciResult, PciRootBinding, PciRootBindingKey,
-    PciRootState, PciSegment, PciTopologyBuilder, ResolvedPciBar, ResolvedPciFunction,
-    ResolvedPciTopology,
+    ConfigOffset, PciBarAccess, PciBarIndex, PciBarRoute, PciBdf, PciClass, PciEndpointIdentity,
+    PciError, PciFunction, PciFunctionRequirement, PciFunctionSpec, PciHostKey, PciHostProvider,
+    PciMemoryBar, PciResult, PciRootBinding, PciRootBindingKey, PciRootState, PciSegment,
+    PciTopologyBuilder, ResolvedPciBar, ResolvedPciFunction, ResolvedPciTopology,
 };
+pub(crate) use pci::{all_ones, read_bytes};
 pub use registration::{
     DeviceBundle, DeviceLifecycle, DeviceRegistration, DmaPollableDeviceOps, PollableDeviceOps,
 };

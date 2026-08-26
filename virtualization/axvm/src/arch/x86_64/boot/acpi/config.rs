@@ -10,6 +10,7 @@ use axdevice::*;
 use axdevice_base::InterruptControllerId;
 
 use super::serial::*;
+use crate::arch::x86_64::pci_config::{PCI_HOST_NODE, host_key as x86_pci_host_key};
 
 /// Guest processor/APIC identities.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -109,11 +110,12 @@ impl X86FirmwarePlan {
 
         let serials = x86_serial_plans(graph)?;
         let specials = resolve_x86_specials(&firmware.specials, &serials)?;
-        let pci_topology = graph
-            .pci_topology(&crate::arch::x86_64::pci_config::host_key())
-            .ok_or(X86FirmwarePlanError::MissingDevice {
-                node_id: crate::arch::x86_64::pci_config::PCI_HOST_NODE,
-            })?;
+        let pci_topology =
+            graph
+                .pci_topology(&x86_pci_host_key())
+                .ok_or(X86FirmwarePlanError::MissingDevice {
+                    node_id: PCI_HOST_NODE,
+                })?;
         let pci_aperture = pci_topology.memory_aperture();
         let pci_size = pci_aperture
             .end

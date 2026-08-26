@@ -12,11 +12,15 @@ use axvmconfig::VirtualDeviceRequest;
 use crate::{ConfiguredDeviceError, ConfiguredModelRegistration, DeviceInstantiationContext};
 
 const MODEL: &str = "vpci-test";
-const HOST_KEY: &str = "x86-q35";
 const BAR_INDEX: u8 = 2;
 const BAR_SIZE: usize = 0x1_0000;
 const VENDOR_ID: u16 = 0x1af4;
 const DEVICE_ID: u16 = 0x1110;
+
+/// The x86 Q35 host key, shared with the architecture composition root.
+fn host_key() -> PciHostKey {
+    crate::arch::x86_64::pci_config::host_key()
+}
 
 /// Catalog entry for the opt-in generic PCI enumeration fixture.
 pub const REGISTRATION: ConfiguredModelRegistration = ConfiguredModelRegistration {
@@ -55,7 +59,7 @@ impl DeviceModel for VpciTestModel {
     fn requirements(&self) -> DeviceManagerResult<DeviceRequirements> {
         let bar = PciMemoryBar::new(PciBarIndex::new(BAR_INDEX)?, BAR_SIZE as u64)?;
         let requirement = PciFunctionRequirement::new(
-            PciHostKey::new(HOST_KEY)?,
+            host_key(),
             PciEndpointIdentity::new(VENDOR_ID, DEVICE_ID, PciClass::new(0x05, 0x00, 0x00)),
         )
         .with_bar(bar)?;
@@ -206,9 +210,9 @@ mod tests {
     fn requirements_declare_only_the_test_pci_function() {
         let requirements = VpciTestModel.requirements().unwrap();
         let function = requirements.pci_function().unwrap();
-        assert_eq!(function.host().as_str(), HOST_KEY);
+        assert_eq!(function.host().as_str(), host_key().as_str());
         let expected = PciFunctionRequirement::new(
-            PciHostKey::new(HOST_KEY).unwrap(),
+            host_key(),
             PciEndpointIdentity::new(VENDOR_ID, DEVICE_ID, PciClass::new(0x05, 0, 0)),
         )
         .with_bar(PciMemoryBar::new(PciBarIndex::new(BAR_INDEX).unwrap(), BAR_SIZE as u64).unwrap())
@@ -298,7 +302,7 @@ mod tests {
     fn graph_build_routes_private_bar_backing() {
         let root_slot = Arc::new(Mutex::new(None));
         let provider = PciHostProvider::new(
-            PciHostKey::new(HOST_KEY).unwrap(),
+            host_key(),
             DeviceNodeSpec::virtual_device(
                 id("pci-host"),
                 Arc::new(HostModel {
@@ -335,7 +339,7 @@ mod tests {
             .next()
             .unwrap();
         let function = graph
-            .pci_topology(&PciHostKey::new(HOST_KEY).unwrap())
+            .pci_topology(&host_key())
             .unwrap()
             .function(&id("vpci-test0"))
             .unwrap();

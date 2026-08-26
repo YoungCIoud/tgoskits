@@ -231,3 +231,70 @@ fn automatic_endpoint_host_edge_participates_in_cycle_detection() {
     };
     assert!(matches!(error, DeviceGraphError::DependencyCycle { .. }));
 }
+
+#[test]
+fn duplicate_host_node_ids_fail_at_provider_registration() {
+    let mut graph = DeviceGraphBuilder::new();
+    graph.register_pci_host(host_provider()).unwrap();
+
+    let secondary_requirements = DeviceRequirements::new()
+        .with_mmio(
+            slot("secondary-pci-memory"),
+            0x10_0000,
+            0x10_0000,
+            ResourceRequest::Auto,
+        )
+        .unwrap();
+    let secondary = PciHostProvider::new(
+        PciHostKey::new("secondary-pci").unwrap(),
+        // Reuses the primary host node id on purpose.
+        DeviceNodeSpec::virtual_device(
+            id("pci-host"),
+            Arc::new(EmptyModel {
+                requirements: secondary_requirements,
+            }),
+        ),
+        slot("secondary-pci-memory"),
+    );
+
+    assert!(matches!(
+        graph.register_pci_host(secondary),
+        Err(DeviceGraphError::DuplicateNode { node })
+            if node == "pci-host"
+    ));
+}
+
+#[test]
+fn multi_host_resolution_fails_atomically_when_one_aperture_cannot_plan() {
+    fn secondary_provider() -> PciHostProvider {
+        let requirements = DeviceRequirements::new()
+            .with_mmio(
+                slot("secondary-pci-memory"),
+                // Larger than any pool this test grants, so planning for the
+                // second host fails after the first one already resolved.
+                0x4000_0000,
+                0x4000_0000,
+                ResourceRequest::Auto,
+            )
+            .unwrap();
+        let model = Arc::new(EmptyModel { requirements });
+        PciHostProvider::new(
+            PciHostKey::new("secondary-pci").unwrap(),
+            DeviceNodeSpec::virtual_device(id("pci-secondary"), model),
+            slot("secondary-pci-memory"),
+        )
+    }
+
+    let mut graph = DeviceGraphBuilder::new();
+    graph.register_pci_host(host_provider()).unwrap();
+    graph.register_pci_host(secondary_provider()).unwrap();
+
+    let error = match graph.declare().unwrap().resolve(pools()) {
+        Ok(_) => panic!("an unplannable second aperture must abort resolution"),
+        Err(error) => error,
+    };
+    assert!(
+        error.to_string().contains("secondary-pci-memory"),
+        "unexpected error: {error}"
+    );
+}

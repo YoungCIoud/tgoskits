@@ -500,6 +500,14 @@ impl DeviceRuntime {
         Ok(())
     }
 
+    /// Registers one graph node's bundle with PCI identity validation.
+    ///
+    /// Host nodes must publish exactly one [`PciRootBindingKey`] service whose
+    /// owner and topology match the resolved node; endpoint bundles must bind
+    /// their resolved function through a dependency-hosted root. The binding
+    /// lease is retained by the runtime and its `Drop` unwinds the provisional
+    /// route (invalidate generation -> withdraw root route -> release the
+    /// endpoint reference), so any failure leaves no residue.
     pub(crate) fn register_graph_bundle(
         &mut self,
         node: &ResolvedDeviceNode,
@@ -561,7 +569,7 @@ impl DeviceRuntime {
                     }
                 })?;
                 let device = DeviceId::new((self.devices.len() + function.device_index) as u32);
-                Some(binding.bind(&endpoint.function, device, function.function.clone())?)
+                Some(binding.bind(&endpoint.function_node, device, function.function.clone())?)
             }
             (Some(_), None) => {
                 return Err(DeviceManagerError::InvalidConfig {

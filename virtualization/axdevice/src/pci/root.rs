@@ -291,6 +291,6 @@ impl PciBarRoute {
     }
 }
 
-fn all_ones(size: usize) -> u64 {
+pub(crate) fn all_ones(size: usize) -> u64 {
     u64::MAX >> ((8 - size) * 8)
 }

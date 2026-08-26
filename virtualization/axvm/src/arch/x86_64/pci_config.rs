@@ -10,7 +10,7 @@ pub(super) const PCI_MEMORY_SIZE: u64 = 0x1000_0000;
 const CONFIG_SLOT: &str = "config-ports";
 const MEMORY_SLOT: &str = "memory-aperture";
 
-pub(super) fn host_key() -> PciHostKey {
+pub(crate) fn host_key() -> PciHostKey {
     PciHostKey::new("x86-q35").expect("static x86 PCI host key is valid")
 }
 

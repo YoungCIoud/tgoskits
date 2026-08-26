@@ -101,6 +101,9 @@ impl BarState {
     }
 
     pub(crate) const fn committed_dword(&self) -> u32 {
+        // Aperture resolution caps addresses below 4 GiB; the cast relies on
+        // that validated invariant.
+        debug_assert!(self.address < FOUR_GIB);
         self.address as u32 & 0xffff_fff0
     }
 

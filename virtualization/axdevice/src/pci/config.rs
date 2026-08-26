@@ -95,6 +95,11 @@ impl FunctionState {
         read_bytes(&self.config, offset, size)
     }
 
+    /// Classifies one BAR write after merging the guest lanes into a full
+    /// dword. The size probe is recognized only when the merged dword equals
+    /// all ones in one access; lane-wise accumulation across multiple writes
+    /// is intentionally not tracked, matching the design's four-row contract
+    /// rather than hardware register latching.
     pub(crate) fn prepare_bar_write(
         &self,
         offset: usize,
@@ -148,7 +153,7 @@ impl FunctionState {
     }
 }
 
-fn read_bytes(bytes: &[u8], offset: usize, size: usize) -> u64 {
+pub(crate) fn read_bytes(bytes: &[u8], offset: usize, size: usize) -> u64 {
     bytes[offset..offset + size]
         .iter()
         .enumerate()

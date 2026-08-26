@@ -21,7 +21,7 @@ pub struct ResolvedDeviceNode {
 
 pub(crate) struct ResolvedPciEndpoint {
     pub(crate) host: DeviceNodeId,
-    pub(crate) function: DeviceNodeId,
+    pub(crate) function_node: DeviceNodeId,
 }
 
 pub(crate) struct ResolvedPciHost {
@@ -137,7 +137,7 @@ impl ResolvedDeviceGraph {
                     .expect("resolved PCI endpoint owners originate from graph nodes");
                 endpoint.pci_endpoint = Some(ResolvedPciEndpoint {
                     host: host.host_id.clone(),
-                    function: function.id().clone(),
+                    function_node: function.id().clone(),
                 });
             }
         }
