@@ -1,5 +1,4 @@
 features = [
-    "fs",
     "vpci-test-device",
 ]
 log = "Info"
