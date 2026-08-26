@@ -17,9 +17,17 @@ const BAR_SIZE: usize = 0x1_0000;
 const VENDOR_ID: u16 = 0x1af4;
 const DEVICE_ID: u16 = 0x1110;
 
-/// The x86 Q35 host key, shared with the architecture composition root.
+/// Host key of the x86 Q35 composition root this fixture targets.
+///
+/// The literal mirrors `arch::x86_64::pci_config::host_key` on purpose: this
+/// module must compile on every architecture, while that module only exists
+/// on x86_64. A mismatch cannot stay silent — graph declaration fails with
+/// a typed host-unavailable error as soon as an endpoint selects a key that
+/// no architecture-registered provider serves.
+const HOST_KEY: &str = "x86-q35";
+
 fn host_key() -> PciHostKey {
-    crate::arch::x86_64::pci_config::host_key()
+    PciHostKey::new(HOST_KEY).expect("static x86 PCI host key is valid")
 }
 
 /// Catalog entry for the opt-in generic PCI enumeration fixture.

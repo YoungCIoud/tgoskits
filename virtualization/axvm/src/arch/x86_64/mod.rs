@@ -44,7 +44,7 @@ mod exit;
 mod host_irq;
 pub(crate) mod irq;
 mod nested_paging;
-pub(crate) mod pci_config;
+mod pci_config;
 mod pic;
 pub(crate) mod port;
 mod resource_pools;
