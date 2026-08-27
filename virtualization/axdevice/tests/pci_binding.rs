@@ -39,21 +39,14 @@ impl HostModel {
     /// Builds an unrelated topology so a published binding fails the
     /// resolved-topology identity check.
     fn foreign_binding() -> Arc<PciRootBinding> {
-        let mut builder = PciTopologyBuilder::new();
-        builder
-            .add_function(
-                PciFunctionSpec::new(
-                    id("foreign"),
-                    PciEndpointIdentity::new(0x1234, 0x5678, PciClass::new(0, 0, 0)),
-                )
-                .with_bdf(ResourceRequest::Fixed(
-                    PciBdf::new(PciSegment::new(0), 0, 0, 0).unwrap(),
-                )),
-            )
-            .unwrap();
-        let topology = Arc::new(builder.resolve(0x3000_0000..0x3010_0000).unwrap());
-        let root = Arc::new(PciRootState::new(topology));
-        Arc::new(PciRootBinding::new(id("pci-host"), root))
+        let (graph, ..) = resolved_graph(RecordingEndpoint::shared(), false);
+        let runtime = build_runtime(&graph);
+        runtime
+            .services()
+            .all::<PciRootBindingKey>()
+            .into_iter()
+            .next()
+            .expect("resolved fixture publishes one PCI root")
     }
 }
 
@@ -204,18 +197,7 @@ impl DeviceModel for PlainRootModel {
     }
 
     fn build(&self, _context: &mut DeviceBuildContext<'_>) -> DeviceManagerResult<DeviceBundle> {
-        let mut builder = PciTopologyBuilder::new();
-        builder
-            .add_function(PciFunctionSpec::new(
-                id("plain-root"),
-                PciEndpointIdentity::new(0x1234, 0x5678, PciClass::new(0, 0, 0)),
-            ))
-            .unwrap();
-        let topology = Arc::new(builder.resolve(0x3100_0000..0x3110_0000).unwrap());
-        let binding = Arc::new(PciRootBinding::new(
-            id("plain-root-node"),
-            Arc::new(PciRootState::new(topology)),
-        ));
+        let binding = HostModel::foreign_binding();
         *self.binding.lock().unwrap() = Some(binding.clone());
         let bundle = DeviceBundle::new().with_service::<PciRootBindingKey>(binding)?;
         Ok(bundle)

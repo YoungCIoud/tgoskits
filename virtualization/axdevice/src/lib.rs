@@ -84,9 +84,9 @@ pub use pci::{
     ConfigOffset, PciBarAccess, PciBarIndex, PciBarRoute, PciBdf, PciClass, PciEndpointIdentity,
     PciError, PciFunction, PciFunctionRequirement, PciFunctionSpec, PciHostKey, PciHostProvider,
     PciMemoryBar, PciResult, PciRootBinding, PciRootBindingKey, PciRootState, PciSegment,
-    PciTopologyBuilder, ResolvedPciBar, ResolvedPciFunction, ResolvedPciTopology,
+    ResolvedPciBar, ResolvedPciFunction, ResolvedPciTopology,
 };
-pub(crate) use pci::{all_ones, read_bytes};
+pub(crate) use pci::{PciTopologyBuilder, all_ones, read_bytes};
 pub use registration::{
     DeviceBundle, DeviceLifecycle, DeviceRegistration, DmaPollableDeviceOps, PollableDeviceOps,
 };
