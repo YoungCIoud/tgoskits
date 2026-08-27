@@ -25,6 +25,18 @@ pub enum DeviceGraphError {
         /// Missing typed provider key.
         host: String,
     },
+    /// A PCI endpoint declaration has no runtime device model.
+    #[error("PCI endpoint node {node} requires a runtime device model")]
+    PciEndpointRequiresRuntimeModel {
+        /// Stable endpoint node identifier.
+        node: String,
+    },
+    /// A PCI host provider has no runtime device model.
+    #[error("PCI host provider node {node} requires a runtime device model")]
+    PciHostRequiresRuntimeModel {
+        /// Stable host node identifier.
+        node: String,
+    },
     /// A node references a parent or dependency that is absent.
     #[error("device graph node {node} references missing node {dependency}")]
     MissingDependency {

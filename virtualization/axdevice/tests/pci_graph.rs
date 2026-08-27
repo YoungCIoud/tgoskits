@@ -91,6 +91,49 @@ fn pci_requirement_requires_a_registered_typed_host() {
 }
 
 #[test]
+fn pci_endpoint_without_a_runtime_model_is_rejected_before_resolution() {
+    let requirements = DeviceRequirements::new()
+        .with_pci_function(endpoint_requirement())
+        .unwrap();
+    let mut graph = DeviceGraphBuilder::new();
+    graph.register_pci_host(host_provider()).unwrap();
+    graph
+        .add(DeviceNodeSpec::host_passthrough(
+            id("passthrough"),
+            requirements,
+        ))
+        .unwrap();
+
+    let error = match graph.declare() {
+        Ok(_) => panic!("a PCI endpoint without a runtime model must fail declaration"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        DeviceGraphError::PciEndpointRequiresRuntimeModel { node } if node == "passthrough"
+    ));
+}
+
+#[test]
+fn pci_host_provider_without_a_runtime_model_is_rejected_before_resolution() {
+    let mut graph = DeviceGraphBuilder::new();
+    let provider = PciHostProvider::new(
+        host_key(),
+        DeviceNodeSpec::host_passthrough(id("pci-host"), DeviceRequirements::new()),
+        slot("pci-memory"),
+    );
+
+    let error = match graph.register_pci_host(provider) {
+        Ok(()) => panic!("a PCI host provider without a runtime model must fail registration"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        DeviceGraphError::PciHostRequiresRuntimeModel { node } if node == "pci-host"
+    ));
+}
+
+#[test]
 fn duplicate_pci_host_keys_are_rejected_before_the_second_node_is_added() {
     let mut graph = DeviceGraphBuilder::new();
     graph.register_pci_host(host_provider()).unwrap();

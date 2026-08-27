@@ -51,6 +51,11 @@ impl DeviceGraphBuilder {
                 host: provider.key.to_string(),
             });
         }
+        if provider.node.model.is_none() {
+            return Err(DeviceGraphError::PciHostRequiresRuntimeModel {
+                node: provider.node.id.to_string(),
+            });
+        }
         let host_id = provider.node.id().clone();
         self.add(provider.node)?;
         self.pci_hosts.insert(
@@ -165,7 +170,7 @@ impl DeviceNodeSpec {
                 node: self.id.to_string(),
                 detail: error.to_string(),
             })?;
-        Ok(match (&self.model, &self.requirements) {
+        let requirements = match (&self.model, &self.requirements) {
             (Some(model), _) => {
                 model
                     .requirements()
@@ -181,7 +186,13 @@ impl DeviceNodeSpec {
                     detail: "node has inconsistent model and declaration state".into(),
                 });
             }
-        })
+        };
+        if self.model.is_none() && requirements.pci_function().is_some() {
+            return Err(DeviceGraphError::PciEndpointRequiresRuntimeModel {
+                node: self.id.to_string(),
+            });
+        }
+        Ok(requirements)
     }
 
     fn to_declared(&self) -> Result<DeclaredDeviceNode, DeviceGraphError> {
