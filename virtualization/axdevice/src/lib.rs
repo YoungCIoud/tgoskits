@@ -81,10 +81,13 @@ pub use model::{
     FdtContributionSpec, FdtNodeSpec,
 };
 pub use pci::{
-    ConfigOffset, PciBarAccess, PciBarIndex, PciBarRoute, PciBdf, PciClass, PciEndpointIdentity,
-    PciError, PciFunction, PciFunctionRequirement, PciFunctionSpec, PciHostKey, PciHostProvider,
-    PciMemoryBar, PciResult, PciRootBinding, PciRootBindingKey, PciRootState, PciSegment,
-    ResolvedPciBar, ResolvedPciFunction, ResolvedPciTopology,
+    ConfigOffset, PciBarAccess, PciBarIndex, PciBarRoute, PciBdf, PciCapabilityByteMode,
+    PciCapabilityEffectAccess, PciCapabilityEffectRegion, PciCapabilityId, PciCapabilityLayout,
+    PciCapabilitySnapshot, PciCapabilitySpec, PciClass, PciCommandState, PciConfigEffectId,
+    PciConfigReadEffect, PciConfigWriteEffect, PciEndpointIdentity, PciError, PciFunction,
+    PciFunctionRequirement, PciFunctionSpec, PciHostKey, PciHostProvider, PciMemoryBar, PciResult,
+    PciRootBinding, PciRootBindingKey, PciRootState, PciSegment, ResolvedPciBar,
+    ResolvedPciFunction, ResolvedPciTopology,
 };
 pub(crate) use pci::{PciTopologyBuilder, all_ones, read_bytes};
 pub use registration::{

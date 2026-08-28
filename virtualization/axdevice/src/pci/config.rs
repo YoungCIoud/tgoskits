@@ -3,18 +3,24 @@
 use alloc::vec::Vec;
 
 use super::{
-    PciBdf, PciEndpointIdentity, PciResult,
+    PciBdf, PciCapabilityEffectRegion, PciCapabilityId, PciCapabilityLayout, PciCapabilitySnapshot,
+    PciEndpointIdentity, PciResult,
     address::CONFIG_SPACE_SIZE,
     bar::{BarState, ResolvedBarPlan},
     function::PciConfigByte,
+    runtime::PciCommandState,
 };
 
+const COMMAND_BUS_MASTER_ENABLE: u8 = 0x04;
+const COMMAND_INTERRUPT_DISABLE: u8 = 0x04;
 const COMMAND_MEMORY_SPACE_ENABLE: u8 = 0x02;
+const STATUS_CAPABILITIES_LIST: u8 = 0x10;
 
 #[derive(Clone)]
 pub(crate) struct PowerOnConfig {
     bytes: [u8; CONFIG_SPACE_SIZE],
     write_mask: [u8; CONFIG_SPACE_SIZE],
+    capabilities: Vec<PciCapabilityLayout>,
 }
 
 impl PowerOnConfig {
@@ -22,6 +28,7 @@ impl PowerOnConfig {
         identity: PciEndpointIdentity,
         bars: &[ResolvedBarPlan],
         config_bytes: &[PciConfigByte],
+        capabilities: &[PciCapabilityLayout],
     ) -> PciResult<Self> {
         if identity.vendor_id() == u16::MAX {
             return Err(super::PciError::InvalidEndpointIdentity {
@@ -32,7 +39,10 @@ impl PowerOnConfig {
         let mut write_mask = [0; CONFIG_SPACE_SIZE];
         bytes[0..2].copy_from_slice(&identity.vendor_id().to_le_bytes());
         bytes[2..4].copy_from_slice(&identity.device_id().to_le_bytes());
-        write_mask[4] = COMMAND_MEMORY_SPACE_ENABLE;
+        bytes[0x2c..0x2e].copy_from_slice(&identity.subsystem_vendor_id().to_le_bytes());
+        bytes[0x2e..0x30].copy_from_slice(&identity.subsystem_device_id().to_le_bytes());
+        write_mask[4] = COMMAND_MEMORY_SPACE_ENABLE | COMMAND_BUS_MASTER_ENABLE;
+        write_mask[5] = COMMAND_INTERRUPT_DISABLE;
         let class = identity.class();
         bytes[8] = identity.revision();
         bytes[9] = class.programming_interface();
@@ -49,7 +59,26 @@ impl PowerOnConfig {
             bytes[offset..offset + 4]
                 .copy_from_slice(&(bar.address as u32 & 0xffff_fff0).to_le_bytes());
         }
-        Ok(Self { bytes, write_mask })
+        if let Some(first) = capabilities.first() {
+            bytes[0x06] |= STATUS_CAPABILITIES_LIST;
+            bytes[0x34] = first.offset().value() as u8;
+        }
+        for (index, capability) in capabilities.iter().enumerate() {
+            let base = usize::from(capability.offset().value());
+            bytes[base] = capability.id().value();
+            bytes[base + 1] = capabilities
+                .get(index + 1)
+                .map_or(0, |next| next.offset().value() as u8);
+            bytes[base + 2..base + usize::from(capability.length())]
+                .copy_from_slice(capability.body());
+            write_mask[base + 2..base + usize::from(capability.length())]
+                .copy_from_slice(capability.write_mask());
+        }
+        Ok(Self {
+            bytes,
+            write_mask,
+            capabilities: capabilities.to_vec(),
+        })
     }
 }
 
@@ -83,6 +112,14 @@ impl FunctionState {
         self.config[4] & COMMAND_MEMORY_SPACE_ENABLE != 0
     }
 
+    pub(crate) fn command_state(&self) -> PciCommandState {
+        PciCommandState::new(
+            self.config[4] & COMMAND_MEMORY_SPACE_ENABLE != 0,
+            self.config[4] & COMMAND_BUS_MASTER_ENABLE != 0,
+            self.config[5] & COMMAND_INTERRUPT_DISABLE != 0,
+        )
+    }
+
     pub(crate) fn bars(&self) -> &[BarState] {
         &self.bars
     }
@@ -93,6 +130,48 @@ impl FunctionState {
             return read_bytes(&dword, offset % 4, size);
         }
         read_bytes(&self.config, offset, size)
+    }
+
+    pub(crate) fn config_effect(
+        &self,
+        offset: usize,
+        size: usize,
+        width: crate::AccessWidth,
+        write: bool,
+    ) -> PciResult<
+        Option<(
+            PciCapabilityId,
+            PciCapabilityEffectRegion,
+            u8,
+            PciCapabilitySnapshot,
+        )>,
+    > {
+        for capability in &self.power_on.capabilities {
+            let Some(effect) = capability.effect_for_access(offset, size, write, width)? else {
+                continue;
+            };
+            let relative = offset
+                .checked_sub(usize::from(capability.offset().value()))
+                .ok_or(super::PciError::InvalidConfigAccess {
+                    offset: offset as u16,
+                    width,
+                    detail: "capability effect offset underflows",
+                })?;
+            return Ok(Some((
+                capability.id(),
+                effect,
+                relative as u8,
+                capability.snapshot(&self.config),
+            )));
+        }
+        Ok(None)
+    }
+
+    pub(crate) fn intersects_config_effect(&self, offset: usize, size: usize) -> bool {
+        self.power_on
+            .capabilities
+            .iter()
+            .any(|capability| capability.intersects_effect(offset, size))
     }
 
     /// Classifies one BAR write after merging the guest lanes into a full
@@ -184,7 +263,7 @@ mod tests {
             size: bar.size(),
             address: 0x2000_0000,
         };
-        let power_on = PowerOnConfig::build(identity, &[plan], &[]).unwrap();
+        let power_on = PowerOnConfig::build(identity, &[plan], &[], &[]).unwrap();
         let mut state = FunctionState::new(PciBdf::bus_zero(1), power_on, &[plan]);
 
         state.write_non_bar(0, 4, 0);

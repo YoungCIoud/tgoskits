@@ -1,13 +1,17 @@
 //! Runtime-authenticated PCI endpoint binding and BAR dispatch.
 
-use alloc::{collections::BTreeMap, sync::Arc};
+use alloc::{collections::BTreeMap, string::ToString, sync::Arc};
 
 use ax_sync::SpinLock;
 use axdevice_base::{
     Device, DeviceContext, DeviceError, DeviceId, DeviceResult, NoopDeviceContext,
 };
 
-use super::{PciBarIndex, PciBarRoute, PciBdf, PciRootState};
+use super::{
+    PciBarIndex, PciBarRoute, PciBdf, PciCapabilityId, PciCapabilitySnapshot, PciConfigEffectId,
+    PciError, PciRootState,
+    root::{PciConfigReadOutcome, PciConfigWriteOutcome},
+};
 use crate::{
     AccessWidth, DeviceManagerError, DeviceManagerResult, DeviceNodeId, ServiceCardinality,
     ServiceKey,
@@ -17,6 +21,139 @@ use crate::{
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PciBarAccess {
     route: PciBarRoute,
+}
+
+/// Immutable command-register state captured for one endpoint notification.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PciCommandState {
+    memory_space_enable: bool,
+    bus_master_enable: bool,
+    interrupt_disable: bool,
+}
+
+impl PciCommandState {
+    pub(crate) const fn new(
+        memory_space_enable: bool,
+        bus_master_enable: bool,
+        interrupt_disable: bool,
+    ) -> Self {
+        Self {
+            memory_space_enable,
+            bus_master_enable,
+            interrupt_disable,
+        }
+    }
+
+    /// Returns whether the PCI function's memory BAR decode is enabled.
+    pub const fn memory_space_enable(self) -> bool {
+        self.memory_space_enable
+    }
+
+    /// Returns whether the PCI function may initiate bus-master DMA.
+    pub const fn bus_master_enable(self) -> bool {
+        self.bus_master_enable
+    }
+
+    /// Returns whether legacy INTx delivery is disabled.
+    pub const fn interrupt_disable(self) -> bool {
+        self.interrupt_disable
+    }
+}
+
+/// Snapshot of one endpoint configuration read effect.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PciConfigReadEffect {
+    capability: PciCapabilityId,
+    effect: PciConfigEffectId,
+    offset: u8,
+    width: AccessWidth,
+    capability_snapshot: PciCapabilitySnapshot,
+}
+
+impl PciConfigReadEffect {
+    pub(crate) const fn new(
+        capability: PciCapabilityId,
+        effect: PciConfigEffectId,
+        offset: u8,
+        width: AccessWidth,
+        capability_snapshot: PciCapabilitySnapshot,
+    ) -> Self {
+        Self {
+            capability,
+            effect,
+            offset,
+            width,
+            capability_snapshot,
+        }
+    }
+
+    /// Returns the capability containing this effect.
+    pub const fn capability(self) -> PciCapabilityId {
+        self.capability
+    }
+
+    /// Returns the effect identifier.
+    pub const fn effect(self) -> PciConfigEffectId {
+        self.effect
+    }
+
+    /// Returns the capability-relative access offset.
+    pub const fn offset(self) -> u8 {
+        self.offset
+    }
+
+    /// Returns the complete access width.
+    pub const fn width(self) -> AccessWidth {
+        self.width
+    }
+
+    /// Returns the root-time capability body snapshot for this access.
+    pub const fn capability_snapshot(self) -> PciCapabilitySnapshot {
+        self.capability_snapshot
+    }
+}
+
+/// Snapshot of one endpoint configuration write effect.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PciConfigWriteEffect {
+    read: PciConfigReadEffect,
+    value: u64,
+}
+
+impl PciConfigWriteEffect {
+    pub(crate) const fn new(read: PciConfigReadEffect, value: u64) -> Self {
+        Self { read, value }
+    }
+
+    /// Returns the capability containing this effect.
+    pub const fn capability(self) -> PciCapabilityId {
+        self.read.capability()
+    }
+
+    /// Returns the effect identifier.
+    pub const fn effect(self) -> PciConfigEffectId {
+        self.read.effect()
+    }
+
+    /// Returns the capability-relative access offset.
+    pub const fn offset(self) -> u8 {
+        self.read.offset()
+    }
+
+    /// Returns the complete access width.
+    pub const fn width(self) -> AccessWidth {
+        self.read.width()
+    }
+
+    /// Returns the root-time capability body snapshot for this access.
+    pub const fn capability_snapshot(self) -> PciCapabilitySnapshot {
+        self.read.capability_snapshot()
+    }
+
+    /// Returns the guest-provided write value.
+    pub const fn value(self) -> u64 {
+        self.value
+    }
 }
 
 impl PciBarAccess {
@@ -53,6 +190,15 @@ impl PciBarAccess {
 /// grant-through-BAR-callback regression test. The route token itself never
 /// carries or mints capabilities.
 pub trait PciFunction: Device {
+    /// Returns the endpoint-owned config effects implemented by this function.
+    ///
+    /// The runtime compares this list with the effect IDs declared in the
+    /// resolved PCI capabilities before publishing a route. An empty default
+    /// keeps functions without endpoint config effects source-compatible.
+    fn supported_config_effects(&self) -> &[PciConfigEffectId] {
+        &[]
+    }
+
     /// Reads one complete memory BAR access.
     fn read_bar(&self, access: PciBarAccess, context: &mut dyn DeviceContext) -> DeviceResult<u64>;
     /// Writes one complete memory BAR access.
@@ -62,6 +208,39 @@ pub trait PciFunction: Device {
         value: u64,
         context: &mut dyn DeviceContext,
     ) -> DeviceResult;
+
+    /// Handles one endpoint-owned conventional config read effect.
+    fn read_config_effect(
+        &self,
+        _effect: PciConfigReadEffect,
+        _context: &mut dyn DeviceContext,
+    ) -> DeviceResult<u64> {
+        Err(DeviceError::Unsupported {
+            operation: "read PCI config effect",
+            detail: "the endpoint does not implement this config effect".into(),
+        })
+    }
+
+    /// Handles one endpoint-owned conventional config write effect.
+    fn write_config_effect(
+        &self,
+        _effect: PciConfigWriteEffect,
+        _context: &mut dyn DeviceContext,
+    ) -> DeviceResult {
+        Err(DeviceError::Unsupported {
+            operation: "write PCI config effect",
+            detail: "the endpoint does not implement this config effect".into(),
+        })
+    }
+
+    /// Observes a root-owned command-register transition.
+    fn command_changed(
+        &self,
+        _command: PciCommandState,
+        _context: &mut dyn DeviceContext,
+    ) -> DeviceResult {
+        Ok(())
+    }
 }
 
 /// Non-capability token identifying one active endpoint binding generation.
@@ -189,6 +368,7 @@ impl PciRootBinding {
         device: DeviceId,
         function: Arc<dyn PciFunction>,
     ) -> DeviceManagerResult<PciBindingLease> {
+        self.validate_config_effect_contract(function_id, function.as_ref())?;
         let token = self.router.activate(device, function)?;
         if let Err(error) = self.root.bind_endpoint(function_id, token) {
             drop(self.router.invalidate(token));
@@ -198,6 +378,63 @@ impl PciRootBinding {
             binding: self.clone(),
             token,
         })
+    }
+
+    fn validate_config_effect_contract(
+        &self,
+        function_id: &DeviceNodeId,
+        function: &dyn PciFunction,
+    ) -> DeviceManagerResult {
+        let resolved = self.root.topology().function(function_id).ok_or_else(|| {
+            DeviceManagerError::Pci(PciError::UnknownFunction {
+                function: function_id.to_string(),
+            })
+        })?;
+        let supported = function.supported_config_effects();
+
+        for (index, effect) in supported.iter().enumerate() {
+            if supported[..index].contains(effect) {
+                return Err(DeviceManagerError::InvalidConfig {
+                    operation: "bind PCI endpoint route",
+                    detail: alloc::format!(
+                        "endpoint {} advertises duplicate PCI config effect {}",
+                        function_id,
+                        effect.value()
+                    ),
+                });
+            }
+            if !resolved.capabilities().any(|capability| {
+                capability
+                    .effects()
+                    .iter()
+                    .any(|declared| declared.effect() == *effect)
+            }) {
+                return Err(DeviceManagerError::InvalidConfig {
+                    operation: "bind PCI endpoint route",
+                    detail: alloc::format!(
+                        "endpoint {} advertises undeclared PCI config effect {}",
+                        function_id,
+                        effect.value()
+                    ),
+                });
+            }
+        }
+
+        for capability in resolved.capabilities() {
+            for declared in capability.effects() {
+                if !supported.contains(&declared.effect()) {
+                    return Err(DeviceManagerError::InvalidConfig {
+                        operation: "bind PCI endpoint route",
+                        detail: alloc::format!(
+                            "endpoint {} does not support declared PCI config effect {}",
+                            function_id,
+                            declared.effect().value()
+                        ),
+                    });
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Dispatches a BAR read after root lookup and token validation.
@@ -220,6 +457,68 @@ impl PciRootBinding {
         let endpoint = self.router.endpoint(token)?;
         let mut context = NoopDeviceContext::new(token.device);
         endpoint.write_bar(PciBarAccess { route }, value, &mut context)
+    }
+
+    /// Dispatches one complete conventional config read.
+    pub fn read_config(
+        &self,
+        bdf: PciBdf,
+        offset: crate::ConfigOffset,
+        width: AccessWidth,
+    ) -> DeviceResult<u64> {
+        match self
+            .root
+            .prepare_read_config(bdf, offset, width)
+            .map_err(pci_config_error)?
+        {
+            PciConfigReadOutcome::Value(value) => Ok(value),
+            PciConfigReadOutcome::Effect { token, effect } => {
+                let endpoint = self.router.endpoint(token)?;
+                let mut context = NoopDeviceContext::new(token.device);
+                endpoint.read_config_effect(*effect, &mut context)
+            }
+        }
+    }
+
+    pub(crate) fn config_access_intersects_effect(
+        &self,
+        bdf: PciBdf,
+        offset: crate::ConfigOffset,
+        width: AccessWidth,
+    ) -> DeviceResult<bool> {
+        self.root
+            .config_access_intersects_effect(bdf, offset, width)
+            .map_err(pci_config_error)
+    }
+
+    /// Dispatches one complete conventional config write.
+    pub fn write_config(
+        &self,
+        bdf: PciBdf,
+        offset: crate::ConfigOffset,
+        width: AccessWidth,
+        value: u64,
+    ) -> DeviceResult {
+        match self
+            .root
+            .prepare_write_config(bdf, offset, width, value)
+            .map_err(pci_config_error)?
+        {
+            PciConfigWriteOutcome::Complete => Ok(()),
+            PciConfigWriteOutcome::Effect { token, effect } => {
+                let endpoint = self.router.endpoint(token)?;
+                let mut context = NoopDeviceContext::new(token.device);
+                endpoint.write_config_effect(*effect, &mut context)
+            }
+            PciConfigWriteOutcome::CommandChanged { token, command } => {
+                let Some(token) = token else {
+                    return Ok(());
+                };
+                let endpoint = self.router.endpoint(token)?;
+                let mut context = NoopDeviceContext::new(token.device);
+                endpoint.command_changed(command, &mut context)
+            }
+        }
     }
 }
 
@@ -253,14 +552,29 @@ impl Drop for PciBindingLease {
     }
 }
 
+fn pci_config_error(error: super::PciError) -> DeviceError {
+    DeviceError::InvalidInput {
+        operation: "access PCI configuration",
+        detail: alloc::format!("{error}"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use alloc::vec::Vec;
+
     use axdevice_base::{DeviceAccess, Resource};
 
     use super::*;
-    use crate::PciError;
+    use crate::{
+        ConfigOffset, PciCapabilityEffectAccess, PciCapabilityEffectRegion, PciCapabilityId,
+        PciCapabilitySpec, PciClass, PciConfigEffectId, PciEndpointIdentity, PciError,
+        PciFunctionSpec, PciTopologyBuilder,
+    };
 
-    struct StubFunction;
+    struct StubFunction {
+        fail_command: bool,
+    }
 
     impl Device for StubFunction {
         fn name(&self) -> &str {
@@ -302,6 +616,166 @@ mod tests {
         ) -> DeviceResult {
             Ok(())
         }
+
+        fn command_changed(
+            &self,
+            _command: PciCommandState,
+            _context: &mut dyn DeviceContext,
+        ) -> DeviceResult {
+            if self.fail_command {
+                return Err(DeviceError::Unsupported {
+                    operation: "synchronize PCI command state",
+                    detail: "test endpoint rejected the command transition".into(),
+                });
+            }
+            Ok(())
+        }
+    }
+
+    struct RecordingFunction {
+        root: Arc<PciRootState>,
+        bdf: PciBdf,
+        reads: SpinLock<Vec<(PciConfigReadEffect, DeviceId, u64)>>,
+        writes: SpinLock<Vec<(PciConfigWriteEffect, DeviceId)>>,
+        commands: SpinLock<Vec<(PciCommandState, DeviceId)>>,
+    }
+
+    impl Device for RecordingFunction {
+        fn name(&self) -> &str {
+            "recording-pci-function"
+        }
+
+        fn resources(&self) -> &[Resource] {
+            &[]
+        }
+
+        fn read(
+            &self,
+            _access: &DeviceAccess,
+            _context: &mut dyn DeviceContext,
+        ) -> DeviceResult<u64> {
+            Err(DeviceError::NotFound)
+        }
+
+        fn write(
+            &self,
+            _access: &DeviceAccess,
+            _value: u64,
+            _context: &mut dyn DeviceContext,
+        ) -> DeviceResult {
+            Ok(())
+        }
+    }
+
+    impl PciFunction for RecordingFunction {
+        fn supported_config_effects(&self) -> &[PciConfigEffectId] {
+            const EFFECTS: &[PciConfigEffectId] = &[PciConfigEffectId::new(7)];
+            EFFECTS
+        }
+
+        fn read_bar(
+            &self,
+            _access: PciBarAccess,
+            _context: &mut dyn DeviceContext,
+        ) -> DeviceResult<u64> {
+            Ok(0)
+        }
+
+        fn write_bar(
+            &self,
+            _access: PciBarAccess,
+            _value: u64,
+            _context: &mut dyn DeviceContext,
+        ) -> DeviceResult {
+            Ok(())
+        }
+
+        fn read_config_effect(
+            &self,
+            effect: PciConfigReadEffect,
+            context: &mut dyn DeviceContext,
+        ) -> DeviceResult<u64> {
+            // This nested root read proves that dispatch released the root
+            // state lock before entering endpoint-owned behavior.
+            let vendor_device = self
+                .root
+                .read_config(self.bdf, ConfigOffset::new(0).unwrap(), AccessWidth::Dword)
+                .map_err(|error| DeviceError::InvalidInput {
+                    operation: "read recording PCI function",
+                    detail: alloc::format!("{error}"),
+                })?;
+            self.reads
+                .lock_irqsave()
+                .push((effect, context.device_id(), vendor_device));
+            Ok(0x5a)
+        }
+
+        fn write_config_effect(
+            &self,
+            effect: PciConfigWriteEffect,
+            context: &mut dyn DeviceContext,
+        ) -> DeviceResult {
+            self.writes
+                .lock_irqsave()
+                .push((effect, context.device_id()));
+            Ok(())
+        }
+
+        fn command_changed(
+            &self,
+            command: PciCommandState,
+            context: &mut dyn DeviceContext,
+        ) -> DeviceResult {
+            self.commands
+                .lock_irqsave()
+                .push((command, context.device_id()));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn binding_rejects_an_unsupported_config_effect_before_publishing_route() {
+        let effect = PciCapabilityEffectRegion::new(
+            PciConfigEffectId::new(7),
+            2,
+            1,
+            PciCapabilityEffectAccess::ReadWrite,
+        )
+        .unwrap();
+        let capability =
+            PciCapabilitySpec::new(PciCapabilityId::new(9), alloc::vec![0], alloc::vec![0])
+                .unwrap()
+                .with_effect(effect)
+                .unwrap();
+        let function_id = DeviceNodeId::new("unsupported-effect-endpoint").unwrap();
+        let mut builder = PciTopologyBuilder::new();
+        builder
+            .add_function(
+                PciFunctionSpec::new(
+                    function_id.clone(),
+                    PciEndpointIdentity::new(0x1af4, 0x1041, PciClass::new(0xff, 0, 0)),
+                )
+                .with_capability(capability),
+            )
+            .unwrap();
+        let topology = Arc::new(builder.resolve(0xc000_0000..0xc100_0000).unwrap());
+        let bdf = topology.function(&function_id).unwrap().bdf();
+        let binding = Arc::new(PciRootBinding::new(
+            DeviceNodeId::new("host").unwrap(),
+            Arc::new(PciRootState::new(topology)),
+        ));
+        let function: Arc<dyn PciFunction> = Arc::new(StubFunction {
+            fail_command: false,
+        });
+
+        assert!(matches!(
+            binding.bind(&function_id, DeviceId::new(7), function),
+            Err(DeviceManagerError::InvalidConfig { .. })
+        ));
+        assert!(matches!(
+            binding.read_config(bdf, ConfigOffset::new(0x42).unwrap(), AccessWidth::Byte,),
+            Err(DeviceError::InvalidInput { .. })
+        ));
     }
 
     fn router() -> EndpointRouter {
@@ -313,7 +787,9 @@ mod tests {
     #[test]
     fn rebind_mints_a_new_generation_and_rejects_stale_tokens() {
         let router = router();
-        let function: Arc<dyn PciFunction> = Arc::new(StubFunction);
+        let function: Arc<dyn PciFunction> = Arc::new(StubFunction {
+            fail_command: false,
+        });
         let device = DeviceId::new(7);
 
         let first = router.activate(device, Arc::clone(&function)).unwrap();
@@ -337,7 +813,9 @@ mod tests {
     #[test]
     fn invalidate_returns_none_for_unknown_or_stale_tokens() {
         let router = router();
-        let function: Arc<dyn PciFunction> = Arc::new(StubFunction);
+        let function: Arc<dyn PciFunction> = Arc::new(StubFunction {
+            fail_command: false,
+        });
         let device = DeviceId::new(3);
 
         let token = router.activate(device, Arc::clone(&function)).unwrap();
@@ -370,7 +848,9 @@ mod tests {
         let function_id = DeviceNodeId::new("endpoint").unwrap();
 
         let router = router();
-        let function: Arc<dyn PciFunction> = Arc::new(StubFunction);
+        let function: Arc<dyn PciFunction> = Arc::new(StubFunction {
+            fail_command: false,
+        });
         let first = router
             .activate(DeviceId::new(1), Arc::clone(&function))
             .unwrap();
@@ -388,5 +868,199 @@ mod tests {
             .activate(DeviceId::new(1), Arc::clone(&function))
             .unwrap();
         root.bind_endpoint(&function_id, second).unwrap();
+    }
+
+    #[test]
+    fn binding_dispatches_config_effects_and_command_transitions() {
+        let effect = PciCapabilityEffectRegion::new(
+            PciConfigEffectId::new(7),
+            8,
+            6,
+            PciCapabilityEffectAccess::ReadWrite,
+        )
+        .unwrap();
+        let capability = PciCapabilitySpec::new(
+            PciCapabilityId::new(9),
+            alloc::vec![0, 0, 0x11, 0x22, 0x33, 0x44, 0, 0, 0, 0, 0, 0, 0, 0,],
+            alloc::vec![0, 0, 0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0, 0, 0, 0, 0],
+        )
+        .unwrap()
+        .with_effect(effect)
+        .unwrap();
+        let function_id = DeviceNodeId::new("effect-endpoint").unwrap();
+        let mut builder = PciTopologyBuilder::new();
+        builder
+            .add_function(
+                PciFunctionSpec::new(
+                    function_id.clone(),
+                    PciEndpointIdentity::new(0x1af4, 0x1041, PciClass::new(0xff, 0, 0)),
+                )
+                .with_capability(capability),
+            )
+            .unwrap();
+        let topology = Arc::new(builder.resolve(0xc000_0000..0xc100_0000).unwrap());
+        let bdf = topology.function(&function_id).unwrap().bdf();
+        let root = Arc::new(PciRootState::new(Arc::clone(&topology)));
+        let binding = Arc::new(PciRootBinding::new(
+            DeviceNodeId::new("host").unwrap(),
+            Arc::clone(&root),
+        ));
+        let recording = Arc::new(RecordingFunction {
+            root,
+            bdf,
+            reads: SpinLock::new(Vec::new()),
+            writes: SpinLock::new(Vec::new()),
+            commands: SpinLock::new(Vec::new()),
+        });
+        let lease = binding
+            .bind(&function_id, DeviceId::new(7), recording.clone())
+            .unwrap();
+        let capability_offset = topology
+            .function(&function_id)
+            .unwrap()
+            .capabilities()
+            .next()
+            .unwrap()
+            .offset()
+            .value();
+
+        // Selector bytes are ordinary root-owned storage. The effect must
+        // observe their value captured by the same transaction.
+        binding
+            .write_config(
+                bdf,
+                ConfigOffset::new(capability_offset + 4).unwrap(),
+                AccessWidth::Dword,
+                0x6655_4433,
+            )
+            .unwrap();
+        assert!(recording.reads.lock_irqsave().is_empty());
+        assert!(recording.writes.lock_irqsave().is_empty());
+
+        assert_eq!(
+            binding
+                .read_config(
+                    bdf,
+                    ConfigOffset::new(capability_offset + 8).unwrap(),
+                    AccessWidth::Dword,
+                )
+                .unwrap(),
+            0x5a
+        );
+        let read = recording.reads.lock_irqsave().pop().unwrap();
+        assert_eq!(read.0.capability(), PciCapabilityId::new(9));
+        assert_eq!(read.0.effect(), PciConfigEffectId::new(7));
+        assert_eq!(read.0.offset(), 8);
+        assert_eq!(read.0.width(), AccessWidth::Dword);
+        assert_eq!(read.1, DeviceId::new(7));
+        assert_eq!(read.2, 0x1041_1af4);
+        assert_eq!(
+            &read.0.capability_snapshot().bytes()[..8],
+            &[0, 0, 0x33, 0x44, 0x55, 0x66, 0, 0]
+        );
+
+        binding
+            .write_config(
+                bdf,
+                ConfigOffset::new(capability_offset + 8).unwrap(),
+                AccessWidth::Dword,
+                0xfeed_beef,
+            )
+            .unwrap();
+        let write = recording.writes.lock_irqsave().pop().unwrap();
+        assert_eq!(write.0.value(), 0xfeed_beef);
+        assert_eq!(write.1, DeviceId::new(7));
+        assert_eq!(
+            &write.0.capability_snapshot().bytes()[..8],
+            &[0, 0, 0x33, 0x44, 0x55, 0x66, 0, 0]
+        );
+
+        // Effect results are not copied into root config storage: the next
+        // read reaches the endpoint again and returns its fresh result.
+        assert_eq!(
+            binding
+                .read_config(
+                    bdf,
+                    ConfigOffset::new(capability_offset + 8).unwrap(),
+                    AccessWidth::Dword,
+                )
+                .unwrap(),
+            0x5a
+        );
+        let second_read = recording.reads.lock_irqsave().pop().unwrap();
+        assert_eq!(second_read.0.effect(), PciConfigEffectId::new(7));
+        assert_eq!(second_read.1, DeviceId::new(7));
+
+        binding
+            .write_config(
+                bdf,
+                ConfigOffset::new(4).unwrap(),
+                AccessWidth::Word,
+                0x0406,
+            )
+            .unwrap();
+        let command = recording.commands.lock_irqsave().pop().unwrap();
+        assert!(command.0.memory_space_enable());
+        assert!(command.0.bus_master_enable());
+        assert!(command.0.interrupt_disable());
+        assert_eq!(command.1, DeviceId::new(7));
+
+        assert!(matches!(
+            binding.read_config(
+                bdf,
+                ConfigOffset::new(capability_offset + 12).unwrap(),
+                AccessWidth::Dword,
+            ),
+            Err(DeviceError::InvalidInput { .. })
+        ));
+        assert!(recording.reads.lock_irqsave().is_empty());
+
+        drop(lease);
+        assert!(matches!(
+            binding.read_config(
+                bdf,
+                ConfigOffset::new(capability_offset + 8).unwrap(),
+                AccessWidth::Dword,
+            ),
+            Err(DeviceError::InvalidInput { .. })
+        ));
+    }
+
+    #[test]
+    fn command_callback_failure_keeps_the_root_owned_command_commit() {
+        let function_id = DeviceNodeId::new("failing-command-endpoint").unwrap();
+        let mut builder = PciTopologyBuilder::new();
+        builder
+            .add_function(PciFunctionSpec::new(
+                function_id.clone(),
+                PciEndpointIdentity::new(0x1af4, 0x1041, PciClass::new(0xff, 0, 0)),
+            ))
+            .unwrap();
+        let topology = Arc::new(builder.resolve(0xc000_0000..0xc100_0000).unwrap());
+        let bdf = topology.function(&function_id).unwrap().bdf();
+        let binding = Arc::new(PciRootBinding::new(
+            DeviceNodeId::new("host").unwrap(),
+            Arc::new(PciRootState::new(topology)),
+        ));
+        let function: Arc<dyn PciFunction> = Arc::new(StubFunction { fail_command: true });
+        let _lease = binding
+            .bind(&function_id, DeviceId::new(8), function)
+            .unwrap();
+
+        assert!(matches!(
+            binding.write_config(
+                bdf,
+                ConfigOffset::new(4).unwrap(),
+                AccessWidth::Word,
+                0x0406
+            ),
+            Err(DeviceError::Unsupported { .. })
+        ));
+        assert_eq!(
+            binding
+                .read_config(bdf, ConfigOffset::new(4).unwrap(), AccessWidth::Word)
+                .unwrap(),
+            0x0406
+        );
     }
 }

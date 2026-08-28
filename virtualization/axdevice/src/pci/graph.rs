@@ -6,7 +6,10 @@ use alloc::{
 };
 use core::fmt;
 
-use super::{PciBdf, PciEndpointIdentity, PciError, PciFunctionSpec, PciMemoryBar, PciResult};
+use super::{
+    PciBdf, PciCapabilitySpec, PciEndpointIdentity, PciError, PciFunctionSpec, PciMemoryBar,
+    PciResult,
+};
 use crate::{DeviceManagerError, DeviceNodeId, DeviceNodeSpec, ResourceRequest, ResourceSlot};
 
 /// Stable key selecting one architecture-provided PCI host.
@@ -49,6 +52,7 @@ pub struct PciFunctionRequirement {
     pub(crate) identity: PciEndpointIdentity,
     pub(crate) bdf: ResourceRequest<PciBdf>,
     pub(crate) bars: Vec<PciMemoryBar>,
+    pub(crate) capabilities: Vec<PciCapabilitySpec>,
 }
 
 impl PciFunctionRequirement {
@@ -59,6 +63,7 @@ impl PciFunctionRequirement {
             identity,
             bdf: ResourceRequest::Auto,
             bars: Vec::new(),
+            capabilities: Vec::new(),
         }
     }
 
@@ -84,6 +89,12 @@ impl PciFunctionRequirement {
         Ok(self)
     }
 
+    /// Adds one conventional PCI capability declaration.
+    pub fn with_capability(mut self, capability: PciCapabilitySpec) -> Self {
+        self.capabilities.push(capability);
+        self
+    }
+
     /// Returns the selected host key.
     pub const fn host(&self) -> &PciHostKey {
         &self.host
@@ -93,6 +104,9 @@ impl PciFunctionRequirement {
         let mut spec = PciFunctionSpec::new(id, self.identity).with_bdf(self.bdf);
         for bar in &self.bars {
             spec = spec.with_bar(bar.clone())?;
+        }
+        for capability in &self.capabilities {
+            spec = spec.with_capability(capability.clone());
         }
         Ok(spec)
     }

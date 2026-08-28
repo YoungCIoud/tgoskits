@@ -17,7 +17,7 @@ const CONFIG_DATA_PORT: u16 = 0xcfc;
 /// CF8/CFC frontend that only decodes x86 port accesses.
 pub struct X86PciConfigFrontend {
     address: SpinLock<u32>,
-    root: Arc<PciRootState>,
+    binding: Arc<PciRootBinding>,
     resources: Box<[Resource]>,
 }
 
@@ -27,10 +27,10 @@ impl X86PciConfigFrontend {
     /// Size of the combined address/data port window.
     pub const PORT_SIZE: u16 = 8;
     /// Creates a frontend for one generic PCI root.
-    pub fn new(root: Arc<PciRootState>) -> Self {
+    pub fn new(binding: Arc<PciRootBinding>) -> Self {
         Self {
             address: SpinLock::new(0),
-            root,
+            binding,
             resources: alloc::vec![Resource::PortRange {
                 base: Self::PORT_BASE,
                 size: Self::PORT_SIZE
@@ -113,19 +113,22 @@ impl X86PciConfigFrontend {
         width: AccessWidth,
     ) -> DeviceResult<u64> {
         if data_offset.is_multiple_of(size) {
-            return self
-                .root
-                .read_config(bdf, register, width)
-                .map_err(pci_access_error);
+            return self.binding.read_config(bdf, register, width);
+        }
+        if self
+            .binding
+            .config_access_intersects_effect(bdf, register, width)?
+        {
+            return Err(DeviceError::InvalidInput {
+                operation: "access x86 PCI configuration",
+                detail: "an unaligned access cannot partially cover a config effect".into(),
+            });
         }
         let mut value = 0;
         for index in 0..size {
             let lane =
                 ConfigOffset::new(register.value() + index as u16).map_err(pci_access_error)?;
-            let byte = self
-                .root
-                .read_config(bdf, lane, AccessWidth::Byte)
-                .map_err(pci_access_error)?;
+            let byte = self.binding.read_config(bdf, lane, AccessWidth::Byte)?;
             value |= byte << (index * 8);
         }
         Ok(value)
@@ -142,17 +145,22 @@ impl X86PciConfigFrontend {
         value: u64,
     ) -> DeviceResult {
         if data_offset.is_multiple_of(size) {
-            return self
-                .root
-                .write_config(bdf, register, width, value)
-                .map_err(pci_access_error);
+            return self.binding.write_config(bdf, register, width, value);
+        }
+        if self
+            .binding
+            .config_access_intersects_effect(bdf, register, width)?
+        {
+            return Err(DeviceError::InvalidInput {
+                operation: "access x86 PCI configuration",
+                detail: "an unaligned access cannot partially cover a config effect".into(),
+            });
         }
         for index in 0..size {
             let lane =
                 ConfigOffset::new(register.value() + index as u16).map_err(pci_access_error)?;
-            self.root
-                .write_config(bdf, lane, AccessWidth::Byte, value >> (index * 8))
-                .map_err(pci_access_error)?;
+            self.binding
+                .write_config(bdf, lane, AccessWidth::Byte, value >> (index * 8))?;
         }
         Ok(())
     }
@@ -320,7 +328,9 @@ fn write_bytes(bytes: &mut [u8], offset: usize, size: usize, value: u64) {
 mod tests {
     use super::*;
     use crate::{
-        PciClass, PciEndpointIdentity, PciFunctionSpec, PciTopologyBuilder, ResourceRequest,
+        PciCapabilityEffectAccess, PciCapabilityEffectRegion, PciCapabilityId, PciCapabilitySpec,
+        PciClass, PciConfigEffectId, PciEndpointIdentity, PciFunctionSpec, PciTopologyBuilder,
+        ResourceRequest,
     };
 
     fn bdf(device: u8) -> PciBdf {
@@ -349,9 +359,14 @@ mod tests {
         .unwrap();
         topology.add_function(host).unwrap();
         topology.add_function(lpc).unwrap();
-        X86PciConfigFrontend::new(Arc::new(PciRootState::new(Arc::new(
+        let root = Arc::new(PciRootState::new(Arc::new(
             topology.resolve(0xc000_0000..0xd000_0000).unwrap(),
-        ))))
+        )));
+        let binding = Arc::new(PciRootBinding::new(
+            crate::DeviceNodeId::new("host").unwrap(),
+            root,
+        ));
+        X86PciConfigFrontend::new(binding)
     }
 
     fn access(port: u16, width: AccessWidth) -> DeviceAccess {
@@ -476,7 +491,10 @@ mod tests {
             0x8000_0004,
         );
         write(&frontend, CONFIG_DATA_PORT + 1, AccessWidth::Word, 0xffff);
-        assert_eq!(read(&frontend, CONFIG_DATA_PORT + 1, AccessWidth::Word), 0);
+        assert_eq!(
+            read(&frontend, CONFIG_DATA_PORT + 1, AccessWidth::Word),
+            0x04
+        );
         write(
             &frontend,
             CONFIG_ADDRESS_PORT,
@@ -484,6 +502,52 @@ mod tests {
             0x8000_0004,
         );
         assert_eq!(read(&frontend, CONFIG_DATA_PORT, AccessWidth::Byte), 0);
+    }
+
+    #[test]
+    fn unaligned_data_window_access_rejects_a_config_effect_before_lane_split() {
+        let function_id = crate::DeviceNodeId::new("effect-endpoint").unwrap();
+        let effect = PciCapabilityEffectRegion::new(
+            PciConfigEffectId::new(1),
+            5,
+            2,
+            PciCapabilityEffectAccess::ReadWrite,
+        )
+        .unwrap();
+        let capability = PciCapabilitySpec::new(
+            PciCapabilityId::new(9),
+            alloc::vec![0; 7],
+            alloc::vec![0; 7],
+        )
+        .unwrap()
+        .with_effect(effect)
+        .unwrap();
+        let function = PciFunctionSpec::new(
+            function_id.clone(),
+            PciEndpointIdentity::new(0x1af4, 0x1041, PciClass::new(0xff, 0, 0)),
+        )
+        .with_bdf(ResourceRequest::Fixed(bdf(1)))
+        .with_capability(capability);
+        let mut topology = PciTopologyBuilder::new();
+        topology.add_function(function).unwrap();
+        let topology = Arc::new(topology.resolve(0xc000_0000..0xc100_0000).unwrap());
+        let endpoint_bdf = topology.function(&function_id).unwrap().bdf();
+        let root = Arc::new(PciRootState::new(topology));
+        let binding = Arc::new(PciRootBinding::new(
+            crate::DeviceNodeId::new("host").unwrap(),
+            root,
+        ));
+        let frontend = X86PciConfigFrontend::new(binding);
+        let register = ConfigOffset::new(0x45).unwrap();
+
+        assert!(matches!(
+            frontend.read_data_window(endpoint_bdf, register, 1, 2, AccessWidth::Word),
+            Err(DeviceError::InvalidInput { .. })
+        ));
+        assert!(matches!(
+            frontend.write_data_window(endpoint_bdf, register, 1, 2, AccessWidth::Word, 0),
+            Err(DeviceError::InvalidInput { .. })
+        ));
     }
 
     fn read_error(frontend: &X86PciConfigFrontend, port: u16, width: AccessWidth) -> DeviceError {

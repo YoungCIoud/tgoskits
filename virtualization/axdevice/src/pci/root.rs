@@ -5,16 +5,37 @@
 //! runtime identities, and lifecycle callbacks are introduced by later
 //! integration layers.
 
-use alloc::{collections::BTreeMap, string::ToString, sync::Arc};
+use alloc::{boxed::Box, collections::BTreeMap, string::ToString, sync::Arc};
 use core::{fmt, ops::Range};
 
 use ax_sync::SpinLock;
 
 use super::{
-    EndpointRouteToken, FOUR_GIB, PciBarIndex, PciBdf, PciError, PciResult, ResolvedPciTopology,
+    EndpointRouteToken, FOUR_GIB, PciBarIndex, PciBdf, PciCommandState, PciConfigReadEffect,
+    PciConfigWriteEffect, PciError, PciResult, ResolvedPciTopology,
     config::{BarWriteAction, FunctionState},
 };
 use crate::{AccessWidth, ConfigOffset};
+
+pub(crate) enum PciConfigReadOutcome {
+    Value(u64),
+    Effect {
+        token: EndpointRouteToken,
+        effect: Box<PciConfigReadEffect>,
+    },
+}
+
+pub(crate) enum PciConfigWriteOutcome {
+    Complete,
+    Effect {
+        token: EndpointRouteToken,
+        effect: Box<PciConfigWriteEffect>,
+    },
+    CommandChanged {
+        token: Option<EndpointRouteToken>,
+        command: PciCommandState,
+    },
+}
 
 /// Shared root state for one frozen PCI topology.
 pub struct PciRootState {
@@ -64,12 +85,12 @@ impl PciRootState {
         offset: ConfigOffset,
         width: AccessWidth,
     ) -> PciResult<u64> {
-        let (offset, size) = offset.validate_access(width)?;
-        let state = self.state.lock_irqsave();
-        Ok(state.function_index(bdf).map_or_else(
-            || all_ones(size),
-            |index| state.functions[index].read(offset, size),
-        ))
+        match self.prepare_read_config(bdf, offset, width)? {
+            PciConfigReadOutcome::Value(value) => Ok(value),
+            PciConfigReadOutcome::Effect { .. } => Err(PciError::ConfigEffectUnavailable {
+                detail: "an endpoint binding is required for this config read",
+            }),
+        }
     }
 
     /// Applies one conventional config write.
@@ -89,30 +110,150 @@ impl PciRootState {
         width: AccessWidth,
         value: u64,
     ) -> PciResult {
-        let (offset, size) = offset.validate_access(width)?;
-        let mut state = self.state.lock_irqsave();
-        let Some(function_index) = state.function_index(bdf) else {
-            return Ok(());
-        };
-        let Some(action) = state.functions[function_index].prepare_bar_write(offset, size, value)
-        else {
-            state.functions[function_index].write_non_bar(offset, size, value);
-            return Ok(());
-        };
-        match action {
-            BarWriteAction::Probe { bar } => state.functions[function_index].apply_probe(bar),
-            BarWriteAction::Relocate { bar, candidate } => {
-                let accepted = state.bar_address_available(
-                    self.topology.memory_aperture(),
-                    function_index,
-                    bar,
-                    candidate,
-                );
-                state.functions[function_index]
-                    .finish_relocation(bar, accepted.then_some(candidate));
+        match self.prepare_write_config(bdf, offset, width, value)? {
+            PciConfigWriteOutcome::Complete | PciConfigWriteOutcome::CommandChanged { .. } => {
+                Ok(())
             }
+            PciConfigWriteOutcome::Effect { .. } => Err(PciError::ConfigEffectUnavailable {
+                detail: "an endpoint binding is required for this config write",
+            }),
         }
-        Ok(())
+    }
+
+    pub(crate) fn prepare_read_config(
+        &self,
+        bdf: PciBdf,
+        offset: ConfigOffset,
+        width: AccessWidth,
+    ) -> PciResult<PciConfigReadOutcome> {
+        let (offset, size) = offset.validate_access(width)?;
+        let (token, capability, effect, relative, snapshot) = {
+            let state = self.state.lock_irqsave();
+            let Some(function_index) = state.function_index(bdf) else {
+                return Ok(PciConfigReadOutcome::Value(all_ones(size)));
+            };
+            let function = &state.functions[function_index];
+            let Some((capability, effect, relative, snapshot)) =
+                function.config_effect(offset, size, width, false)?
+            else {
+                return Ok(PciConfigReadOutcome::Value(function.read(offset, size)));
+            };
+            let token =
+                state
+                    .bindings
+                    .get(&bdf)
+                    .copied()
+                    .ok_or(PciError::ConfigEffectUnavailable {
+                        detail: "an endpoint binding is required for this config read",
+                    })?;
+            (token, capability, effect, relative, snapshot)
+        };
+        Ok(PciConfigReadOutcome::Effect {
+            token,
+            effect: Box::new(PciConfigReadEffect::new(
+                capability,
+                effect.effect(),
+                relative,
+                width,
+                snapshot,
+            )),
+        })
+    }
+
+    pub(crate) fn config_access_intersects_effect(
+        &self,
+        bdf: PciBdf,
+        offset: ConfigOffset,
+        width: AccessWidth,
+    ) -> PciResult<bool> {
+        let size = width.size();
+        let offset = usize::from(offset.value());
+        let end = offset
+            .checked_add(size)
+            .ok_or(PciError::InvalidConfigAccess {
+                offset: offset as u16,
+                width,
+                detail: "config access range overflows",
+            })?;
+        if end > 0x100 {
+            return Err(PciError::InvalidConfigAccess {
+                offset: offset as u16,
+                width,
+                detail: "config access leaves the function boundary",
+            });
+        }
+        let state = self.state.lock_irqsave();
+        Ok(state
+            .function_index(bdf)
+            .is_some_and(|index| state.functions[index].intersects_config_effect(offset, size)))
+    }
+
+    pub(crate) fn prepare_write_config(
+        &self,
+        bdf: PciBdf,
+        offset: ConfigOffset,
+        width: AccessWidth,
+        value: u64,
+    ) -> PciResult<PciConfigWriteOutcome> {
+        let (offset, size) = offset.validate_access(width)?;
+        let (token, capability, effect, relative, snapshot) =
+            {
+                let mut state = self.state.lock_irqsave();
+                let Some(function_index) = state.function_index(bdf) else {
+                    return Ok(PciConfigWriteOutcome::Complete);
+                };
+                if let Some((capability, effect, relative, snapshot)) =
+                    state.functions[function_index].config_effect(offset, size, width, true)?
+                {
+                    let token = state.bindings.get(&bdf).copied().ok_or(
+                        PciError::ConfigEffectUnavailable {
+                            detail: "an endpoint binding is required for this config write",
+                        },
+                    )?;
+                    (token, capability, effect, relative, snapshot)
+                } else {
+                    let bar_action =
+                        state.functions[function_index].prepare_bar_write(offset, size, value);
+                    if let Some(action) = bar_action {
+                        match action {
+                            BarWriteAction::Probe { bar } => {
+                                state.functions[function_index].apply_probe(bar)
+                            }
+                            BarWriteAction::Relocate { bar, candidate } => {
+                                let accepted = state.bar_address_available(
+                                    self.topology.memory_aperture(),
+                                    function_index,
+                                    bar,
+                                    candidate,
+                                );
+                                state.functions[function_index]
+                                    .finish_relocation(bar, accepted.then_some(candidate));
+                            }
+                        }
+                        return Ok(PciConfigWriteOutcome::Complete);
+                    }
+                    let previous = state.functions[function_index].command_state();
+                    state.functions[function_index].write_non_bar(offset, size, value);
+                    let command = state.functions[function_index].command_state();
+                    let command_changed = previous.bus_master_enable()
+                        != command.bus_master_enable()
+                        || previous.interrupt_disable() != command.interrupt_disable();
+                    if command_changed {
+                        return Ok(PciConfigWriteOutcome::CommandChanged {
+                            token: state.bindings.get(&bdf).copied(),
+                            command,
+                        });
+                    }
+                    return Ok(PciConfigWriteOutcome::Complete);
+                }
+            };
+        Ok(PciConfigWriteOutcome::Effect {
+            token,
+            effect: Box::new(PciConfigWriteEffect::new(
+                PciConfigReadEffect::new(capability, effect.effect(), relative, width, snapshot),
+                value,
+            )),
+        })
     }
 
     /// Resolves one complete memory access against the current enabled BARs.
@@ -301,8 +442,9 @@ mod tests {
 
     use super::*;
     use crate::{
-        ConfigOffset, DeviceNodeId, PciClass, PciEndpointIdentity, PciFunctionSpec, PciMemoryBar,
-        PciSegment, PciTopologyBuilder, ResourceRequest,
+        ConfigOffset, DeviceNodeId, PciCapabilityId, PciCapabilitySpec, PciClass,
+        PciEndpointIdentity, PciFunctionSpec, PciMemoryBar, PciSegment, PciTopologyBuilder,
+        ResourceRequest,
     };
 
     const APERTURE_START: u64 = 0x2000_0000;
@@ -368,6 +510,88 @@ mod tests {
     }
 
     #[test]
+    fn serializes_capabilities_and_subsystem_ids_into_root_owned_config() {
+        let first = PciCapabilitySpec::new(
+            PciCapabilityId::new(1),
+            alloc::vec![0xa1, 0xb2],
+            alloc::vec![0, 0],
+        )
+        .unwrap();
+        let second = PciCapabilitySpec::new(
+            PciCapabilityId::new(2),
+            alloc::vec![0, 0, 0x11, 0x22],
+            alloc::vec![0, 0, 0xff, 0xff],
+        )
+        .unwrap();
+        let endpoint = PciFunctionSpec::new(
+            node("capability-endpoint"),
+            PciEndpointIdentity::new(0x1234, 0x5678, PciClass::new(0x05, 0, 0))
+                .with_subsystem_ids(0xabcd, 0x1234),
+        )
+        .with_capability(first)
+        .with_capability(second);
+        let mut builder = PciTopologyBuilder::new();
+        builder.add_function(endpoint).unwrap();
+        let topology = Arc::new(builder.resolve(APERTURE_START..APERTURE_END).unwrap());
+        let resolved = topology.function(&node("capability-endpoint")).unwrap();
+        let endpoint_bdf = resolved.bdf();
+        let root = PciRootState::new(topology);
+
+        assert_eq!(
+            root.read_config(endpoint_bdf, offset(0x2c), AccessWidth::Dword)
+                .unwrap(),
+            0x1234_abcd
+        );
+        assert_eq!(
+            root.read_config(endpoint_bdf, offset(0x06), AccessWidth::Byte)
+                .unwrap(),
+            0x10
+        );
+        assert_eq!(
+            root.read_config(endpoint_bdf, offset(0x34), AccessWidth::Byte)
+                .unwrap(),
+            0x40
+        );
+        assert_eq!(
+            root.read_config(endpoint_bdf, offset(0x40), AccessWidth::Dword)
+                .unwrap(),
+            0xb2a1_4401
+        );
+        assert_eq!(
+            root.read_config(endpoint_bdf, offset(0x44), AccessWidth::Dword)
+                .unwrap(),
+            0x0000_0002
+        );
+        assert_eq!(
+            root.read_config(endpoint_bdf, offset(0x48), AccessWidth::Word)
+                .unwrap(),
+            0x2211
+        );
+
+        root.write_config(endpoint_bdf, offset(0x2c), AccessWidth::Word, u64::MAX)
+            .unwrap();
+        root.write_config(endpoint_bdf, offset(0x40), AccessWidth::Byte, u64::MAX)
+            .unwrap();
+        root.write_config(endpoint_bdf, offset(0x48), AccessWidth::Word, 0x1234)
+            .unwrap();
+        assert_eq!(
+            root.read_config(endpoint_bdf, offset(0x2c), AccessWidth::Dword)
+                .unwrap(),
+            0x1234_abcd
+        );
+        assert_eq!(
+            root.read_config(endpoint_bdf, offset(0x40), AccessWidth::Byte)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            root.read_config(endpoint_bdf, offset(0x48), AccessWidth::Word)
+                .unwrap(),
+            0x1234
+        );
+    }
+
+    #[test]
     fn platform_config_bytes_cannot_override_core_identity_or_bars() {
         let function = PciFunctionSpec::new(
             node("platform"),
@@ -386,7 +610,7 @@ mod tests {
     }
 
     #[test]
-    fn command_register_only_accepts_memory_space_enable() {
+    fn command_register_accepts_memory_space_bus_master_and_interrupt_disable() {
         let (root, endpoint_bdf, bar_base) = root_with_bar();
 
         assert!(root.resolve_bar(bar_base, AccessWidth::Dword).is_none());
@@ -396,7 +620,7 @@ mod tests {
         assert_eq!(
             root.read_config(endpoint_bdf, offset(4), AccessWidth::Word)
                 .unwrap(),
-            0x0002
+            0x0406
         );
         let route = root.resolve_bar(bar_base + 8, AccessWidth::Dword).unwrap();
         assert_eq!(route.bdf(), endpoint_bdf);

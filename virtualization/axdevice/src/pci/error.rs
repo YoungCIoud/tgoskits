@@ -43,6 +43,18 @@ pub enum PciError {
         /// Rejected invariant.
         detail: &'static str,
     },
+    /// A capability declaration or layout violates conventional config rules.
+    #[error("invalid PCI capability: {detail}")]
+    InvalidCapability {
+        /// Rejected declaration or layout invariant.
+        detail: alloc::string::String,
+    },
+    /// An endpoint-owned config effect was accessed without an active binding.
+    #[error("PCI config effect is unavailable: {detail}")]
+    ConfigEffectUnavailable {
+        /// Diagnostic reason.
+        detail: &'static str,
+    },
     /// The root memory aperture is malformed.
     #[error("invalid PCI host aperture: {detail}")]
     InvalidHostAperture {

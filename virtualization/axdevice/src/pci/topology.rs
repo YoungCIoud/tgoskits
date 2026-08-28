@@ -8,8 +8,9 @@ use alloc::{
 use core::{fmt, ops::Range};
 
 use super::{
-    FOUR_GIB, PciBarIndex, PciBdf, PciEndpointIdentity, PciError, PciFunctionSpec, PciResult,
-    bar::ResolvedBarPlan, config::PowerOnConfig, placement::resolve_bar_addresses,
+    FOUR_GIB, PciBarIndex, PciBdf, PciCapabilityLayout, PciEndpointIdentity, PciError,
+    PciFunctionSpec, PciResult, bar::ResolvedBarPlan, capability::layout_capabilities,
+    config::PowerOnConfig, placement::resolve_bar_addresses,
 };
 use crate::{DeviceNodeId, ResourceRequest};
 
@@ -93,7 +94,10 @@ impl PciTopologyBuilder {
                     address: bar_addresses[&(id.clone(), bar.index())],
                 })
                 .collect::<Vec<_>>();
-            let power_on = PowerOnConfig::build(spec.identity, &bars, &spec.config_bytes)?;
+            let capabilities = layout_capabilities(&spec.capabilities)?;
+            validate_capability_config_patches(&spec.config_bytes, &capabilities)?;
+            let power_on =
+                PowerOnConfig::build(spec.identity, &bars, &spec.config_bytes, &capabilities)?;
             functions.push(ResolvedPciFunction {
                 owner: id.clone(),
                 host: id.clone(),
@@ -101,6 +105,7 @@ impl PciTopologyBuilder {
                 identity: spec.identity,
                 bdf,
                 bars,
+                capabilities,
                 power_on,
             });
         }
@@ -110,6 +115,26 @@ impl PciTopologyBuilder {
             functions,
         })
     }
+}
+
+fn validate_capability_config_patches(
+    patches: &[super::function::PciConfigByte],
+    capabilities: &[PciCapabilityLayout],
+) -> PciResult {
+    for patch in patches {
+        let offset = usize::from(patch.offset.value());
+        if capabilities.iter().any(|capability| {
+            let start = usize::from(capability.offset().value());
+            let end = start + usize::from(capability.length());
+            start <= offset && offset < end
+        }) {
+            return Err(PciError::InvalidConfigPatch {
+                offset: patch.offset.value(),
+                detail: "platform config bytes cannot overlap a capability",
+            });
+        }
+    }
+    Ok(())
 }
 
 impl Default for PciTopologyBuilder {
@@ -136,6 +161,7 @@ pub struct ResolvedPciFunction {
     identity: PciEndpointIdentity,
     bdf: PciBdf,
     bars: Vec<ResolvedBarPlan>,
+    capabilities: Vec<PciCapabilityLayout>,
     pub(crate) power_on: PowerOnConfig,
 }
 
@@ -174,6 +200,11 @@ impl ResolvedPciFunction {
             .map(ResolvedPciBar)
     }
 
+    /// Returns the capabilities in their resolved config-space order.
+    pub fn capabilities(&self) -> impl Iterator<Item = &PciCapabilityLayout> {
+        self.capabilities.iter()
+    }
+
     pub(crate) fn bars(&self) -> &[ResolvedBarPlan] {
         &self.bars
     }
@@ -189,6 +220,7 @@ impl fmt::Debug for ResolvedPciFunction {
             .field("identity", &self.identity)
             .field("bdf", &self.bdf)
             .field("bars", &self.bars)
+            .field("capabilities", &self.capabilities)
             .finish()
     }
 }
@@ -344,7 +376,9 @@ fn validate_supported_bdf(bdf: PciBdf) -> PciResult {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ConfigOffset, PciClass, PciMemoryBar, PciSegment};
+    use crate::{
+        ConfigOffset, PciCapabilityId, PciCapabilitySpec, PciClass, PciMemoryBar, PciSegment,
+    };
 
     const APERTURE_START: u64 = 0x2000_0000;
     const APERTURE_END: u64 = 0x2040_0000;
@@ -420,6 +454,27 @@ mod tests {
         assert!(matches!(
             PciTopologyBuilder::new().resolve(APERTURE_START..(1_u64 << 32) + 1),
             Err(PciError::InvalidHostAperture { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_platform_config_bytes_overlapping_capabilities() {
+        let capability = PciCapabilitySpec::new(
+            PciCapabilityId::new(1),
+            alloc::vec![0; 2],
+            alloc::vec![0; 2],
+        )
+        .unwrap();
+        let function = function("overlapping-capability")
+            .with_capability(capability)
+            .with_platform_config_byte(ConfigOffset::new(0x40).unwrap(), 1, 0xff)
+            .unwrap();
+        let mut builder = PciTopologyBuilder::new();
+        builder.add_function(function).unwrap();
+
+        assert!(matches!(
+            builder.resolve(APERTURE_START..APERTURE_END),
+            Err(PciError::InvalidConfigPatch { offset: 0x40, .. })
         ));
     }
 

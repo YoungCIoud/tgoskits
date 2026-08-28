@@ -2,7 +2,7 @@
 
 use alloc::vec::Vec;
 
-use super::{PciError, PciMemoryBar, PciResult};
+use super::{PciCapabilitySpec, PciError, PciMemoryBar, PciResult};
 use crate::{ConfigOffset, DeviceNodeId, ResourceRequest};
 
 #[derive(Clone, Copy, Debug)]
@@ -51,6 +51,8 @@ impl PciClass {
 pub struct PciEndpointIdentity {
     vendor_id: u16,
     device_id: u16,
+    subsystem_vendor_id: u16,
+    subsystem_device_id: u16,
     class: PciClass,
     revision: u8,
 }
@@ -61,6 +63,8 @@ impl PciEndpointIdentity {
         Self {
             vendor_id,
             device_id,
+            subsystem_vendor_id: 0,
+            subsystem_device_id: 0,
             class,
             revision: 0,
         }
@@ -72,6 +76,13 @@ impl PciEndpointIdentity {
         self
     }
 
+    /// Sets the immutable subsystem identity fields.
+    pub const fn with_subsystem_ids(mut self, vendor_id: u16, device_id: u16) -> Self {
+        self.subsystem_vendor_id = vendor_id;
+        self.subsystem_device_id = device_id;
+        self
+    }
+
     /// Returns the vendor ID.
     pub const fn vendor_id(self) -> u16 {
         self.vendor_id
@@ -80,6 +91,16 @@ impl PciEndpointIdentity {
     /// Returns the device ID.
     pub const fn device_id(self) -> u16 {
         self.device_id
+    }
+
+    /// Returns the subsystem vendor ID.
+    pub const fn subsystem_vendor_id(self) -> u16 {
+        self.subsystem_vendor_id
+    }
+
+    /// Returns the subsystem device ID.
+    pub const fn subsystem_device_id(self) -> u16 {
+        self.subsystem_device_id
     }
 
     /// Returns the class-code triplet.
@@ -100,6 +121,7 @@ pub struct PciFunctionSpec {
     pub(crate) identity: PciEndpointIdentity,
     pub(crate) bdf: ResourceRequest<super::PciBdf>,
     pub(crate) bars: Vec<PciMemoryBar>,
+    pub(crate) capabilities: Vec<PciCapabilitySpec>,
     pub(crate) config_bytes: Vec<PciConfigByte>,
 }
 
@@ -111,6 +133,7 @@ impl PciFunctionSpec {
             identity,
             bdf: ResourceRequest::Auto,
             bars: Vec::new(),
+            capabilities: Vec::new(),
             config_bytes: Vec::new(),
         }
     }
@@ -147,6 +170,12 @@ impl PciFunctionSpec {
         Ok(self)
     }
 
+    /// Adds one conventional PCI capability declaration.
+    pub fn with_capability(mut self, capability: PciCapabilitySpec) -> Self {
+        self.capabilities.push(capability);
+        self
+    }
+
     /// Defines one platform-owned conventional config byte and its write mask.
     ///
     /// This is intended for fixed host-bridge compatibility fields. BAR bytes
@@ -170,10 +199,10 @@ impl PciFunctionSpec {
                 detail: "BAR bytes are owned by the BAR state machine",
             });
         }
-        if !matches!(offset_value, 4 | 5 | 0x0e) && offset_value < 0x40 {
+        if offset_value != 0x0e && offset_value < 0x40 {
             return Err(PciError::InvalidConfigPatch {
                 offset: offset_value,
-                detail: "core identity and status fields cannot be overridden",
+                detail: "core identity, command, and status fields cannot be overridden",
             });
         }
         if self

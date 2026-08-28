@@ -83,7 +83,7 @@ impl DeviceModel for X86PciHostModel {
         let root = Arc::new(PciRootState::new(topology));
         let binding = Arc::new(PciRootBinding::new(self.host_id.clone(), root.clone()));
         let mut bundle = DeviceBundle::new();
-        bundle.add_device(Arc::new(X86PciConfigFrontend::new(root.clone())));
+        bundle.add_device(Arc::new(X86PciConfigFrontend::new(binding.clone())));
         bundle.add_device(Arc::new(PciMemoryApertureDevice::new(
             memory.0,
             memory.1,
@@ -96,7 +96,7 @@ impl DeviceModel for X86PciHostModel {
 }
 
 fn q35_host_function(id: DeviceNodeId) -> PciResult<PciFunctionSpec> {
-    PciFunctionSpec::new(
+    Ok(PciFunctionSpec::new(
         id,
         PciEndpointIdentity::new(0x8086, 0x29c0, PciClass::new(0x06, 0x00, 0x00)),
     )
@@ -105,8 +105,7 @@ fn q35_host_function(id: DeviceNodeId) -> PciResult<PciFunctionSpec> {
         0,
         0,
         0,
-    )?))
-    .with_platform_config_byte(ConfigOffset::new(4)?, 0, 0x07)
+    )?)))
 }
 
 fn lpc_function() -> PciResult<PciFunctionSpec> {
@@ -121,7 +120,6 @@ fn lpc_function() -> PciResult<PciFunctionSpec> {
         0x1f,
         0,
     )?))
-    .with_platform_config_byte(ConfigOffset::new(4)?, 0, 0x07)?
     .with_platform_config_byte(ConfigOffset::new(0x0e)?, 0x80, 0)?
     .with_platform_config_byte(ConfigOffset::new(0x40)?, 0x01, 0x80)?
     .with_platform_config_byte(ConfigOffset::new(0x41)?, 0, 0xff)?
