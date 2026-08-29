@@ -86,8 +86,9 @@ pub use pci::{
     PciCapabilityLayout, PciCapabilitySnapshot, PciCapabilitySpec, PciClass, PciCommandState,
     PciConfigEffectId, PciConfigReadEffect, PciConfigWriteEffect, PciEndpointContext,
     PciEndpointIdentity, PciError, PciFunction, PciFunctionRequirement, PciFunctionSpec,
-    PciHostKey, PciHostProvider, PciMemoryBar, PciResult, PciRootBinding, PciRootBindingKey,
-    PciRootState, PciSegment, ResolvedPciBar, ResolvedPciFunction, ResolvedPciTopology,
+    PciHostKey, PciHostProvider, PciIntxPin, PciIntxRequirement, PciIntxRouter, PciMemoryBar,
+    PciResult, PciRootBinding, PciRootBindingKey, PciRootState, PciSegment, ResolvedPciBar,
+    ResolvedPciFunction, ResolvedPciIntx, ResolvedPciTopology,
 };
 pub(crate) use pci::{PciTopologyBuilder, all_ones, read_bytes};
 pub use registration::{

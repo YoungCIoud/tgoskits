@@ -1,6 +1,8 @@
 //! x86_64 VM resource creation and initialization.
 
 use ax_memory_addr::PAGE_SIZE_4K;
+#[cfg(all(test, feature = "host-fs"))]
+use axdevice::FwCfgPayloadSlot;
 use axdevice::{DeviceFirmwareBinding, DeviceNodeId, DeviceNodeSpec};
 
 use super::*;
@@ -146,6 +148,11 @@ fn plan_devices(
         super::resource_pools::create(config)?,
         super::pci_config::provider()?,
     )?))
+}
+
+#[cfg(all(test, feature = "host-fs"))]
+pub(crate) fn test_plan_devices(config: &AxVMConfig) -> AxVmResult<X86VmPlan> {
+    plan_devices(config, std::sync::Arc::new(FwCfgPayloadSlot::new()))
 }
 
 fn build_vcpu_setup_config(

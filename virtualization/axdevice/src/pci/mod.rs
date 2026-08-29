@@ -30,7 +30,10 @@ pub use capability::{
 };
 pub use error::{PciError, PciResult};
 pub use function::{PciClass, PciEndpointIdentity, PciFunctionSpec};
-pub use graph::{PciFunctionRequirement, PciHostKey, PciHostProvider};
+pub use graph::{
+    PciFunctionRequirement, PciHostKey, PciHostProvider, PciIntxPin, PciIntxRequirement,
+    PciIntxRouter, ResolvedPciIntx,
+};
 pub use root::{PciBarRoute, PciRootState};
 pub(crate) use runtime::PciBindingLease;
 pub use runtime::{

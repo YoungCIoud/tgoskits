@@ -2,7 +2,7 @@
 
 use alloc::vec::Vec;
 
-use super::{PciCapabilitySpec, PciError, PciMemoryBar, PciResult};
+use super::{PciCapabilitySpec, PciError, PciIntxRequirement, PciMemoryBar, PciResult};
 use crate::{ConfigOffset, DeviceNodeId, ResourceRequest};
 
 #[derive(Clone, Copy, Debug)]
@@ -122,6 +122,7 @@ pub struct PciFunctionSpec {
     pub(crate) bdf: ResourceRequest<super::PciBdf>,
     pub(crate) bars: Vec<PciMemoryBar>,
     pub(crate) capabilities: Vec<PciCapabilitySpec>,
+    pub(crate) intx: Option<PciIntxRequirement>,
     pub(crate) config_bytes: Vec<PciConfigByte>,
 }
 
@@ -134,6 +135,7 @@ impl PciFunctionSpec {
             bdf: ResourceRequest::Auto,
             bars: Vec::new(),
             capabilities: Vec::new(),
+            intx: None,
             config_bytes: Vec::new(),
         }
     }
@@ -174,6 +176,18 @@ impl PciFunctionSpec {
     pub fn with_capability(mut self, capability: PciCapabilitySpec) -> Self {
         self.capabilities.push(capability);
         self
+    }
+
+    /// Attaches one endpoint-owned conventional INTx requirement.
+    pub(crate) fn with_intx(mut self, intx: PciIntxRequirement) -> PciResult<Self> {
+        if self.intx.is_some() {
+            return Err(PciError::InvalidConfigPatch {
+                offset: 0x3d,
+                detail: "a PCI function may declare at most one INTx attachment",
+            });
+        }
+        self.intx = Some(intx);
+        Ok(self)
     }
 
     /// Defines one platform-owned conventional config byte and its write mask.

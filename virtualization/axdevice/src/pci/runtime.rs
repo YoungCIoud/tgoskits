@@ -1,11 +1,11 @@
 //! Runtime-authenticated PCI endpoint binding and BAR dispatch.
 
-use alloc::{collections::BTreeMap, string::ToString, sync::Arc, vec::Vec};
+use alloc::{collections::BTreeMap, format, string::ToString, sync::Arc, vec::Vec};
 use core::fmt;
 
 use ax_sync::SpinLock;
 use axdevice_base::{
-    Device, DeviceContext, DeviceError, DeviceId, DeviceResult,
+    Device, DeviceContext, DeviceError, DeviceId, DeviceResult, IrqLine,
     RoutedAdmissionEpoch as RoutedGrantAdmissionEpoch, RoutedBindingGeneration, RoutedDeviceGrant,
 };
 
@@ -20,6 +20,11 @@ use crate::{
 };
 
 const DEFAULT_DRAIN_ATTEMPTS: usize = 1_000_000;
+
+// A root binding may be dropped while an endpoint backend is temporarily
+// unable to withdraw its IRQ. Keep that owner in a process-lifetime,
+// fail-closed queue so dropping the root cannot drop an asserted line.
+static ORPHANED_IRQ_WITHDRAWALS: SpinLock<Vec<PendingIrqWithdrawal>> = SpinLock::new(Vec::new());
 
 /// Metadata passed to one endpoint BAR callback.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -193,11 +198,29 @@ impl PciBarAccess {
 
 /// Permit held while an endpoint publishes one interrupt-line transition.
 ///
-/// The permit is intentionally opaque in commit 2. Later interrupt topology
-/// work will add the line operation methods without exposing the admission
-/// gate or allowing an endpoint to retain the permit beyond the callback.
+/// The permit exposes only the line operations needed by an admitted callback;
+/// the admission gate remains private and the endpoint cannot retain the
+/// permit beyond the callback that acquired it.
 pub struct EndpointIrqTransitionPermit {
     _private: (),
+}
+
+impl EndpointIrqTransitionPermit {
+    /// Asserts one endpoint-owned level-triggered source.
+    pub fn assert(&mut self, line: &IrqLine) -> DeviceResult {
+        line.assert().map_err(|error| DeviceError::Backend {
+            operation: "assert PCI endpoint INTx line",
+            detail: format!("{error}"),
+        })
+    }
+
+    /// Deasserts one endpoint-owned level-triggered source.
+    pub fn deassert(&mut self, line: &IrqLine) -> DeviceResult {
+        line.deassert().map_err(|error| DeviceError::Backend {
+            operation: "deassert PCI endpoint INTx line",
+            detail: format!("{error}"),
+        })
+    }
 }
 
 /// Context supplied to endpoint-owned PCI callbacks.
@@ -305,6 +328,11 @@ impl PciEndpointContext for LegacyPciEndpointContext {
 /// The route grant is not a substitute for endpoint DMA registration: guest
 /// memory still requires the endpoint's matching [`DmaGrant`].
 pub trait PciFunction: Device {
+    /// Returns whether endpoint-owned interrupt state is pending.
+    fn intx_pending(&self) -> bool {
+        false
+    }
+
     /// Returns the endpoint-owned config effects implemented by this function.
     ///
     /// The runtime compares this list with the effect IDs declared in the
@@ -379,6 +407,19 @@ pub trait PciFunction: Device {
             operation: "reset PCI endpoint",
             detail: "the endpoint does not implement lifecycle reset".into(),
         })
+    }
+
+    /// Withdraws the endpoint-owned IRQ source during binding teardown or
+    /// lifecycle reset.
+    ///
+    /// The runtime invokes this only after the root route is withdrawn or
+    /// reset, new IRQ permits are closed, and previously acquired permits are
+    /// drained. An INTx endpoint should deassert its owned [`IrqLine`] through
+    /// the supplied transition permit. The operation must be idempotent so a
+    /// failed reset can be followed by final teardown. The default is
+    /// suitable for functions without an interrupt source.
+    fn withdraw_irq(&self, _permit: &mut EndpointIrqTransitionPermit) -> DeviceResult {
+        Ok(())
     }
 }
 
@@ -731,12 +772,28 @@ impl EndpointRouter {
                 })
                 .collect::<Vec<_>>()
         };
+        let mut first_error = None;
         for (endpoint, command) in endpoints {
-            endpoint
-                .reset(command)
-                .map_err(DeviceManagerError::Device)?;
+            if let Err(error) = endpoint.reset(command).map_err(DeviceManagerError::Device)
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
+
+            // The fresh route admission is intentionally still closed here.
+            // The lifecycle owner has drained the old admission, so this
+            // owner-side transition is authorized directly by the reset
+            // phase's permit rather than by a routed callback permit.
+            let mut permit = EndpointIrqTransitionPermit { _private: () };
+            if let Err(error) = endpoint
+                .withdraw_irq(&mut permit)
+                .map_err(DeviceManagerError::Device)
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
         }
-        Ok(())
+        first_error.map_or(Ok(()), Err)
     }
 
     fn reset_admissions(
@@ -785,7 +842,7 @@ impl EndpointRouter {
         Ok(replacements)
     }
 
-    fn close_admissions_and_drain_irq(&self) -> DeviceManagerResult {
+    fn close_admissions_and_drain(&self) -> DeviceManagerResult {
         let admissions = {
             let state = self.state.lock_irqsave();
             for endpoint in state.endpoints.values() {
@@ -799,30 +856,39 @@ impl EndpointRouter {
                 .collect::<Vec<_>>()
         };
         for admission in admissions {
-            admission.wait_for_irq_permits()?;
+            admission.wait_for_idle()?;
         }
         Ok(())
     }
 
-    fn invalidate_all(&self) -> DeviceManagerResult {
-        let admissions = {
+    fn invalidate_all(&self) -> (Vec<PendingIrqWithdrawal>, DeviceManagerResult) {
+        let pending = {
             let mut state = self.state.lock_irqsave();
-            let admissions = state
+            let pending = state
                 .endpoints
                 .values()
                 .map(|endpoint| {
                     endpoint.token.admission.close();
                     endpoint.token.grant.close_admission();
-                    endpoint.token.admission.clone()
+                    PendingIrqWithdrawal {
+                        device: endpoint.token.device_id(),
+                        function: endpoint.function.clone(),
+                        admission: endpoint.token.admission.clone(),
+                    }
                 })
                 .collect::<Vec<_>>();
             state.endpoints.clear();
-            admissions
+            pending
         };
-        for admission in admissions {
-            admission.wait_for_irq_permits()?;
+        let mut first_error = None;
+        for withdrawal in &pending {
+            if let Err(error) = withdrawal.admission.wait_for_irq_permits()
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
         }
-        Ok(())
+        (pending, first_error.map_or(Ok(()), Err))
     }
 
     fn open_admissions(&self) {
@@ -854,6 +920,13 @@ pub struct PciRootBinding {
     root: Arc<PciRootState>,
     router: Arc<EndpointRouter>,
     lifecycle: SpinLock<BindingLifecycleState>,
+    pending_irq_withdrawals: SpinLock<Vec<PendingIrqWithdrawal>>,
+}
+
+struct PendingIrqWithdrawal {
+    device: DeviceId,
+    function: Arc<dyn PciFunction>,
+    admission: Arc<EndpointAdmission>,
 }
 
 impl PciRootBinding {
@@ -864,12 +937,87 @@ impl PciRootBinding {
             root,
             router: Arc::new(EndpointRouter::new()),
             lifecycle: SpinLock::new(BindingLifecycleState::Running),
+            pending_irq_withdrawals: SpinLock::new(Vec::new()),
         }
     }
 
     /// Returns the host graph identity publishing this service.
     pub const fn host(&self) -> &DeviceNodeId {
         &self.host
+    }
+
+    /// Retries endpoint-owned IRQ withdrawals that could not complete during
+    /// bounded binding teardown.
+    ///
+    /// A pending withdrawal keeps the endpoint owner and its closed admission
+    /// alive. Rebinding the same device is rejected until this method drains
+    /// the owner-side cleanup successfully.
+    pub fn retry_irq_withdrawals(&self) -> DeviceManagerResult {
+        let _lifecycle = self.lifecycle.lock_irqsave();
+        self.retry_irq_withdrawals_locked()
+    }
+
+    /// Retries endpoint IRQ withdrawals orphaned by a previous root teardown.
+    ///
+    /// The orphan queue retains each endpoint owner and closed admission until
+    /// this method succeeds. A failed retry leaves the entry fail-closed for a
+    /// later owner or teardown supervisor to retry.
+    pub fn retry_orphaned_irq_withdrawals() -> DeviceManagerResult {
+        retry_pending_irq_withdrawals(&ORPHANED_IRQ_WITHDRAWALS)
+    }
+
+    fn retry_irq_withdrawals_locked(&self) -> DeviceManagerResult {
+        retry_pending_irq_withdrawals(&self.pending_irq_withdrawals)
+    }
+}
+
+fn retry_pending_irq_withdrawals(
+    pending_storage: &SpinLock<Vec<PendingIrqWithdrawal>>,
+) -> DeviceManagerResult {
+    let pending = core::mem::take(&mut *pending_storage.lock_irqsave());
+    let mut remaining = Vec::new();
+    let mut first_error = None;
+    for withdrawal in pending {
+        let mut permit = EndpointIrqTransitionPermit { _private: () };
+        let result = withdrawal.admission.wait_for_irq_permits().and_then(|()| {
+            withdrawal
+                .function
+                .withdraw_irq(&mut permit)
+                .map_err(DeviceManagerError::Device)
+        });
+        if let Err(error) = result {
+            if first_error.is_none() {
+                first_error = Some(error);
+            }
+            remaining.push(withdrawal);
+        }
+    }
+    // A root teardown may transfer another owner while callbacks run. Merge
+    // with the current queue instead of replacing it, preserving both the
+    // retry results and owners arriving concurrently.
+    pending_storage.lock_irqsave().extend(remaining);
+    first_error.map_or(Ok(()), Err)
+}
+
+fn transfer_pending_irq_withdrawals(pending_storage: &SpinLock<Vec<PendingIrqWithdrawal>>) {
+    let pending = core::mem::take(&mut *pending_storage.lock_irqsave());
+    if pending.is_empty() {
+        return;
+    }
+    ORPHANED_IRQ_WITHDRAWALS.lock_irqsave().extend(pending);
+    warn!("PCI endpoint IRQ withdrawals transferred to the fail-closed orphan queue");
+}
+
+impl PciRootBinding {
+    fn queue_irq_withdrawal(&self, withdrawal: PendingIrqWithdrawal) {
+        self.pending_irq_withdrawals.lock_irqsave().push(withdrawal);
+    }
+
+    fn has_pending_irq_withdrawal(&self, device: DeviceId) -> bool {
+        self.pending_irq_withdrawals
+            .lock_irqsave()
+            .iter()
+            .any(|withdrawal| withdrawal.device == device)
     }
 
     pub(crate) fn matches_topology(&self, topology: &Arc<super::ResolvedPciTopology>) -> bool {
@@ -888,9 +1036,9 @@ impl PciRootBinding {
 
         let result = self.reset_routes();
         if result.is_err()
-            && let Err(error) = self.router.close_admissions_and_drain_irq()
+            && let Err(error) = self.router.close_admissions_and_drain()
         {
-            warn!("PCI reset failure cleanup could not drain IRQ permits: {error}");
+            warn!("PCI reset failure cleanup could not drain routed endpoint activity: {error}");
         }
         *lifecycle = if result.is_ok() {
             BindingLifecycleState::Running
@@ -944,6 +1092,12 @@ impl PciRootBinding {
             return Err(DeviceManagerError::InvalidState {
                 operation: "bind PCI endpoint route",
                 detail: "PCI root binding is not running".into(),
+            });
+        }
+        if self.has_pending_irq_withdrawal(device) {
+            return Err(DeviceManagerError::InvalidState {
+                operation: "bind PCI endpoint route",
+                detail: "the previous PCI endpoint IRQ withdrawal is still pending".into(),
             });
         }
         let token = self.router.activate(device, function)?;
@@ -1154,6 +1308,23 @@ impl PciRootBinding {
             .map_err(pci_config_error)?
         {
             PciConfigReadOutcome::Value(value) => Ok(value),
+            PciConfigReadOutcome::DynamicStatus {
+                token,
+                command,
+                value,
+                interrupt_status_mask,
+            } => {
+                let pending = self.dispatch_legacy(
+                    &token,
+                    command.bus_master_enable(),
+                    |endpoint, _context| Ok(endpoint.intx_pending()),
+                )?;
+                Ok(if pending {
+                    value | interrupt_status_mask
+                } else {
+                    value & !interrupt_status_mask
+                })
+            }
             PciConfigReadOutcome::Effect {
                 token,
                 command,
@@ -1222,6 +1393,24 @@ impl PciRootBinding {
             .map_err(pci_config_error)?
         {
             PciConfigReadOutcome::Value(value) => Ok(value),
+            PciConfigReadOutcome::DynamicStatus {
+                token,
+                command,
+                value,
+                interrupt_status_mask,
+            } => {
+                let pending = self.dispatch_with_context(
+                    &token,
+                    command.bus_master_enable(),
+                    context,
+                    |endpoint, _context| Ok(endpoint.intx_pending()),
+                )?;
+                Ok(if pending {
+                    value | interrupt_status_mask
+                } else {
+                    value & !interrupt_status_mask
+                })
+            }
             PciConfigReadOutcome::Effect {
                 token,
                 command,
@@ -1280,9 +1469,17 @@ impl Drop for PciRootBinding {
     fn drop(&mut self) {
         let mut lifecycle = self.lifecycle.lock_irqsave();
         *lifecycle = BindingLifecycleState::Stopping;
-        if let Err(error) = self.router.invalidate_all() {
+        let (pending, drain_result) = self.router.invalidate_all();
+        for withdrawal in pending {
+            self.queue_irq_withdrawal(withdrawal);
+        }
+        if let Err(error) = drain_result {
             warn!("PCI root teardown could not drain IRQ permits: {error}");
         }
+        if let Err(error) = self.retry_irq_withdrawals_locked() {
+            warn!("PCI root teardown could not complete pending IRQ withdrawals: {error}");
+        }
+        transfer_pending_irq_withdrawals(&self.pending_irq_withdrawals);
         *lifecycle = BindingLifecycleState::Dead;
     }
 }
@@ -1312,13 +1509,29 @@ impl Drop for PciBindingLease {
         // linearization point; callbacks that already acquired a lease keep
         // their endpoint Arc, while new validation and IRQ permits fail.
         self.binding.root.unbind_device(self.token.device_id());
-        if let Some((_function, admission)) = self
+        if let Some((function, admission)) = self
             .binding
             .router
             .invalidate_device(self.token.device_id())
-            && let Err(error) = admission.wait_for_irq_permits()
         {
-            warn!("PCI endpoint teardown could not drain IRQ permits: {error}");
+            let withdrawal = PendingIrqWithdrawal {
+                device: self.token.device_id(),
+                function,
+                admission,
+            };
+            if let Err(error) = withdrawal.admission.wait_for_irq_permits().and_then(|()| {
+                let mut permit = EndpointIrqTransitionPermit { _private: () };
+                withdrawal
+                    .function
+                    .withdraw_irq(&mut permit)
+                    .map_err(DeviceManagerError::Device)
+            }) {
+                // Do not race an in-flight routed transition with the final
+                // owner-side withdrawal. Keep the endpoint owner and closed
+                // admission for an explicit retry.
+                warn!("PCI endpoint teardown queued a pending IRQ withdrawal: {error}");
+                self.binding.queue_irq_withdrawal(withdrawal);
+            }
         }
     }
 }
@@ -1332,9 +1545,15 @@ fn pci_config_error(error: super::PciError) -> DeviceError {
 
 #[cfg(test)]
 mod tests {
-    use alloc::vec::Vec;
+    use alloc::{vec, vec::Vec};
+    use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Mutex;
 
-    use axdevice_base::{DeviceAccess, Resource};
+    use axdevice_base::{
+        ControllerInputId, DeviceAccess, InterruptControllerId, InterruptEndpoint,
+        InterruptSharing, InterruptTrigger, IrqError, IrqResult, Resource, WiredIrqInput,
+        WiredIrqSink,
+    };
 
     use super::*;
     use crate::{
@@ -1343,8 +1562,180 @@ mod tests {
         PciFunctionSpec, PciTopologyBuilder,
     };
 
+    static ORPHAN_QUEUE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
     struct StubFunction {
         fail_command: bool,
+    }
+
+    struct FailingDeassertSink {
+        fail_deassert: AtomicBool,
+        asserted: AtomicBool,
+    }
+
+    struct BlockingWithdrawalFunction {
+        started: AtomicBool,
+        release: AtomicBool,
+        withdrawals: AtomicUsize,
+    }
+
+    impl Device for BlockingWithdrawalFunction {
+        fn name(&self) -> &str {
+            "blocking-withdrawal-function"
+        }
+
+        fn resources(&self) -> &[Resource] {
+            &[]
+        }
+
+        fn read(
+            &self,
+            _access: &DeviceAccess,
+            _context: &mut dyn DeviceContext,
+        ) -> DeviceResult<u64> {
+            Err(DeviceError::NotFound)
+        }
+
+        fn write(
+            &self,
+            _access: &DeviceAccess,
+            _value: u64,
+            _context: &mut dyn DeviceContext,
+        ) -> DeviceResult {
+            Err(DeviceError::NotFound)
+        }
+    }
+
+    impl PciFunction for BlockingWithdrawalFunction {
+        fn read_bar(
+            &self,
+            _access: PciBarAccess,
+            _context: &mut dyn PciEndpointContext,
+        ) -> DeviceResult<u64> {
+            Ok(0)
+        }
+
+        fn write_bar(
+            &self,
+            _access: PciBarAccess,
+            _value: u64,
+            _context: &mut dyn PciEndpointContext,
+        ) -> DeviceResult {
+            Ok(())
+        }
+
+        fn withdraw_irq(&self, _permit: &mut EndpointIrqTransitionPermit) -> DeviceResult {
+            self.started.store(true, Ordering::Release);
+            while !self.release.load(Ordering::Acquire) {
+                std::thread::yield_now();
+            }
+            self.withdrawals.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+    }
+
+    fn pending_withdrawal(device: u32, function: Arc<dyn PciFunction>) -> PendingIrqWithdrawal {
+        let admission = Arc::new(EndpointAdmission::new(
+            EndpointBindingGeneration(1),
+            RoutedAdmissionEpoch(1),
+        ));
+        admission.close();
+        PendingIrqWithdrawal {
+            device: DeviceId::new(device),
+            function,
+            admission,
+        }
+    }
+
+    impl WiredIrqSink for FailingDeassertSink {
+        fn set_level(&self, input: ControllerInputId, asserted: bool) -> IrqResult {
+            if !asserted && self.fail_deassert.load(Ordering::Relaxed) {
+                return Err(IrqError::Backend {
+                    endpoint: InterruptEndpoint::Wired {
+                        controller: InterruptControllerId::new(0),
+                        input,
+                    },
+                    operation: "test deassert",
+                    detail: "injected test failure".into(),
+                });
+            }
+            self.asserted.store(asserted, Ordering::Relaxed);
+            Ok(())
+        }
+
+        fn pulse(&self, input: ControllerInputId) -> IrqResult {
+            Err(IrqError::Backend {
+                endpoint: InterruptEndpoint::Wired {
+                    controller: InterruptControllerId::new(0),
+                    input,
+                },
+                operation: "test pulse",
+                detail: "not used by this test".into(),
+            })
+        }
+    }
+
+    #[test]
+    fn irq_transition_permit_surfaces_real_line_backend_failures() {
+        let sink = Arc::new(FailingDeassertSink {
+            fail_deassert: AtomicBool::new(false),
+            asserted: AtomicBool::new(false),
+        });
+        let line = WiredIrqInput::new(
+            InterruptControllerId::new(0),
+            ControllerInputId::new(19),
+            InterruptTrigger::LevelTriggered,
+            sink.clone(),
+        )
+        .connect()
+        .unwrap();
+        let mut permit = EndpointIrqTransitionPermit { _private: () };
+
+        permit.assert(&line).unwrap();
+        sink.fail_deassert.store(true, Ordering::Relaxed);
+        let error = permit.deassert(&line).unwrap_err();
+        assert!(matches!(
+            error,
+            DeviceError::Backend {
+                operation: "deassert PCI endpoint INTx line",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn orphan_retry_merges_concurrent_transfers_without_dropping_owners() {
+        let _test_lock = ORPHAN_QUEUE_TEST_LOCK.lock().unwrap();
+        PciRootBinding::retry_orphaned_irq_withdrawals().unwrap();
+
+        let first = Arc::new(BlockingWithdrawalFunction {
+            started: AtomicBool::new(false),
+            release: AtomicBool::new(false),
+            withdrawals: AtomicUsize::new(0),
+        });
+        ORPHANED_IRQ_WITHDRAWALS
+            .lock_irqsave()
+            .push(pending_withdrawal(1, first.clone()));
+
+        let retry = std::thread::spawn(PciRootBinding::retry_orphaned_irq_withdrawals);
+        while !first.started.load(Ordering::Acquire) {
+            std::thread::yield_now();
+        }
+
+        let second = Arc::new(BlockingWithdrawalFunction {
+            started: AtomicBool::new(false),
+            release: AtomicBool::new(true),
+            withdrawals: AtomicUsize::new(0),
+        });
+        let incoming = SpinLock::new(vec![pending_withdrawal(2, second.clone())]);
+        transfer_pending_irq_withdrawals(&incoming);
+        first.release.store(true, Ordering::Release);
+        retry.join().unwrap().unwrap();
+
+        assert_eq!(first.withdrawals.load(Ordering::Relaxed), 1);
+        assert_eq!(second.withdrawals.load(Ordering::Relaxed), 0);
+        PciRootBinding::retry_orphaned_irq_withdrawals().unwrap();
+        assert_eq!(second.withdrawals.load(Ordering::Relaxed), 1);
     }
 
     impl Device for StubFunction {
@@ -1417,7 +1808,12 @@ mod tests {
         writes: SpinLock<Vec<(PciConfigWriteEffect, DeviceId)>>,
         commands: SpinLock<Vec<(PciCommandState, DeviceId)>>,
         resets: SpinLock<Vec<PciCommandState>>,
+        reset_failures: SpinLock<usize>,
+        withdrawals: SpinLock<usize>,
+        withdraw_failures: SpinLock<usize>,
+        irq_line: Option<IrqLine>,
         supports_effects: bool,
+        pending: bool,
     }
 
     impl Device for RecordingFunction {
@@ -1448,6 +1844,15 @@ mod tests {
     }
 
     impl PciFunction for RecordingFunction {
+        fn intx_pending(&self) -> bool {
+            // A dynamic status query must not retain the root state lock while
+            // entering endpoint-owned behavior.
+            let _ =
+                self.root
+                    .read_config(self.bdf, ConfigOffset::new(0).unwrap(), AccessWidth::Dword);
+            self.pending
+        }
+
         fn supported_config_effects(&self) -> &[PciConfigEffectId] {
             const EFFECTS: &[PciConfigEffectId] = &[PciConfigEffectId::new(7)];
             if self.supports_effects { EFFECTS } else { &[] }
@@ -1514,6 +1919,30 @@ mod tests {
 
         fn reset(&self, command: PciCommandState) -> DeviceResult {
             self.resets.lock_irqsave().push(command);
+            let mut failures = self.reset_failures.lock_irqsave();
+            if *failures != 0 {
+                *failures -= 1;
+                return Err(DeviceError::Backend {
+                    operation: "reset test PCI endpoint",
+                    detail: "injected test failure".into(),
+                });
+            }
+            Ok(())
+        }
+
+        fn withdraw_irq(&self, permit: &mut EndpointIrqTransitionPermit) -> DeviceResult {
+            let mut failures = self.withdraw_failures.lock_irqsave();
+            if *failures != 0 {
+                *failures -= 1;
+                return Err(DeviceError::Backend {
+                    operation: "withdraw test PCI endpoint IRQ",
+                    detail: "injected test failure".into(),
+                });
+            }
+            if let Some(line) = &self.irq_line {
+                permit.deassert(line)?;
+            }
+            *self.withdrawals.lock_irqsave() += 1;
             Ok(())
         }
     }
@@ -1710,6 +2139,19 @@ mod tests {
             DeviceNodeId::new("host").unwrap(),
             Arc::clone(&root),
         ));
+        let sink = Arc::new(FailingDeassertSink {
+            fail_deassert: AtomicBool::new(false),
+            asserted: AtomicBool::new(false),
+        });
+        let line = WiredIrqInput::new(
+            InterruptControllerId::new(0),
+            ControllerInputId::new(19),
+            InterruptTrigger::LevelTriggered,
+            sink.clone(),
+        )
+        .connect()
+        .unwrap();
+        line.assert().unwrap();
         let recording = Arc::new(RecordingFunction {
             root,
             bdf: topology.function(&function_id).unwrap().bdf(),
@@ -1717,7 +2159,12 @@ mod tests {
             writes: SpinLock::new(Vec::new()),
             commands: SpinLock::new(Vec::new()),
             resets: SpinLock::new(Vec::new()),
+            reset_failures: SpinLock::new(0),
+            withdrawals: SpinLock::new(0),
+            withdraw_failures: SpinLock::new(0),
+            irq_line: Some(line),
             supports_effects: false,
+            pending: false,
         });
         let mut grants = Vec::new();
         let lease = binding
@@ -1730,6 +2177,9 @@ mod tests {
             .unwrap();
 
         binding.reset_lifecycle().unwrap();
+
+        assert_eq!(*recording.withdrawals.lock_irqsave(), 1);
+        assert!(!sink.asserted.load(Ordering::Relaxed));
 
         let resets = recording.resets.lock_irqsave();
         assert_eq!(resets.len(), 1);
@@ -1760,26 +2210,59 @@ mod tests {
             ))
             .unwrap();
         let topology = Arc::new(builder.resolve(0xc000_0000..0xc100_0000).unwrap());
+        let root = Arc::new(PciRootState::new(Arc::clone(&topology)));
         let binding = Arc::new(PciRootBinding::new(
             DeviceNodeId::new("host").unwrap(),
-            Arc::new(PciRootState::new(topology)),
+            Arc::clone(&root),
         ));
+        let sink = Arc::new(FailingDeassertSink {
+            fail_deassert: AtomicBool::new(false),
+            asserted: AtomicBool::new(false),
+        });
+        let line = WiredIrqInput::new(
+            InterruptControllerId::new(0),
+            ControllerInputId::new(19),
+            InterruptTrigger::LevelTriggered,
+            sink.clone(),
+        )
+        .connect()
+        .unwrap();
+        line.assert().unwrap();
+        let recording = Arc::new(RecordingFunction {
+            root,
+            bdf: topology.function(&function_id).unwrap().bdf(),
+            reads: SpinLock::new(Vec::new()),
+            writes: SpinLock::new(Vec::new()),
+            commands: SpinLock::new(Vec::new()),
+            resets: SpinLock::new(Vec::new()),
+            reset_failures: SpinLock::new(1),
+            withdrawals: SpinLock::new(0),
+            withdraw_failures: SpinLock::new(0),
+            irq_line: Some(line),
+            supports_effects: false,
+            pending: false,
+        });
         let mut grants = Vec::new();
-        let _lease = binding
+        let lease = binding
             .bind_registered(
                 &function_id,
                 DeviceId::new(7),
-                Arc::new(StubFunction {
-                    fail_command: false,
-                }),
+                recording.clone(),
                 &mut grants,
             )
             .unwrap();
 
         assert!(matches!(
             binding.reset_lifecycle(),
-            Err(DeviceManagerError::Device(DeviceError::Unsupported { .. }))
+            Err(DeviceManagerError::Device(DeviceError::Backend { .. }))
         ));
+        assert_eq!(recording.resets.lock_irqsave().len(), 1);
+        assert_eq!(*recording.withdrawals.lock_irqsave(), 1);
+        assert!(!sink.asserted.load(Ordering::Relaxed));
+        assert_eq!(
+            *binding.lifecycle.lock_irqsave(),
+            BindingLifecycleState::ResetFailed
+        );
         let token = binding
             .router
             .state
@@ -1794,6 +2277,89 @@ mod tests {
             token.admission.clone().acquire(&token),
             Err(DeviceError::InvalidState { .. })
         ));
+        drop(lease);
+    }
+
+    #[test]
+    fn reset_irq_cleanup_failure_stays_closed_until_teardown_retries_withdrawal() {
+        let function_id = DeviceNodeId::new("reset-cleanup-failure-endpoint").unwrap();
+        let mut builder = PciTopologyBuilder::new();
+        builder
+            .add_function(PciFunctionSpec::new(
+                function_id.clone(),
+                PciEndpointIdentity::new(0x1af4, 0x1042, PciClass::new(0xff, 0, 0)),
+            ))
+            .unwrap();
+        let topology = Arc::new(builder.resolve(0xc000_0000..0xc100_0000).unwrap());
+        let root = Arc::new(PciRootState::new(Arc::clone(&topology)));
+        let binding = Arc::new(PciRootBinding::new(
+            DeviceNodeId::new("host").unwrap(),
+            Arc::clone(&root),
+        ));
+        let sink = Arc::new(FailingDeassertSink {
+            fail_deassert: AtomicBool::new(false),
+            asserted: AtomicBool::new(false),
+        });
+        let line = WiredIrqInput::new(
+            InterruptControllerId::new(0),
+            ControllerInputId::new(19),
+            InterruptTrigger::LevelTriggered,
+            sink.clone(),
+        )
+        .connect()
+        .unwrap();
+        line.assert().unwrap();
+        let recording = Arc::new(RecordingFunction {
+            root,
+            bdf: topology.function(&function_id).unwrap().bdf(),
+            reads: SpinLock::new(Vec::new()),
+            writes: SpinLock::new(Vec::new()),
+            commands: SpinLock::new(Vec::new()),
+            resets: SpinLock::new(Vec::new()),
+            reset_failures: SpinLock::new(0),
+            withdrawals: SpinLock::new(0),
+            withdraw_failures: SpinLock::new(1),
+            irq_line: Some(line),
+            supports_effects: false,
+            pending: false,
+        });
+        let mut grants = Vec::new();
+        let lease = binding
+            .bind_registered(
+                &function_id,
+                DeviceId::new(12),
+                recording.clone(),
+                &mut grants,
+            )
+            .unwrap();
+
+        assert!(matches!(
+            binding.reset_lifecycle(),
+            Err(DeviceManagerError::Device(DeviceError::Backend { .. }))
+        ));
+        assert_eq!(
+            *binding.lifecycle.lock_irqsave(),
+            BindingLifecycleState::ResetFailed
+        );
+        assert!(
+            !binding
+                .router
+                .state
+                .lock_irqsave()
+                .endpoints
+                .get(&DeviceId::new(12))
+                .unwrap()
+                .token
+                .grant(false)
+                .admission_is_open()
+        );
+        assert!(sink.asserted.load(Ordering::Relaxed));
+
+        *recording.withdraw_failures.lock_irqsave() = 0;
+        drop(lease);
+        assert!(!sink.asserted.load(Ordering::Relaxed));
+        assert_eq!(*recording.withdrawals.lock_irqsave(), 1);
+        drop(binding);
     }
 
     #[test]
@@ -1912,7 +2478,12 @@ mod tests {
             writes: SpinLock::new(Vec::new()),
             commands: SpinLock::new(Vec::new()),
             resets: SpinLock::new(Vec::new()),
+            reset_failures: SpinLock::new(0),
+            withdrawals: SpinLock::new(0),
+            withdraw_failures: SpinLock::new(0),
+            irq_line: None,
             supports_effects: true,
+            pending: false,
         });
         let mut grants = Vec::new();
         let lease = binding
@@ -2032,6 +2603,231 @@ mod tests {
             ),
             Err(DeviceError::InvalidInput { .. })
         ));
+    }
+
+    #[test]
+    fn dynamic_interrupt_status_is_read_from_the_bound_endpoint() {
+        let function_id = DeviceNodeId::new("intx-endpoint").unwrap();
+        let mut builder = PciTopologyBuilder::new();
+        builder
+            .add_function(
+                PciFunctionSpec::new(
+                    function_id.clone(),
+                    PciEndpointIdentity::new(0x1af4, 0x1041, PciClass::new(0xff, 0, 0)),
+                )
+                .with_intx(crate::PciIntxRequirement::new(
+                    crate::PciIntxPin::A,
+                    crate::ResourceSlot::new("intx").unwrap(),
+                ))
+                .unwrap(),
+            )
+            .unwrap();
+        let route = crate::PciIntxRouter::new(
+            InterruptControllerId::new(0),
+            [
+                ControllerInputId::new(16),
+                ControllerInputId::new(17),
+                ControllerInputId::new(18),
+                ControllerInputId::new(19),
+            ],
+            [16, 17, 18, 19],
+            InterruptTrigger::LevelTriggered,
+            InterruptSharing::Shared,
+        )
+        .resolve(&function_id, PciBdf::bus_zero(0), crate::PciIntxPin::A)
+        .unwrap();
+        builder.set_intx_route(&function_id, route).unwrap();
+        let topology = Arc::new(builder.resolve(0xc000_0000..0xc100_0000).unwrap());
+        let bdf = topology.function(&function_id).unwrap().bdf();
+        assert!(topology.function(&function_id).unwrap().intx().is_some());
+        let root = Arc::new(PciRootState::new(Arc::clone(&topology)));
+        let binding = Arc::new(PciRootBinding::new(
+            DeviceNodeId::new("host").unwrap(),
+            root,
+        ));
+        let recording = Arc::new(RecordingFunction {
+            root: Arc::clone(&binding.root),
+            bdf,
+            reads: SpinLock::new(Vec::new()),
+            writes: SpinLock::new(Vec::new()),
+            commands: SpinLock::new(Vec::new()),
+            resets: SpinLock::new(Vec::new()),
+            reset_failures: SpinLock::new(0),
+            withdrawals: SpinLock::new(0),
+            withdraw_failures: SpinLock::new(0),
+            irq_line: None,
+            supports_effects: false,
+            pending: true,
+        });
+        let mut grants = Vec::new();
+        let lease = binding
+            .bind_registered(
+                &function_id,
+                DeviceId::new(9),
+                recording.clone(),
+                &mut grants,
+            )
+            .unwrap();
+
+        assert_eq!(
+            binding
+                .read_config(bdf, ConfigOffset::new(0x06).unwrap(), AccessWidth::Byte)
+                .unwrap()
+                & 0x08,
+            0x08
+        );
+        drop(lease);
+        // Teardown invokes endpoint-owned final IRQ withdrawal after the
+        // binding admission has been closed and drained.
+        assert_eq!(*recording.withdrawals.lock_irqsave(), 1);
+        assert_eq!(
+            binding
+                .read_config(bdf, ConfigOffset::new(0x06).unwrap(), AccessWidth::Byte)
+                .unwrap()
+                & 0x08,
+            0
+        );
+    }
+
+    #[test]
+    fn failed_irq_withdrawal_survives_root_binding_destruction() {
+        let _test_lock = ORPHAN_QUEUE_TEST_LOCK.lock().unwrap();
+        let function_id = DeviceNodeId::new("pending-withdrawal-endpoint").unwrap();
+        let mut builder = PciTopologyBuilder::new();
+        builder
+            .add_function(
+                PciFunctionSpec::new(
+                    function_id.clone(),
+                    PciEndpointIdentity::new(0x1af4, 0x1041, PciClass::new(0xff, 0, 0)),
+                )
+                .with_intx(crate::PciIntxRequirement::new(
+                    crate::PciIntxPin::A,
+                    crate::ResourceSlot::new("intx").unwrap(),
+                ))
+                .unwrap(),
+            )
+            .unwrap();
+        let route = crate::PciIntxRouter::new(
+            InterruptControllerId::new(0),
+            [
+                ControllerInputId::new(16),
+                ControllerInputId::new(17),
+                ControllerInputId::new(18),
+                ControllerInputId::new(19),
+            ],
+            [16, 17, 18, 19],
+            InterruptTrigger::LevelTriggered,
+            InterruptSharing::Shared,
+        )
+        .resolve(&function_id, PciBdf::bus_zero(0), crate::PciIntxPin::A)
+        .unwrap();
+        builder.set_intx_route(&function_id, route).unwrap();
+        let topology = Arc::new(builder.resolve(0xc000_0000..0xc100_0000).unwrap());
+        let bdf = topology.function(&function_id).unwrap().bdf();
+        let binding = Arc::new(PciRootBinding::new(
+            DeviceNodeId::new("host").unwrap(),
+            Arc::new(PciRootState::new(Arc::clone(&topology))),
+        ));
+        let recording = Arc::new(RecordingFunction {
+            root: Arc::clone(&binding.root),
+            bdf,
+            reads: SpinLock::new(Vec::new()),
+            writes: SpinLock::new(Vec::new()),
+            commands: SpinLock::new(Vec::new()),
+            resets: SpinLock::new(Vec::new()),
+            reset_failures: SpinLock::new(0),
+            withdrawals: SpinLock::new(0),
+            withdraw_failures: SpinLock::new(0),
+            irq_line: None,
+            supports_effects: false,
+            pending: false,
+        });
+        let mut grants = Vec::new();
+        let lease = binding
+            .bind_registered(
+                &function_id,
+                DeviceId::new(10),
+                recording.clone(),
+                &mut grants,
+            )
+            .unwrap();
+        let permit = lease.token.admission.acquire_irq_permit().unwrap();
+
+        drop(lease);
+        drop(binding);
+        assert_eq!(*recording.withdrawals.lock_irqsave(), 0);
+
+        drop(permit);
+        PciRootBinding::retry_orphaned_irq_withdrawals().unwrap();
+        assert_eq!(*recording.withdrawals.lock_irqsave(), 1);
+    }
+
+    #[test]
+    fn failed_owner_irq_withdrawal_is_retryable() {
+        let function_id = DeviceNodeId::new("failed-withdrawal-endpoint").unwrap();
+        let mut builder = PciTopologyBuilder::new();
+        builder
+            .add_function(
+                PciFunctionSpec::new(
+                    function_id.clone(),
+                    PciEndpointIdentity::new(0x1af4, 0x1041, PciClass::new(0xff, 0, 0)),
+                )
+                .with_intx(crate::PciIntxRequirement::new(
+                    crate::PciIntxPin::A,
+                    crate::ResourceSlot::new("intx").unwrap(),
+                ))
+                .unwrap(),
+            )
+            .unwrap();
+        let route = crate::PciIntxRouter::new(
+            InterruptControllerId::new(0),
+            [
+                ControllerInputId::new(16),
+                ControllerInputId::new(17),
+                ControllerInputId::new(18),
+                ControllerInputId::new(19),
+            ],
+            [16, 17, 18, 19],
+            InterruptTrigger::LevelTriggered,
+            InterruptSharing::Shared,
+        )
+        .resolve(&function_id, PciBdf::bus_zero(0), crate::PciIntxPin::A)
+        .unwrap();
+        builder.set_intx_route(&function_id, route).unwrap();
+        let topology = Arc::new(builder.resolve(0xc000_0000..0xc100_0000).unwrap());
+        let bdf = topology.function(&function_id).unwrap().bdf();
+        let binding = Arc::new(PciRootBinding::new(
+            DeviceNodeId::new("host").unwrap(),
+            Arc::new(PciRootState::new(Arc::clone(&topology))),
+        ));
+        let recording = Arc::new(RecordingFunction {
+            root: Arc::clone(&binding.root),
+            bdf,
+            reads: SpinLock::new(Vec::new()),
+            writes: SpinLock::new(Vec::new()),
+            commands: SpinLock::new(Vec::new()),
+            resets: SpinLock::new(Vec::new()),
+            reset_failures: SpinLock::new(0),
+            withdrawals: SpinLock::new(0),
+            withdraw_failures: SpinLock::new(1),
+            irq_line: None,
+            supports_effects: false,
+            pending: false,
+        });
+        let mut grants = Vec::new();
+        let lease = binding
+            .bind_registered(
+                &function_id,
+                DeviceId::new(11),
+                recording.clone(),
+                &mut grants,
+            )
+            .unwrap();
+
+        drop(lease);
+        assert_eq!(*recording.withdrawals.lock_irqsave(), 0);
+        assert!(binding.retry_irq_withdrawals().is_ok());
+        assert_eq!(*recording.withdrawals.lock_irqsave(), 1);
     }
 
     #[test]

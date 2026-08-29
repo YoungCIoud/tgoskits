@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 use axdevice::*;
+use axdevice_base::{ControllerInputId, InterruptControllerId, InterruptSharing, InterruptTrigger};
 
 pub(super) const PCI_HOST_NODE: &str = "pci-host";
 pub(super) const PCI_MEMORY_BASE: u64 = 0xc000_0000;
@@ -21,6 +22,21 @@ pub(super) fn provider() -> DeviceManagerResult<PciHostProvider> {
     });
     let node = DeviceNodeSpec::virtual_device(host_id.clone(), model);
     let provider = PciHostProvider::new(host_key(), node, ResourceSlot::new(MEMORY_SLOT)?)
+        .with_intx_router(
+            PciIntxRouter::new(
+                InterruptControllerId::new(0),
+                [
+                    ControllerInputId::new(16),
+                    ControllerInputId::new(17),
+                    ControllerInputId::new(18),
+                    ControllerInputId::new(19),
+                ],
+                [16, 17, 18, 19],
+                InterruptTrigger::LevelTriggered,
+                InterruptSharing::Shared,
+            )
+            .with_controller_dependency(DeviceNodeId::new("ioapic")?),
+        )
         .with_platform_function(q35_host_function(host_id.clone())?)?
         .with_platform_function(lpc_function()?)?;
     Ok(provider)
@@ -133,6 +149,11 @@ mod tests {
     #[test]
     fn provider_builds_the_host_and_platform_functions_without_an_endpoint() {
         let mut graph = DeviceGraphBuilder::new();
+        graph
+            .add(DeviceNodeSpec::firmware_only(
+                DeviceNodeId::new("ioapic").unwrap(),
+            ))
+            .unwrap();
         graph.register_pci_host(provider().unwrap()).unwrap();
         let mut pools = ResourcePools::new();
         pools

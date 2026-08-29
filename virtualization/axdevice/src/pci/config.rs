@@ -4,7 +4,7 @@ use alloc::vec::Vec;
 
 use super::{
     PciBdf, PciCapabilityEffectRegion, PciCapabilityId, PciCapabilityLayout, PciCapabilitySnapshot,
-    PciEndpointIdentity, PciResult,
+    PciEndpointIdentity, PciResult, ResolvedPciIntx,
     address::CONFIG_SPACE_SIZE,
     bar::{BarState, ResolvedBarPlan},
     function::PciConfigByte,
@@ -29,6 +29,7 @@ impl PowerOnConfig {
         bars: &[ResolvedBarPlan],
         config_bytes: &[PciConfigByte],
         capabilities: &[PciCapabilityLayout],
+        intx: Option<ResolvedPciIntx>,
     ) -> PciResult<Self> {
         if identity.vendor_id() == u16::MAX {
             return Err(super::PciError::InvalidEndpointIdentity {
@@ -41,6 +42,10 @@ impl PowerOnConfig {
         bytes[2..4].copy_from_slice(&identity.device_id().to_le_bytes());
         bytes[0x2c..0x2e].copy_from_slice(&identity.subsystem_vendor_id().to_le_bytes());
         bytes[0x2e..0x30].copy_from_slice(&identity.subsystem_device_id().to_le_bytes());
+        if let Some(intx) = intx {
+            bytes[0x3c] = intx.guest_line_byte();
+            bytes[0x3d] = intx.pin().config_encoding();
+        }
         write_mask[4] = COMMAND_MEMORY_SPACE_ENABLE | COMMAND_BUS_MASTER_ENABLE;
         write_mask[5] = COMMAND_INTERRUPT_DISABLE;
         let class = identity.class();
@@ -84,6 +89,7 @@ impl PowerOnConfig {
 
 pub(crate) struct FunctionState {
     bdf: PciBdf,
+    has_intx: bool,
     power_on: PowerOnConfig,
     config: [u8; CONFIG_SPACE_SIZE],
     bars: Vec<BarState>,
@@ -95,9 +101,15 @@ pub(crate) enum BarWriteAction {
 }
 
 impl FunctionState {
-    pub(crate) fn new(bdf: PciBdf, power_on: PowerOnConfig, bars: &[ResolvedBarPlan]) -> Self {
+    pub(crate) fn new(
+        bdf: PciBdf,
+        power_on: PowerOnConfig,
+        bars: &[ResolvedBarPlan],
+        has_intx: bool,
+    ) -> Self {
         Self {
             bdf,
+            has_intx,
             config: power_on.bytes,
             power_on,
             bars: bars.iter().copied().map(BarState::new).collect(),
@@ -106,6 +118,10 @@ impl FunctionState {
 
     pub(crate) const fn bdf(&self) -> PciBdf {
         self.bdf
+    }
+
+    pub(crate) const fn has_intx(&self) -> bool {
+        self.has_intx
     }
 
     pub(crate) fn memory_decode_enabled(&self) -> bool {
@@ -263,8 +279,8 @@ mod tests {
             size: bar.size(),
             address: 0x2000_0000,
         };
-        let power_on = PowerOnConfig::build(identity, &[plan], &[], &[]).unwrap();
-        let mut state = FunctionState::new(PciBdf::bus_zero(1), power_on, &[plan]);
+        let power_on = PowerOnConfig::build(identity, &[plan], &[], &[], None).unwrap();
+        let mut state = FunctionState::new(PciBdf::bus_zero(1), power_on, &[plan], false);
 
         state.write_non_bar(0, 4, 0);
 

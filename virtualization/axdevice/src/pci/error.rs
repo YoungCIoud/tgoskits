@@ -142,4 +142,12 @@ pub enum PciError {
         /// Required BAR size.
         size: u64,
     },
+    /// An endpoint requested INTx without an architecture-owned router.
+    #[error("PCI INTx route for {function} is unavailable: {detail}")]
+    IntxRouteUnavailable {
+        /// Stable endpoint identity.
+        function: String,
+        /// Diagnostic reason.
+        detail: String,
+    },
 }

@@ -20,6 +20,12 @@ use crate::{AccessWidth, ConfigOffset};
 
 pub(crate) enum PciConfigReadOutcome {
     Value(u64),
+    DynamicStatus {
+        token: EndpointRouteToken,
+        command: PciCommandState,
+        value: u64,
+        interrupt_status_mask: u64,
+    },
     Effect {
         token: EndpointRouteToken,
         command: PciCommandState,
@@ -53,7 +59,12 @@ impl PciRootState {
             .function_plans()
             .iter()
             .map(|function| {
-                FunctionState::new(function.bdf(), function.power_on.clone(), function.bars())
+                FunctionState::new(
+                    function.bdf(),
+                    function.power_on.clone(),
+                    function.bars(),
+                    function.intx().is_some(),
+                )
             })
             .collect();
         Self {
@@ -90,6 +101,9 @@ impl PciRootState {
     ) -> PciResult<u64> {
         match self.prepare_read_config(bdf, offset, width)? {
             PciConfigReadOutcome::Value(value) => Ok(value),
+            PciConfigReadOutcome::DynamicStatus { .. } => Err(PciError::ConfigEffectUnavailable {
+                detail: "an endpoint binding is required for dynamic interrupt status",
+            }),
             PciConfigReadOutcome::Effect { .. } => Err(PciError::ConfigEffectUnavailable {
                 detail: "an endpoint binding is required for this config read",
             }),
@@ -139,7 +153,27 @@ impl PciRootState {
             let Some((capability, effect, relative, snapshot)) =
                 function.config_effect(offset, size, width, false)?
             else {
-                return Ok(PciConfigReadOutcome::Value(function.read(offset, size)));
+                let value = function.read(offset, size);
+                let Some(interrupt_status_mask) = function
+                    .has_intx()
+                    .then(|| interrupt_status_mask(offset, size))
+                    .flatten()
+                else {
+                    return Ok(PciConfigReadOutcome::Value(value));
+                };
+                let Some(token) = state
+                    .bindings
+                    .get(&bdf)
+                    .and_then(EndpointRouteToken::snapshot_if_admitted)
+                else {
+                    return Ok(PciConfigReadOutcome::Value(value));
+                };
+                return Ok(PciConfigReadOutcome::DynamicStatus {
+                    token,
+                    command: function.command_state(),
+                    value,
+                    interrupt_status_mask,
+                });
             };
             let token = state
                 .bindings
@@ -402,6 +436,14 @@ fn resolve_route(
     None
 }
 
+fn interrupt_status_mask(offset: usize, size: usize) -> Option<u64> {
+    let status_offset = 0x06;
+    if !(offset..offset + size).contains(&status_offset) {
+        return None;
+    }
+    Some(0x08 << ((status_offset - offset) * 8))
+}
+
 impl fmt::Debug for PciRootState {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -501,11 +543,15 @@ pub(crate) fn all_ones(size: usize) -> u64 {
 mod tests {
     use alloc::sync::Arc;
 
+    use axdevice_base::{
+        ControllerInputId, InterruptControllerId, InterruptSharing, InterruptTrigger,
+    };
+
     use super::*;
     use crate::{
         ConfigOffset, DeviceNodeId, PciCapabilityId, PciCapabilitySpec, PciClass,
-        PciEndpointIdentity, PciFunctionSpec, PciMemoryBar, PciSegment, PciTopologyBuilder,
-        ResourceRequest,
+        PciEndpointIdentity, PciFunctionSpec, PciIntxPin, PciIntxRequirement, PciIntxRouter,
+        PciMemoryBar, PciSegment, PciTopologyBuilder, ResourceRequest, ResourceSlot,
     };
 
     const APERTURE_START: u64 = 0x2000_0000;
@@ -553,6 +599,55 @@ mod tests {
             root.read_config(absent, offset(4), AccessWidth::Word)
                 .unwrap(),
             0xffff
+        );
+    }
+
+    #[test]
+    fn config_space_publishes_the_resolved_intx_pin_and_line() {
+        let function_id = node("intx-endpoint");
+        let bdf = bdf(1, 0);
+        let function = PciFunctionSpec::new(
+            function_id.clone(),
+            PciEndpointIdentity::new(0x1af4, 0x1041, PciClass::new(0xff, 0, 0)),
+        )
+        .with_bdf(ResourceRequest::Fixed(bdf))
+        .with_intx(PciIntxRequirement::new(
+            PciIntxPin::C,
+            ResourceSlot::new("intx").unwrap(),
+        ))
+        .unwrap();
+        let large_line_router = PciIntxRouter::new(
+            InterruptControllerId::new(0),
+            [
+                ControllerInputId::new(16),
+                ControllerInputId::new(17),
+                ControllerInputId::new(18),
+                ControllerInputId::new(19),
+            ],
+            [300, 301, 302, 303],
+            InterruptTrigger::LevelTriggered,
+            InterruptSharing::Shared,
+        );
+        let large_line_route = large_line_router
+            .resolve(&function_id, bdf, PciIntxPin::C)
+            .unwrap();
+        let mut builder = PciTopologyBuilder::new();
+        builder.add_function(function).unwrap();
+        builder
+            .set_intx_route(&function_id, large_line_route)
+            .unwrap();
+        let topology = Arc::new(builder.resolve(APERTURE_START..APERTURE_END).unwrap());
+        let root = PciRootState::new(topology);
+
+        assert_eq!(
+            root.read_config(bdf, offset(0x3c), AccessWidth::Byte)
+                .unwrap(),
+            u64::from(u8::MAX)
+        );
+        assert_eq!(
+            root.read_config(bdf, offset(0x3d), AccessWidth::Byte)
+                .unwrap(),
+            3
         );
     }
 
