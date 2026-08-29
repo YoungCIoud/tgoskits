@@ -2,7 +2,9 @@
 
 use alloc::vec::Vec;
 
-use super::{PciCapabilitySpec, PciError, PciIntxRequirement, PciMemoryBar, PciResult};
+use super::{
+    PciCapabilitySpec, PciError, PciIntxRequirement, PciMemoryBar, PciResult, config_layout,
+};
 use crate::{ConfigOffset, DeviceNodeId, ResourceRequest};
 
 #[derive(Clone, Copy, Debug)]
@@ -182,7 +184,7 @@ impl PciFunctionSpec {
     pub(crate) fn with_intx(mut self, intx: PciIntxRequirement) -> PciResult<Self> {
         if self.intx.is_some() {
             return Err(PciError::InvalidConfigPatch {
-                offset: 0x3d,
+                offset: config_layout::CONFIG_INTERRUPT_PIN_OFFSET as u16,
                 detail: "a PCI function may declare at most one INTx attachment",
             });
         }
@@ -207,13 +209,17 @@ impl PciFunctionSpec {
         write_mask: u8,
     ) -> PciResult<Self> {
         let offset_value = offset.value();
-        if (0x10..0x28).contains(&offset_value) {
+        let offset_usize = usize::from(offset_value);
+        if (config_layout::CONFIG_BAR_START..config_layout::CONFIG_BAR_END).contains(&offset_usize)
+        {
             return Err(PciError::InvalidConfigPatch {
                 offset: offset_value,
                 detail: "BAR bytes are owned by the BAR state machine",
             });
         }
-        if offset_value != 0x0e && offset_value < 0x40 {
+        if offset_usize != config_layout::CONFIG_HEADER_TYPE_OFFSET
+            && offset_usize < config_layout::CONFIG_STANDARD_HEADER_END
+        {
             return Err(PciError::InvalidConfigPatch {
                 offset: offset_value,
                 detail: "core identity, command, and status fields cannot be overridden",

@@ -14,6 +14,7 @@ mod devices;
 
 pub use append::DefaultVirtualDeviceIntent;
 pub(crate) use append::append_configured_devices;
+pub use devices::virtio_pci::{VirtioPciFunction, virtio_capabilities};
 
 pub(crate) fn register_devices(
     catalog: &mut ConfiguredDeviceCatalog,

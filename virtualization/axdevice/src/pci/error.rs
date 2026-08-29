@@ -79,6 +79,18 @@ pub enum PciError {
         /// Already-bound graph function identity.
         function: String,
     },
+    /// A function is between endpoint activation and root binding publication.
+    #[error("PCI function {function} endpoint binding initialization is in progress")]
+    BindingInProgress {
+        /// Function whose binding is being initialized.
+        function: String,
+    },
+    /// A binding reservation no longer owns a pending root publication.
+    #[error("PCI function {function} binding reservation is no longer active")]
+    BindingReservationExpired {
+        /// Function whose reservation expired.
+        function: String,
+    },
     /// Two functions request the same BDF.
     #[error("PCI BDF {bdf} is requested by both {first} and {second}")]
     DuplicateBdf {

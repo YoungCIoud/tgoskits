@@ -10,7 +10,7 @@ use axdevice_base::{ControllerInputId, InterruptControllerId, InterruptSharing, 
 
 use super::{
     PciBdf, PciCapabilitySpec, PciEndpointIdentity, PciError, PciFunctionSpec, PciMemoryBar,
-    PciResult,
+    PciResult, config_layout,
 };
 use crate::{DeviceManagerError, DeviceNodeId, DeviceNodeSpec, ResourceRequest, ResourceSlot};
 
@@ -324,7 +324,7 @@ impl PciFunctionRequirement {
     pub fn with_intx(mut self, intx: PciIntxRequirement) -> PciResult<Self> {
         if self.intx.is_some() {
             return Err(PciError::InvalidConfigPatch {
-                offset: 0x3d,
+                offset: config_layout::CONFIG_INTERRUPT_PIN_OFFSET as u16,
                 detail: "a PCI function may declare at most one INTx attachment",
             });
         }

@@ -2,11 +2,9 @@
 
 use alloc::{boxed::Box, vec::Vec};
 
-use super::{ConfigOffset, PciError, PciResult};
+use super::{ConfigOffset, PciError, PciResult, config_layout};
 
 const CAPABILITY_HEADER_SIZE: usize = 2;
-const CAPABILITY_START: usize = 0x40;
-const CONFIG_SPACE_END: usize = 0x100;
 const CAPABILITY_BODY_MAX_SIZE: usize = u8::MAX as usize - CAPABILITY_HEADER_SIZE;
 
 /// Identifies one conventional PCI capability type.
@@ -381,7 +379,7 @@ pub(crate) fn layout_capabilities(
     specifications: &[PciCapabilitySpec],
 ) -> PciResult<Vec<PciCapabilityLayout>> {
     let mut layouts = Vec::with_capacity(specifications.len());
-    let mut cursor = CAPABILITY_START;
+    let mut cursor = config_layout::CONFIG_STANDARD_HEADER_END;
     let mut effect_ids = Vec::new();
     for spec in specifications {
         for effect in spec.effects() {
@@ -403,7 +401,7 @@ pub(crate) fn layout_capabilities(
             .ok_or(PciError::InvalidCapability {
                 detail: "capability placement overflows conventional config space".into(),
             })?;
-        if end > CONFIG_SPACE_END {
+        if end > config_layout::CONFIG_SPACE_SIZE {
             return Err(PciError::InvalidCapability {
                 detail: "capability declarations exceed conventional config space".into(),
             });

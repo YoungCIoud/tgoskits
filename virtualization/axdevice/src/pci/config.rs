@@ -5,16 +5,20 @@ use alloc::vec::Vec;
 use super::{
     PciBdf, PciCapabilityEffectRegion, PciCapabilityId, PciCapabilityLayout, PciCapabilitySnapshot,
     PciEndpointIdentity, PciResult, ResolvedPciIntx,
-    address::CONFIG_SPACE_SIZE,
     bar::{BarState, ResolvedBarPlan},
+    config_layout::{
+        COMMAND_BUS_MASTER_ENABLE, COMMAND_INTERRUPT_DISABLE, COMMAND_MEMORY_SPACE_ENABLE,
+        CONFIG_BAR_END, CONFIG_BAR_MEMORY_ADDRESS_MASK, CONFIG_BAR_REGISTER_SIZE, CONFIG_BAR_START,
+        CONFIG_BASE_CLASS_OFFSET, CONFIG_CAPABILITY_POINTER_OFFSET, CONFIG_COMMAND_OFFSET,
+        CONFIG_DEVICE_ID_OFFSET, CONFIG_HEADER_TYPE_OFFSET, CONFIG_INTERRUPT_LINE_OFFSET,
+        CONFIG_INTERRUPT_PIN_OFFSET, CONFIG_PROGRAMMING_INTERFACE_OFFSET, CONFIG_REVISION_OFFSET,
+        CONFIG_SPACE_SIZE, CONFIG_STATUS_OFFSET, CONFIG_SUBCLASS_OFFSET,
+        CONFIG_SUBSYSTEM_DEVICE_ID_OFFSET, CONFIG_SUBSYSTEM_VENDOR_ID_OFFSET,
+        CONFIG_VENDOR_ID_OFFSET, STATUS_CAPABILITIES_LIST,
+    },
     function::PciConfigByte,
     runtime::PciCommandState,
 };
-
-const COMMAND_BUS_MASTER_ENABLE: u8 = 0x04;
-const COMMAND_INTERRUPT_DISABLE: u8 = 0x04;
-const COMMAND_MEMORY_SPACE_ENABLE: u8 = 0x02;
-const STATUS_CAPABILITIES_LIST: u8 = 0x10;
 
 #[derive(Clone)]
 pub(crate) struct PowerOnConfig {
@@ -38,22 +42,26 @@ impl PowerOnConfig {
         }
         let mut bytes = [0; CONFIG_SPACE_SIZE];
         let mut write_mask = [0; CONFIG_SPACE_SIZE];
-        bytes[0..2].copy_from_slice(&identity.vendor_id().to_le_bytes());
-        bytes[2..4].copy_from_slice(&identity.device_id().to_le_bytes());
-        bytes[0x2c..0x2e].copy_from_slice(&identity.subsystem_vendor_id().to_le_bytes());
-        bytes[0x2e..0x30].copy_from_slice(&identity.subsystem_device_id().to_le_bytes());
+        bytes[CONFIG_VENDOR_ID_OFFSET..CONFIG_VENDOR_ID_OFFSET + 2]
+            .copy_from_slice(&identity.vendor_id().to_le_bytes());
+        bytes[CONFIG_DEVICE_ID_OFFSET..CONFIG_DEVICE_ID_OFFSET + 2]
+            .copy_from_slice(&identity.device_id().to_le_bytes());
+        bytes[CONFIG_SUBSYSTEM_VENDOR_ID_OFFSET..CONFIG_SUBSYSTEM_VENDOR_ID_OFFSET + 2]
+            .copy_from_slice(&identity.subsystem_vendor_id().to_le_bytes());
+        bytes[CONFIG_SUBSYSTEM_DEVICE_ID_OFFSET..CONFIG_SUBSYSTEM_DEVICE_ID_OFFSET + 2]
+            .copy_from_slice(&identity.subsystem_device_id().to_le_bytes());
         if let Some(intx) = intx {
-            bytes[0x3c] = intx.guest_line_byte();
-            bytes[0x3d] = intx.pin().config_encoding();
+            bytes[CONFIG_INTERRUPT_LINE_OFFSET] = intx.guest_line_byte();
+            bytes[CONFIG_INTERRUPT_PIN_OFFSET] = intx.pin().config_encoding();
         }
-        write_mask[4] = COMMAND_MEMORY_SPACE_ENABLE | COMMAND_BUS_MASTER_ENABLE;
-        write_mask[5] = COMMAND_INTERRUPT_DISABLE;
+        write_mask[CONFIG_COMMAND_OFFSET] = COMMAND_MEMORY_SPACE_ENABLE | COMMAND_BUS_MASTER_ENABLE;
+        write_mask[CONFIG_COMMAND_OFFSET + 1] = COMMAND_INTERRUPT_DISABLE;
         let class = identity.class();
-        bytes[8] = identity.revision();
-        bytes[9] = class.programming_interface();
-        bytes[10] = class.subclass();
-        bytes[11] = class.base();
-        bytes[14] = 0;
+        bytes[CONFIG_REVISION_OFFSET] = identity.revision();
+        bytes[CONFIG_PROGRAMMING_INTERFACE_OFFSET] = class.programming_interface();
+        bytes[CONFIG_SUBCLASS_OFFSET] = class.subclass();
+        bytes[CONFIG_BASE_CLASS_OFFSET] = class.base();
+        bytes[CONFIG_HEADER_TYPE_OFFSET] = 0;
         for patch in config_bytes {
             let offset = usize::from(patch.offset.value());
             bytes[offset] = patch.value;
@@ -61,12 +69,13 @@ impl PowerOnConfig {
         }
         for bar in bars {
             let offset = bar.index.config_offset();
-            bytes[offset..offset + 4]
-                .copy_from_slice(&(bar.address as u32 & 0xffff_fff0).to_le_bytes());
+            bytes[offset..offset + 4].copy_from_slice(
+                &(bar.address as u32 & CONFIG_BAR_MEMORY_ADDRESS_MASK).to_le_bytes(),
+            );
         }
         if let Some(first) = capabilities.first() {
-            bytes[0x06] |= STATUS_CAPABILITIES_LIST;
-            bytes[0x34] = first.offset().value() as u8;
+            bytes[CONFIG_STATUS_OFFSET] |= STATUS_CAPABILITIES_LIST;
+            bytes[CONFIG_CAPABILITY_POINTER_OFFSET] = first.offset().value() as u8;
         }
         for (index, capability) in capabilities.iter().enumerate() {
             let base = usize::from(capability.offset().value());
@@ -125,14 +134,14 @@ impl FunctionState {
     }
 
     pub(crate) fn memory_decode_enabled(&self) -> bool {
-        self.config[4] & COMMAND_MEMORY_SPACE_ENABLE != 0
+        self.config[CONFIG_COMMAND_OFFSET] & COMMAND_MEMORY_SPACE_ENABLE != 0
     }
 
     pub(crate) fn command_state(&self) -> PciCommandState {
         PciCommandState::new(
-            self.config[4] & COMMAND_MEMORY_SPACE_ENABLE != 0,
-            self.config[4] & COMMAND_BUS_MASTER_ENABLE != 0,
-            self.config[5] & COMMAND_INTERRUPT_DISABLE != 0,
+            self.config[CONFIG_COMMAND_OFFSET] & COMMAND_MEMORY_SPACE_ENABLE != 0,
+            self.config[CONFIG_COMMAND_OFFSET] & COMMAND_BUS_MASTER_ENABLE != 0,
+            self.config[CONFIG_COMMAND_OFFSET + 1] & COMMAND_INTERRUPT_DISABLE != 0,
         )
     }
 
@@ -240,10 +249,10 @@ impl FunctionState {
     }
 
     fn bar_dword(&self, offset: usize) -> Option<usize> {
-        if !(0x10..0x28).contains(&offset) {
+        if !(CONFIG_BAR_START..CONFIG_BAR_END).contains(&offset) {
             return None;
         }
-        let slot = ((offset - 0x10) / 4) as u8;
+        let slot = ((offset - CONFIG_BAR_START) / CONFIG_BAR_REGISTER_SIZE) as u8;
         self.bars.iter().position(|bar| slot == bar.index().value())
     }
 }

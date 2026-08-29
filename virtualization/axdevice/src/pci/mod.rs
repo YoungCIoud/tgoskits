@@ -9,6 +9,7 @@ mod address;
 mod bar;
 mod capability;
 mod config;
+mod config_layout;
 mod error;
 mod function;
 mod graph;
