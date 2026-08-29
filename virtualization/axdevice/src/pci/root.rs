@@ -5,10 +5,11 @@
 //! runtime identities, and lifecycle callbacks are introduced by later
 //! integration layers.
 
-use alloc::{boxed::Box, collections::BTreeMap, string::ToString, sync::Arc};
+use alloc::{boxed::Box, collections::BTreeMap, string::ToString, sync::Arc, vec::Vec};
 use core::{fmt, ops::Range};
 
 use ax_sync::SpinLock;
+use axdevice_base::DeviceId;
 
 use super::{
     EndpointRouteToken, FOUR_GIB, PciBarIndex, PciBdf, PciCommandState, PciConfigReadEffect,
@@ -21,6 +22,7 @@ pub(crate) enum PciConfigReadOutcome {
     Value(u64),
     Effect {
         token: EndpointRouteToken,
+        command: PciCommandState,
         effect: Box<PciConfigReadEffect>,
     },
 }
@@ -29,6 +31,7 @@ pub(crate) enum PciConfigWriteOutcome {
     Complete,
     Effect {
         token: EndpointRouteToken,
+        command: PciCommandState,
         effect: Box<PciConfigWriteEffect>,
     },
     CommandChanged {
@@ -127,7 +130,7 @@ impl PciRootState {
         width: AccessWidth,
     ) -> PciResult<PciConfigReadOutcome> {
         let (offset, size) = offset.validate_access(width)?;
-        let (token, capability, effect, relative, snapshot) = {
+        let (token, command, capability, effect, relative, snapshot) = {
             let state = self.state.lock_irqsave();
             let Some(function_index) = state.function_index(bdf) else {
                 return Ok(PciConfigReadOutcome::Value(all_ones(size)));
@@ -138,18 +141,25 @@ impl PciRootState {
             else {
                 return Ok(PciConfigReadOutcome::Value(function.read(offset, size)));
             };
-            let token =
-                state
-                    .bindings
-                    .get(&bdf)
-                    .copied()
-                    .ok_or(PciError::ConfigEffectUnavailable {
-                        detail: "an endpoint binding is required for this config read",
-                    })?;
-            (token, capability, effect, relative, snapshot)
+            let token = state
+                .bindings
+                .get(&bdf)
+                .and_then(EndpointRouteToken::snapshot_if_admitted)
+                .ok_or(PciError::ConfigEffectUnavailable {
+                    detail: "an admitted endpoint binding is required for this config read",
+                })?;
+            (
+                token,
+                function.command_state(),
+                capability,
+                effect,
+                relative,
+                snapshot,
+            )
         };
         Ok(PciConfigReadOutcome::Effect {
             token,
+            command,
             effect: Box::new(PciConfigReadEffect::new(
                 capability,
                 effect.effect(),
@@ -196,59 +206,70 @@ impl PciRootState {
         value: u64,
     ) -> PciResult<PciConfigWriteOutcome> {
         let (offset, size) = offset.validate_access(width)?;
-        let (token, capability, effect, relative, snapshot) =
+        let (token, command, capability, effect, relative, snapshot) = {
+            let mut state = self.state.lock_irqsave();
+            let Some(function_index) = state.function_index(bdf) else {
+                return Ok(PciConfigWriteOutcome::Complete);
+            };
+            if let Some((capability, effect, relative, snapshot)) =
+                state.functions[function_index].config_effect(offset, size, width, true)?
             {
-                let mut state = self.state.lock_irqsave();
-                let Some(function_index) = state.function_index(bdf) else {
-                    return Ok(PciConfigWriteOutcome::Complete);
-                };
-                if let Some((capability, effect, relative, snapshot)) =
-                    state.functions[function_index].config_effect(offset, size, width, true)?
-                {
-                    let token = state.bindings.get(&bdf).copied().ok_or(
-                        PciError::ConfigEffectUnavailable {
-                            detail: "an endpoint binding is required for this config write",
-                        },
-                    )?;
-                    (token, capability, effect, relative, snapshot)
-                } else {
-                    let bar_action =
-                        state.functions[function_index].prepare_bar_write(offset, size, value);
-                    if let Some(action) = bar_action {
-                        match action {
-                            BarWriteAction::Probe { bar } => {
-                                state.functions[function_index].apply_probe(bar)
-                            }
-                            BarWriteAction::Relocate { bar, candidate } => {
-                                let accepted = state.bar_address_available(
-                                    self.topology.memory_aperture(),
-                                    function_index,
-                                    bar,
-                                    candidate,
-                                );
-                                state.functions[function_index]
-                                    .finish_relocation(bar, accepted.then_some(candidate));
-                            }
+                let token = state
+                    .bindings
+                    .get(&bdf)
+                    .and_then(EndpointRouteToken::snapshot_if_admitted)
+                    .ok_or(PciError::ConfigEffectUnavailable {
+                        detail: "an admitted endpoint binding is required for this config write",
+                    })?;
+                (
+                    token,
+                    state.functions[function_index].command_state(),
+                    capability,
+                    effect,
+                    relative,
+                    snapshot,
+                )
+            } else {
+                let bar_action =
+                    state.functions[function_index].prepare_bar_write(offset, size, value);
+                if let Some(action) = bar_action {
+                    match action {
+                        BarWriteAction::Probe { bar } => {
+                            state.functions[function_index].apply_probe(bar)
                         }
-                        return Ok(PciConfigWriteOutcome::Complete);
-                    }
-                    let previous = state.functions[function_index].command_state();
-                    state.functions[function_index].write_non_bar(offset, size, value);
-                    let command = state.functions[function_index].command_state();
-                    let command_changed = previous.bus_master_enable()
-                        != command.bus_master_enable()
-                        || previous.interrupt_disable() != command.interrupt_disable();
-                    if command_changed {
-                        return Ok(PciConfigWriteOutcome::CommandChanged {
-                            token: state.bindings.get(&bdf).copied(),
-                            command,
-                        });
+                        BarWriteAction::Relocate { bar, candidate } => {
+                            let accepted = state.bar_address_available(
+                                self.topology.memory_aperture(),
+                                function_index,
+                                bar,
+                                candidate,
+                            );
+                            state.functions[function_index]
+                                .finish_relocation(bar, accepted.then_some(candidate));
+                        }
                     }
                     return Ok(PciConfigWriteOutcome::Complete);
                 }
-            };
+                let previous = state.functions[function_index].command_state();
+                state.functions[function_index].write_non_bar(offset, size, value);
+                let command = state.functions[function_index].command_state();
+                let command_changed = previous.bus_master_enable() != command.bus_master_enable()
+                    || previous.interrupt_disable() != command.interrupt_disable();
+                if command_changed {
+                    return Ok(PciConfigWriteOutcome::CommandChanged {
+                        token: state
+                            .bindings
+                            .get(&bdf)
+                            .and_then(EndpointRouteToken::snapshot_if_admitted),
+                        command,
+                    });
+                }
+                return Ok(PciConfigWriteOutcome::Complete);
+            }
+        };
         Ok(PciConfigWriteOutcome::Effect {
             token,
+            command,
             effect: Box::new(PciConfigWriteEffect::new(
                 PciConfigReadEffect::new(capability, effect.effect(), relative, width, snapshot),
                 value,
@@ -269,11 +290,19 @@ impl PciRootState {
         &self,
         address: u64,
         width: AccessWidth,
-    ) -> Option<(EndpointRouteToken, PciBarRoute)> {
+    ) -> Option<(EndpointRouteToken, PciBarRoute, PciCommandState)> {
         let access_end = address.checked_add(width.size() as u64)?;
         let state = self.state.lock_irqsave();
         let (bdf, route) = resolve_route(&state.functions, address, access_end, width)?;
-        Some((*state.bindings.get(&bdf)?, route))
+        let function = state
+            .functions
+            .iter()
+            .find(|function| function.bdf() == bdf)?;
+        Some((
+            state.bindings.get(&bdf)?.snapshot_if_admitted()?,
+            route,
+            function.command_state(),
+        ))
     }
 
     pub(crate) fn bind_endpoint(
@@ -297,11 +326,23 @@ impl PciRootState {
         Ok(())
     }
 
-    pub(crate) fn unbind_endpoint(&self, token: EndpointRouteToken) {
+    pub(crate) fn replace_endpoint_tokens(
+        &self,
+        replacements: &[(EndpointRouteToken, EndpointRouteToken)],
+    ) {
+        let mut state = self.state.lock_irqsave();
+        for token in state.bindings.values_mut() {
+            if let Some((_, replacement)) = replacements.iter().find(|(old, _)| old == token) {
+                *token = replacement.clone();
+            }
+        }
+    }
+
+    pub(crate) fn unbind_device(&self, device: DeviceId) {
         self.state
             .lock_irqsave()
             .bindings
-            .retain(|_, registered| *registered != token);
+            .retain(|_, token| token.device_id() != device);
     }
 
     /// Restores every function's root-owned power-on config and BAR route.
@@ -309,6 +350,26 @@ impl PciRootState {
         for function in &mut self.state.lock_irqsave().functions {
             function.reset();
         }
+    }
+
+    /// Resets root-owned state and snapshots the fresh command state for all
+    /// currently bound endpoint device identities.
+    pub(crate) fn reset_and_snapshot_commands(&self) -> Vec<(DeviceId, PciCommandState)> {
+        let mut state = self.state.lock_irqsave();
+        for function in &mut state.functions {
+            function.reset();
+        }
+        state
+            .bindings
+            .iter()
+            .filter_map(|(bdf, token)| {
+                state
+                    .functions
+                    .iter()
+                    .find(|function| function.bdf() == *bdf)
+                    .map(|function| (token.device_id(), function.command_state()))
+            })
+            .collect()
     }
 }
 
