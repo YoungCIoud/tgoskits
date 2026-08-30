@@ -5,16 +5,42 @@ use super::{super::config::decode_pci_cfg_bytes, *};
 
 #[test]
 fn conversion_preserves_derived_lengths_and_pci_cfg_effect() {
-    let specs = virtio_capabilities(&VirtioPciCapabilitySet::new(16)).unwrap();
+    let capabilities = VirtioPciCapabilitySet::new(16);
+    let specs = virtio_capabilities(&capabilities).unwrap();
     assert_eq!(specs.len(), 5);
-    assert_eq!(specs[0].body().len(), 14);
-    assert_eq!(specs[1].body().len(), 18);
-    assert_eq!(specs[3].body().len(), 14);
-    assert_eq!(specs[4].body().len(), 18);
+
+    let expected = [
+        (VirtioPciCapabilityType::Common, 0, 0x000, 0x38, 0),
+        (VirtioPciCapabilityType::Notify, 0, 0x100, 0x04, 4),
+        (VirtioPciCapabilityType::Isr, 0, 0x200, 0x01, 0),
+        (VirtioPciCapabilityType::Device, 0, 0x300, 16, 0),
+        (VirtioPciCapabilityType::PciConfig, 0, 0, 0, 0),
+    ];
+    for ((capability, spec), (cfg_type, bar, offset, length, multiplier)) in
+        capabilities.as_slice().iter().zip(&specs).zip(expected)
+    {
+        assert_eq!(capability.cfg_type(), cfg_type);
+        assert_eq!(capability.bar(), bar);
+        assert_eq!(capability.offset(), offset);
+        assert_eq!(capability.length(), length);
+        assert_eq!(capability.notify_off_multiplier(), multiplier);
+
+        let body = spec.body();
+        assert_eq!(body.len(), usize::from(capability.serialized_length()) - 2);
+        assert_eq!(body[0], capability.serialized_length());
+        assert_eq!(body[1], cfg_type as u8);
+        assert_eq!(body[2], bar);
+        assert_eq!(u32::from_le_bytes(body[6..10].try_into().unwrap()), offset);
+        assert_eq!(u32::from_le_bytes(body[10..14].try_into().unwrap()), length);
+        if body.len() >= 18 {
+            assert_eq!(
+                u32::from_le_bytes(body[14..18].try_into().unwrap()),
+                multiplier
+            );
+        }
+    }
+
     assert_eq!(specs[4].effects().len(), 1);
-    assert_eq!(specs[0].body()[0], 16);
-    assert_eq!(specs[1].body()[0], 20);
-    assert_eq!(specs[4].body()[0], 20);
     let effect = specs[4].effects()[0];
     assert_eq!(effect.effect(), PciConfigEffectId::new(1));
     assert_eq!(effect.offset(), 16);

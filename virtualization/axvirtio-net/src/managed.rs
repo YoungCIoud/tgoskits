@@ -7,9 +7,10 @@ use axdevice_base::{
     BusKind, Device, DeviceAccess, DeviceContext, DeviceError, InterruptTriggerMode, IrqLine,
     Resource,
 };
+use axvirtio_common::map_virtio_error;
 use axvm_types::GuestPhysAddr;
 
-use crate::{DeviceEvent, NetworkBackend, VirtioError, VirtioMmioNetDevice};
+use crate::{DeviceEvent, NetworkBackend, VirtioMmioNetDevice};
 
 /// A VirtIO-net model registered in the unified emulated-device runtime.
 pub struct ManagedVirtioNetDevice<B, T>
@@ -98,7 +99,7 @@ where
                 access.width(),
             )
             .map(|value| value as u64)
-            .map_err(map_virtio_error)
+            .map_err(|error| map_virtio_error(error, "access virtio-net MMIO transport"))
     }
 
     fn write(
@@ -120,20 +121,22 @@ where
                 access.width(),
                 value as usize,
             )
-            .map_err(map_virtio_error)?;
-        if event == DeviceEvent::InterruptPending {
-            self.irq.pulse().map_err(|error| DeviceError::Backend {
-                operation: "pulse virtio-net interrupt",
-                detail: alloc::format!("{error}"),
-            })?;
+            .map_err(|error| map_virtio_error(error, "access virtio-net MMIO transport"))?;
+        match event {
+            DeviceEvent::InterruptPending => {
+                self.irq.pulse().map_err(|error| DeviceError::Backend {
+                    operation: "pulse virtio-net interrupt",
+                    detail: alloc::format!("{error}"),
+                })?;
+            }
+            DeviceEvent::QueueFaulted => {
+                return Err(DeviceError::InvalidState {
+                    operation: "process virtio-net TX queue",
+                    detail: alloc::string::String::from("queue faulted; guest reset required"),
+                });
+            }
+            DeviceEvent::None | DeviceEvent::Reset => {}
         }
         Ok(())
-    }
-}
-
-fn map_virtio_error(error: VirtioError) -> DeviceError {
-    DeviceError::InvalidInput {
-        operation: "access virtio-net MMIO transport",
-        detail: alloc::format!("{error:?}"),
     }
 }

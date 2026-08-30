@@ -1,4 +1,202 @@
+use axvirtio_common::{
+    VIRTIO_STATUS_ACKNOWLEDGE, VIRTIO_STATUS_DRIVER, VIRTIO_STATUS_DRIVER_OK,
+    VIRTIO_STATUS_FEATURES_OK, constants::VIRTIO_F_VERSION_1,
+};
+
 use super::*;
+
+struct BlockEndpointContext {
+    device_id: DeviceId,
+    endpoint_device_id: DeviceId,
+    expected_dma_grant: DmaGrant,
+    memory: Arc<Mutex<Vec<u8>>>,
+    guest_memory_calls: Arc<AtomicUsize>,
+    active_dma_enabled: bool,
+    guest_memory_pause: Option<Arc<TestPause>>,
+    active_dma_grant: Option<DmaGrant>,
+}
+
+const READ_DATA: usize = 0x4400;
+
+impl BlockEndpointContext {
+    fn new(size: usize, endpoint_device_id: DeviceId, expected_dma_grant: DmaGrant) -> Self {
+        Self {
+            device_id: DeviceId::new(0),
+            endpoint_device_id,
+            expected_dma_grant,
+            memory: Arc::new(Mutex::new(vec![0; size])),
+            guest_memory_calls: Arc::new(AtomicUsize::new(0)),
+            active_dma_enabled: true,
+            guest_memory_pause: None,
+            active_dma_grant: None,
+        }
+    }
+
+    fn nested(&self, device_id: DeviceId) -> Self {
+        Self {
+            device_id,
+            endpoint_device_id: self.endpoint_device_id,
+            expected_dma_grant: self.expected_dma_grant.clone(),
+            memory: Arc::clone(&self.memory),
+            guest_memory_calls: Arc::clone(&self.guest_memory_calls),
+            active_dma_enabled: false,
+            guest_memory_pause: self.guest_memory_pause.clone(),
+            active_dma_grant: None,
+        }
+    }
+
+    fn pause_next_guest_memory(&mut self, pause: Arc<TestPause>) {
+        self.guest_memory_pause = Some(pause);
+    }
+
+    fn reset_context(&self) -> Self {
+        Self {
+            device_id: DeviceId::new(0),
+            endpoint_device_id: self.endpoint_device_id,
+            expected_dma_grant: self.expected_dma_grant.clone(),
+            memory: Arc::clone(&self.memory),
+            guest_memory_calls: Arc::clone(&self.guest_memory_calls),
+            active_dma_enabled: true,
+            guest_memory_pause: None,
+            active_dma_grant: None,
+        }
+    }
+
+    fn write_bytes(&self, address: usize, bytes: &[u8]) {
+        self.memory.lock().unwrap()[address..address + bytes.len()].copy_from_slice(bytes);
+    }
+
+    fn read_bytes(&self, address: usize, length: usize) -> Vec<u8> {
+        self.memory.lock().unwrap()[address..address + length].to_vec()
+    }
+
+    fn set_descriptor(&self, index: usize, address: u64, length: u32, flags: u16, next: u16) {
+        let offset = 0x1000 + index * 16;
+        self.write_bytes(offset, &address.to_le_bytes());
+        self.write_bytes(offset + 8, &length.to_le_bytes());
+        self.write_bytes(offset + 12, &flags.to_le_bytes());
+        self.write_bytes(offset + 14, &next.to_le_bytes());
+    }
+
+    fn set_available_head(&self, index: u16, head: u16) {
+        self.write_bytes(0x2000 + 2, &index.to_le_bytes());
+        self.write_bytes(
+            0x2000 + 4 + (usize::from(index) - 1) * 2,
+            &head.to_le_bytes(),
+        );
+    }
+
+    fn set_header(&self, request_type: u32, sector: u64) {
+        self.write_bytes(0x4000, &request_type.to_le_bytes());
+        self.write_bytes(0x4008, &sector.to_le_bytes());
+    }
+
+    fn check_dma_grant(&mut self, grant: &DmaGrant) -> DeviceResult {
+        if !self.active_dma_enabled {
+            return Err(DeviceError::Unsupported {
+                operation: "access guest memory from VirtIO PCI endpoint",
+                detail: "guest-memory access was attempted while PCI bus mastering was disabled"
+                    .into(),
+            });
+        }
+        if self.device_id != self.endpoint_device_id {
+            return Err(DeviceError::Unsupported {
+                operation: "access guest memory from VirtIO PCI endpoint",
+                detail: "guest-memory access escaped the routed endpoint context".into(),
+            });
+        }
+        if !self.expected_dma_grant.same_token(grant) {
+            return Err(DeviceError::Unsupported {
+                operation: "access guest memory from VirtIO PCI endpoint",
+                detail: "guest-memory access used an unregistered DMA grant".into(),
+            });
+        }
+        if let Some(active) = &self.active_dma_grant {
+            if !active.same_token(grant) {
+                return Err(DeviceError::Unsupported {
+                    operation: "access guest memory from VirtIO PCI endpoint",
+                    detail: "guest-memory access used a different DMA grant".into(),
+                });
+            }
+        } else {
+            self.active_dma_grant = Some(grant.clone());
+        }
+        Ok(())
+    }
+}
+
+impl DeviceContext for BlockEndpointContext {
+    fn device_id(&self) -> DeviceId {
+        self.device_id
+    }
+
+    fn with_routed_device(
+        &mut self,
+        grant: &axdevice_base::RoutedDeviceGrant,
+        callback: &mut dyn FnMut(&mut dyn DeviceContext) -> DeviceResult,
+    ) -> DeviceResult {
+        if grant.device_id() != self.endpoint_device_id {
+            return Err(DeviceError::Unsupported {
+                operation: "enter VirtIO PCI endpoint context",
+                detail: "routed grant names a different endpoint device".into(),
+            });
+        }
+        if !grant.admission_is_open() {
+            return Err(DeviceError::Unsupported {
+                operation: "enter VirtIO PCI endpoint context",
+                detail: "routed grant does not carry an open DMA capability".into(),
+            });
+        }
+        let mut nested = self.nested(grant.device_id());
+        nested.active_dma_enabled = grant.dma_enabled();
+        let result = callback(&mut nested);
+        self.active_dma_grant = nested.active_dma_grant;
+        result
+    }
+
+    fn read_guest_memory(
+        &mut self,
+        grant: &DmaGrant,
+        address: GuestPhysAddr,
+        data: &mut [u8],
+    ) -> DeviceResult {
+        if let Some(pause) = self.guest_memory_pause.take() {
+            pause.wait();
+        }
+        self.guest_memory_calls.fetch_add(1, Ordering::Relaxed);
+        self.check_dma_grant(grant)?;
+        let memory = self.memory.lock().unwrap();
+        let start = address.as_usize();
+        data.copy_from_slice(memory.get(start..start + data.len()).ok_or(
+            DeviceError::OutOfRange {
+                addr: address.as_usize() as u64,
+            },
+        )?);
+        Ok(())
+    }
+
+    fn write_guest_memory(
+        &mut self,
+        grant: &DmaGrant,
+        address: GuestPhysAddr,
+        data: &[u8],
+    ) -> DeviceResult {
+        if let Some(pause) = self.guest_memory_pause.take() {
+            pause.wait();
+        }
+        self.guest_memory_calls.fetch_add(1, Ordering::Relaxed);
+        self.check_dma_grant(grant)?;
+        let mut memory = self.memory.lock().unwrap();
+        let start = address.as_usize();
+        memory
+            .get_mut(start..start + data.len())
+            .ok_or(DeviceError::OutOfRange {
+                addr: address.as_usize() as u64,
+            })?
+            .copy_from_slice(data);
+        Ok(())
+    }
+}
 
 #[test]
 fn adapter_retries_completion_assert_after_irq_failure() {
@@ -321,5 +519,405 @@ fn bound_virtio_endpoint_serializes_dispatches_and_relocates_bar() {
     assert_eq!(
         binding.read_bar(bar.address() + 0x300, AccessWidth::Dword),
         Err(DeviceError::NotFound)
+    );
+}
+
+#[test]
+fn configured_virtio_blk_pci_runs_ramdisk_write_read_and_flush() {
+    let config = axvmconfig::GuestConfig::from_toml(
+        r#"
+[devices]
+[[devices.virtual]]
+id = "virtio-blk"
+model = "virtio-blk"
+transport = "pci"
+backend = "ramdisk"
+capacity = "1MiB"
+read_only = false
+"#,
+    )
+    .unwrap();
+    let context = crate::DeviceInstantiationContext::new()
+        .with_default_wired_controller(node("controller"), INTX_CONTROLLER)
+        .with_default_pci_host_key(host_key());
+    let mut catalog = crate::ConfiguredDeviceCatalog::new();
+    crate::machine::register_devices(&mut catalog).unwrap();
+    let endpoint = catalog
+        .instantiate_node(&config.devices.virtual_devices[0], &context)
+        .unwrap();
+
+    let root_slot = Arc::new(Mutex::new(None));
+    let sink = Arc::new(TestIrqSink::new());
+    let provider = PciHostProvider::new(
+        host_key(),
+        DeviceNodeSpec::virtual_device(
+            node("pci-host"),
+            Arc::new(HostModel {
+                root: Arc::clone(&root_slot),
+                sink: Arc::clone(&sink),
+            }),
+        ),
+        slot("pci-memory"),
+    )
+    .with_intx_router(PciIntxRouter::new(
+        INTX_CONTROLLER,
+        [
+            ControllerInputId::new(16),
+            ControllerInputId::new(17),
+            ControllerInputId::new(18),
+            ControllerInputId::new(19),
+        ],
+        [16, 17, 18, 19],
+        InterruptTrigger::LevelTriggered,
+        InterruptSharing::Shared,
+    ));
+    let mut builder = DeviceGraphBuilder::new();
+    builder
+        .add(DeviceNodeSpec::firmware_only(node("controller")))
+        .unwrap();
+    builder.register_pci_host(provider).unwrap();
+    builder.add(endpoint).unwrap();
+    let mut pools = ResourcePools::new();
+    pools
+        .add_auto_mmio(APERTURE_BASE..APERTURE_BASE + APERTURE_SIZE)
+        .unwrap();
+    pools
+        .allow_fixed_controller_inputs(
+            INTX_CONTROLLER,
+            ControllerInputId::new(16)..ControllerInputId::new(20),
+        )
+        .unwrap();
+    let graph = builder.declare().unwrap().resolve(pools).unwrap();
+    let mut runtime_builder = DeviceRuntimeBuilder::new(RuntimeAccessPorts::new());
+    for graph_node in graph.nodes() {
+        runtime_builder
+            .build_graph_node(graph_node, graph.resource_plan())
+            .unwrap();
+    }
+    let runtime = Arc::new(runtime_builder.finish(graph.resource_plan()).unwrap());
+    let root = root_slot.lock().unwrap().clone().unwrap();
+    let binding = runtime
+        .services()
+        .all::<PciRootBindingKey>()
+        .into_iter()
+        .next()
+        .unwrap();
+    let function = graph
+        .pci_topology(&host_key())
+        .unwrap()
+        .function(&node("virtio-blk"))
+        .unwrap();
+    assert_eq!(function.identity().vendor_id(), 0x1af4);
+    assert_eq!(function.identity().device_id(), 0x1042);
+    assert_eq!(function.identity().revision(), 1);
+    assert_eq!(function.identity().subsystem_device_id(), 0x1042);
+    let bdf = function.bdf();
+    let bar = function.bar(PciBarIndex::new(0).unwrap()).unwrap();
+    let bar_address = bar.address();
+    let pci_cfg = function.capabilities().nth(4).unwrap();
+    let pci_cfg_offset = u64::from(pci_cfg.offset().value());
+    let endpoint_device_id = DeviceId::new((runtime.device_count() - 1) as u32);
+
+    root.write_config(bdf, ConfigOffset::new(4).unwrap(), AccessWidth::Word, 6)
+        .unwrap();
+    let expected_dma_grant = runtime
+        .dma_grant_for_test(endpoint_device_id)
+        .expect("configured PCI endpoint must register its DMA grant");
+    let mut endpoint_context =
+        BlockEndpointContext::new(0x10_000, endpoint_device_id, expected_dma_grant);
+    for (value, expected) in [
+        (VIRTIO_STATUS_ACKNOWLEDGE, VIRTIO_STATUS_ACKNOWLEDGE),
+        (
+            VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER,
+            VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER,
+        ),
+    ] {
+        binding
+            .write_bar_with_context(
+                bar_address + 0x14,
+                AccessWidth::Byte,
+                u64::from(value),
+                &mut endpoint_context,
+            )
+            .unwrap();
+        assert_eq!(
+            binding
+                .read_bar_with_context(
+                    bar_address + 0x14,
+                    AccessWidth::Byte,
+                    &mut endpoint_context,
+                )
+                .unwrap(),
+            u64::from(expected)
+        );
+    }
+    for selector in [0_u64, 1] {
+        binding
+            .write_bar_with_context(
+                bar_address,
+                AccessWidth::Dword,
+                selector,
+                &mut endpoint_context,
+            )
+            .unwrap();
+        let offered = binding
+            .read_bar_with_context(
+                bar_address + 0x04,
+                AccessWidth::Dword,
+                &mut endpoint_context,
+            )
+            .unwrap();
+        if selector == 0 {
+            assert_ne!(offered & (1 << 9), 0, "ramdisk must advertise FLUSH");
+        } else {
+            assert_ne!(offered & (VIRTIO_F_VERSION_1 >> 32), 0);
+        }
+        binding
+            .write_bar_with_context(
+                bar_address + 0x08,
+                AccessWidth::Dword,
+                selector,
+                &mut endpoint_context,
+            )
+            .unwrap();
+        binding
+            .write_bar_with_context(
+                bar_address + 0x0c,
+                AccessWidth::Dword,
+                offered,
+                &mut endpoint_context,
+            )
+            .unwrap();
+    }
+    let features_ok = VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER | VIRTIO_STATUS_FEATURES_OK;
+    binding
+        .write_bar_with_context(
+            bar_address + 0x14,
+            AccessWidth::Byte,
+            u64::from(features_ok),
+            &mut endpoint_context,
+        )
+        .unwrap();
+    assert_eq!(
+        binding
+            .read_bar_with_context(bar_address + 0x14, AccessWidth::Byte, &mut endpoint_context)
+            .unwrap()
+            & u64::from(VIRTIO_STATUS_FEATURES_OK),
+        u64::from(VIRTIO_STATUS_FEATURES_OK)
+    );
+    for (offset, width, value) in [
+        (
+            0x14,
+            AccessWidth::Byte,
+            u64::from(features_ok | VIRTIO_STATUS_DRIVER_OK),
+        ),
+        (0x20, AccessWidth::Qword, 0x1000),
+        (0x28, AccessWidth::Qword, 0x2000),
+        (0x30, AccessWidth::Qword, 0x3000),
+    ] {
+        binding
+            .write_bar_with_context(bar_address + offset, width, value, &mut endpoint_context)
+            .unwrap();
+    }
+    binding
+        .write_bar_with_context(
+            bar_address + 0x1c,
+            AccessWidth::Word,
+            1,
+            &mut endpoint_context,
+        )
+        .unwrap();
+    root.write_config(bdf, ConfigOffset::new(4).unwrap(), AccessWidth::Word, 2)
+        .unwrap();
+    let guest_memory_calls_before_bme_off =
+        endpoint_context.guest_memory_calls.load(Ordering::Relaxed);
+    binding
+        .write_bar_with_context(
+            bar_address + 0x100,
+            AccessWidth::Word,
+            0,
+            &mut endpoint_context,
+        )
+        .expect("PCI transport must stop a notify before guest-memory access when BME is off");
+    assert_eq!(
+        endpoint_context.guest_memory_calls.load(Ordering::Relaxed),
+        guest_memory_calls_before_bme_off,
+        "BME-off notify must not enter the guest-memory context",
+    );
+    root.write_config(bdf, ConfigOffset::new(4).unwrap(), AccessWidth::Word, 6)
+        .unwrap();
+
+    endpoint_context.set_descriptor(0, 0x4000, 16, 1, 1);
+    endpoint_context.set_descriptor(1, 0x4100, 512, 1, 2);
+    endpoint_context.set_descriptor(2, 0x4300, 1, 2, 0);
+    endpoint_context.set_header(1, 2);
+    endpoint_context.write_bytes(0x4100, &[0xa5; 512]);
+    endpoint_context.set_available_head(1, 0);
+    for (relative_offset, width, value) in [
+        (4, AccessWidth::Byte, 0),
+        (8, AccessWidth::Dword, 0x100),
+        (12, AccessWidth::Dword, 2),
+    ] {
+        root.write_config(
+            bdf,
+            ConfigOffset::new((pci_cfg_offset + relative_offset) as u16).unwrap(),
+            width,
+            value,
+        )
+        .unwrap();
+    }
+    binding
+        .write_config_with_context(
+            bdf,
+            ConfigOffset::new((pci_cfg_offset + 16) as u16).unwrap(),
+            AccessWidth::Word,
+            0,
+            &mut endpoint_context,
+        )
+        .unwrap();
+    assert_eq!(endpoint_context.read_bytes(0x4300, 1), vec![0]);
+    assert_eq!(
+        binding
+            .read_bar_with_context(
+                bar_address + 0x200,
+                AccessWidth::Byte,
+                &mut endpoint_context
+            )
+            .unwrap(),
+        1
+    );
+    assert!(sink.assert_calls.load(Ordering::Relaxed) >= 1);
+
+    endpoint_context.set_descriptor(1, READ_DATA as u64, 512, 3, 2);
+    endpoint_context.write_bytes(READ_DATA, &[0; 512]);
+    endpoint_context.set_header(0, 2);
+    endpoint_context.set_available_head(2, 0);
+    binding
+        .write_bar_with_context(
+            bar_address + 0x100,
+            AccessWidth::Word,
+            0,
+            &mut endpoint_context,
+        )
+        .unwrap();
+    assert_eq!(endpoint_context.read_bytes(0x4300, 1), vec![0]);
+    assert_eq!(endpoint_context.read_bytes(READ_DATA, 512), vec![0xa5; 512]);
+    assert_eq!(
+        binding
+            .read_bar_with_context(
+                bar_address + 0x200,
+                AccessWidth::Byte,
+                &mut endpoint_context
+            )
+            .unwrap(),
+        1
+    );
+
+    endpoint_context.set_descriptor(1, 0x4300, 1, 2, 0);
+    endpoint_context.set_header(4, 0);
+    endpoint_context.set_available_head(3, 0);
+    binding
+        .write_bar_with_context(
+            bar_address + 0x100,
+            AccessWidth::Word,
+            0,
+            &mut endpoint_context,
+        )
+        .unwrap();
+    assert_eq!(endpoint_context.read_bytes(0x4300, 1), vec![0]);
+    assert_eq!(
+        binding
+            .read_bar_with_context(
+                bar_address + 0x200,
+                AccessWidth::Byte,
+                &mut endpoint_context
+            )
+            .unwrap(),
+        1
+    );
+
+    // Exercise the real configured endpoint reset barrier. The first pause is
+    // before the request can reach the ramdisk backend (A); the second is in
+    // the wired INTx sink after used/status have been written (B). The
+    // endpoint's VirtIO status reset must remain incomplete at both points.
+    let guest_memory_pause = TestPause::new();
+    let irq_pause = TestPause::new();
+    sink.pause_next_assert(Arc::clone(&irq_pause));
+    endpoint_context.pause_next_guest_memory(Arc::clone(&guest_memory_pause));
+    endpoint_context.set_descriptor(0, 0x4000, 16, 1, 1);
+    endpoint_context.set_descriptor(1, 0x4100, 512, 1, 2);
+    endpoint_context.set_descriptor(2, 0x4300, 1, 2, 0);
+    endpoint_context.set_header(1, 0);
+    endpoint_context.write_bytes(0x4100, &[0x3c; 512]);
+    endpoint_context.set_available_head(4, 0);
+    let endpoint_memory = Arc::clone(&endpoint_context.memory);
+    let mut reset_context = endpoint_context.reset_context();
+    let notify_binding = Arc::clone(&binding);
+    let notify = thread::spawn(move || {
+        let mut endpoint_context = endpoint_context;
+        notify_binding.write_bar_with_context(
+            bar_address + 0x100,
+            AccessWidth::Word,
+            0,
+            &mut endpoint_context,
+        )
+    });
+    guest_memory_pause.entered.wait();
+
+    let reset_started = Arc::new(Barrier::new(2));
+    let reset_finished = Arc::new(AtomicBool::new(false));
+    let reset_binding = Arc::clone(&binding);
+    let reset_started_thread = Arc::clone(&reset_started);
+    let reset_finished_thread = Arc::clone(&reset_finished);
+    let reset = thread::spawn(move || {
+        reset_started_thread.wait();
+        let result = reset_binding.write_bar_with_context(
+            bar_address + 0x14,
+            AccessWidth::Byte,
+            0,
+            &mut reset_context,
+        );
+        reset_finished_thread.store(true, Ordering::Release);
+        result
+    });
+    reset_started.wait();
+    assert!(!reset_finished.load(Ordering::Acquire));
+
+    guest_memory_pause.release.wait();
+    irq_pause.entered.wait();
+    assert!(!reset_finished.load(Ordering::Acquire));
+    let endpoint_memory = endpoint_memory.lock().unwrap();
+    assert_eq!(endpoint_memory[0x4300], 0);
+    assert_eq!(
+        u16::from_le_bytes(endpoint_memory[0x2002..0x2004].try_into().unwrap()),
+        4
+    );
+    drop(endpoint_memory);
+
+    irq_pause.release.wait();
+    notify
+        .join()
+        .expect("configured endpoint notify should finish")
+        .unwrap();
+    reset
+        .join()
+        .expect("configured endpoint reset should finish")
+        .unwrap();
+    assert!(reset_finished.load(Ordering::Acquire));
+    assert_eq!(
+        binding
+            .read_bar_with_context(
+                bar_address + 0x14,
+                AccessWidth::Byte,
+                &mut BlockEndpointContext::new(
+                    0x10_000,
+                    endpoint_device_id,
+                    runtime
+                        .dma_grant_for_test(endpoint_device_id)
+                        .expect("reset must retain the registered endpoint grant"),
+                ),
+            )
+            .unwrap(),
+        0
     );
 }

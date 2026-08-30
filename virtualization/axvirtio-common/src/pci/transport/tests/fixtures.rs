@@ -56,6 +56,45 @@ pub(crate) struct BlockingNotifyCore {
     pub(crate) release: StdArc<Barrier>,
 }
 
+pub(crate) struct CountingNotifyCore {
+    pub(crate) notify_calls: StdArc<AtomicUsize>,
+}
+
+impl VirtioDeviceCore for CountingNotifyCore {
+    fn device_type(&self) -> VirtioDeviceID {
+        TestCore.device_type()
+    }
+
+    fn device_features(&self) -> u64 {
+        TestCore.device_features()
+    }
+
+    fn queue_size_max(&self) -> u16 {
+        TestCore.queue_size_max()
+    }
+
+    fn device_config_size(&self) -> u32 {
+        TestCore.device_config_size()
+    }
+
+    fn read_device_config(&self, offset: u64, width: AccessWidth) -> DeviceResult<u64> {
+        TestCore.read_device_config(offset, width)
+    }
+
+    fn write_device_config(&self, offset: u64, width: AccessWidth, value: u64) -> DeviceResult {
+        TestCore.write_device_config(offset, width, value)
+    }
+
+    fn notify_queue(
+        &self,
+        _queue: &mut VirtioQueue<NoGuestMemoryAccessor>,
+        _memory: &mut dyn GuestMemory,
+    ) -> DeviceResult<QueueNotifyOutcome> {
+        self.notify_calls.fetch_add(1, Ordering::AcqRel);
+        Ok(QueueNotifyOutcome::Idle)
+    }
+}
+
 impl VirtioDeviceCore for BlockingNotifyCore {
     fn device_type(&self) -> VirtioDeviceID {
         VirtioDeviceID::Block

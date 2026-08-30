@@ -1097,6 +1097,15 @@ impl DeviceRuntime {
         self.devices.len()
     }
 
+    /// Returns the guest-memory grant registered for a device in host tests.
+    #[cfg(feature = "host-test")]
+    pub fn dma_grant_for_test(&self, device_id: DeviceId) -> Option<DmaGrant> {
+        self.dma_grants
+            .iter()
+            .find(|(registered_id, _)| *registered_id == device_id)
+            .map(|(_, grant)| grant.clone())
+    }
+
     // ─── Iterator helpers ───────────────────────────────────────────
     //
     // NOTE: With the unified Device trait, [`devices()`] is the canonical

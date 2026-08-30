@@ -482,6 +482,24 @@ fn tx_backend_error_still_completes_used() {
 }
 
 #[test]
+fn tx_completion_failure_reports_queue_fault() {
+    let h = Harness::new();
+    h.bring_up();
+
+    // Consume an available head that is outside the descriptor table. Chain
+    // validation faults the queue, so the fallback completion also fails.
+    h.set_avail(h.tx_avail, 0, h.size, 1);
+
+    assert_eq!(
+        h.w(vc::VIRTIO_MMIO_QUEUE_NOTIFY, 1),
+        DeviceEvent::QueueFaulted
+    );
+    assert_eq!(h.backend.calls(), 0);
+    assert_eq!(h.used_idx(h.tx_used), 0);
+    assert!(h.device.is_queue_faulted(1));
+}
+
+#[test]
 fn tx_avail_pre_read_failure_faults_queue_and_stops_drain() {
     let h = Harness::new();
     h.bring_up();

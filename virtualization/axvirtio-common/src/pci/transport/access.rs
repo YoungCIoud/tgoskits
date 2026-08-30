@@ -9,7 +9,7 @@ use super::{
     InterruptTransitionRequest, MSIX_CONFIG, NOTIFY_CONFIG_OFFSET, NUM_QUEUES, QUEUE_DESC,
     QUEUE_DEVICE, QUEUE_DRIVER, QUEUE_ENABLE, QUEUE_MSIX_VECTOR, QUEUE_NOTIFY_OFF, QUEUE_SELECT,
     QUEUE_SIZE, VirtioPciTransport, VirtioPciWriteOutcome, access_in_region, feature_word,
-    invalid_queue, map_virtio_error, reject_processing_queue, require_width,
+    invalid_queue, map_pci_error, reject_processing_queue, require_width,
 };
 use crate::{
     GuestMemory,
@@ -285,10 +285,7 @@ impl<D: super::VirtioDeviceCore> VirtioPciTransport<D> {
                     .get_mut(selected_queue)
                     .ok_or_else(|| invalid_queue(selected_queue_id))?;
                 reject_processing_queue(queue)?;
-                queue
-                    .queue
-                    .set_size(value as u16)
-                    .map_err(map_virtio_error)?;
+                queue.queue.set_size(value as u16).map_err(map_pci_error)?;
                 state.queue_size = value as u16;
             }
             QUEUE_ENABLE => {
@@ -299,7 +296,7 @@ impl<D: super::VirtioDeviceCore> VirtioPciTransport<D> {
                     .ok_or_else(|| invalid_queue(selected_queue_id))?;
                 reject_processing_queue(queue)?;
                 if value != 0 {
-                    queue.queue.validate_layout().map_err(map_virtio_error)?;
+                    queue.queue.validate_layout().map_err(map_pci_error)?;
                 }
                 queue.enabled = value != 0;
                 if !queue.enabled {
@@ -320,7 +317,7 @@ impl<D: super::VirtioDeviceCore> VirtioPciTransport<D> {
                     QUEUE_DEVICE => queue.queue.set_used_ring_addr(address),
                     _ => unreachable!(),
                 }
-                .map_err(map_virtio_error)?;
+                .map_err(map_pci_error)?;
             }
             MSIX_CONFIG => {
                 require_width(width, AccessWidth::Word)?;

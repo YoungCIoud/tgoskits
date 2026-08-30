@@ -1569,6 +1569,7 @@ dependencies = [
  "ax-memory-addr",
  "ax-sync",
  "axaddrspace",
+ "axdevice_base",
  "axvm-types",
  "log",
  "mbarrier",

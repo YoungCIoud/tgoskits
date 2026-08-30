@@ -84,6 +84,11 @@ impl QueueNotification {
 pub struct VirtioQueueGeneration(pub(super) u64);
 
 impl VirtioQueueGeneration {
+    /// Creates a generation token from a value captured by a transport.
+    pub const fn from_value(value: u64) -> Self {
+        Self(value)
+    }
+
     /// Returns the numeric generation for diagnostics and tests.
     pub const fn value(self) -> u64 {
         self.0

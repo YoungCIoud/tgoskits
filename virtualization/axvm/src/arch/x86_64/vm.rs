@@ -140,6 +140,7 @@ fn plan_devices(
         &mut nodes,
         &controller_id,
         axdevice_base::InterruptControllerId::new(0),
+        Some(super::pci_config::host_key()),
     )?;
     Ok(SimpleVmPlan::new(VmDevicePlan::with_pci_host_for_vm(
         config,

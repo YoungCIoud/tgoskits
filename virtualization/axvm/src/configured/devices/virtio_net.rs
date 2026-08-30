@@ -15,7 +15,7 @@ use axdevice_base::{
     BusKind, Device, DeviceAccess, DeviceContext, DeviceError, DmaGrant, InterruptSharing,
     InterruptTrigger, IrqLine, Resource,
 };
-use axvirtio_common::{GuestMemory, NoGuestMemoryAccessor, VirtioError};
+use axvirtio_common::{GuestMemory, NoGuestMemoryAccessor, VirtioError, map_virtio_error};
 use axvirtio_net::{
     DeviceEvent, NetworkBackend, NetworkBackendError, RxOutcome, VirtioMmioNetDevice,
     VirtioNetConfig,
@@ -383,7 +383,7 @@ impl Device for VirtioNetRuntimeDevice {
                 access.width(),
             )
             .map(|value| value as u64)
-            .map_err(map_virtio_error)
+            .map_err(|error| map_virtio_error(error, "access virtio-net MMIO transport"))
     }
 
     fn write(
@@ -409,7 +409,7 @@ impl Device for VirtioNetRuntimeDevice {
                 value as usize,
                 &mut memory,
             )
-            .map_err(map_virtio_error)?;
+            .map_err(|error| map_virtio_error(error, "access virtio-net MMIO transport"))?;
         self.pulse_if_pending(event)?;
         Ok(())
     }
@@ -450,19 +450,21 @@ impl DmaPollableDeviceOps for VirtioNetRuntimeDevice {
 
 impl VirtioNetRuntimeDevice {
     fn pulse_if_pending(&self, event: DeviceEvent) -> Result<(), DeviceError> {
-        if event == DeviceEvent::InterruptPending {
-            self.irq.pulse().map_err(|error| DeviceError::Backend {
-                operation: "pulse virtio-net interrupt",
-                detail: format!("{error}"),
-            })?;
+        match event {
+            DeviceEvent::InterruptPending => {
+                self.irq.pulse().map_err(|error| DeviceError::Backend {
+                    operation: "pulse virtio-net interrupt",
+                    detail: format!("{error}"),
+                })?;
+            }
+            DeviceEvent::QueueFaulted => {
+                return Err(DeviceError::InvalidState {
+                    operation: "process virtio-net TX queue",
+                    detail: String::from("queue faulted; guest reset required"),
+                });
+            }
+            DeviceEvent::None | DeviceEvent::Reset => {}
         }
         Ok(())
-    }
-}
-
-fn map_virtio_error(error: VirtioError) -> DeviceError {
-    DeviceError::InvalidInput {
-        operation: "access virtio-net MMIO transport",
-        detail: format!("{error:?}"),
     }
 }

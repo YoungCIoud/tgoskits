@@ -12,7 +12,7 @@ use ax_sync::SpinLock;
 use axdevice_base::{AccessWidth, DeviceError, DeviceResult};
 
 use crate::{
-    GuestMemory, NoGuestMemoryAccessor, VirtioDeviceID, VirtioError, VirtioQueue,
+    GuestMemory, NoGuestMemoryAccessor, VirtioDeviceID, VirtioError, VirtioQueue, map_virtio_error,
     pci::{InterruptTransition, VirtioPciInterruptCoordinator},
 };
 
@@ -145,6 +145,8 @@ pub struct VirtioPciTransport<D: VirtioDeviceCore> {
     interrupts: Arc<VirtioPciInterruptCoordinator>,
     activity: Arc<QueueActivity>,
     device_config_size: u32,
+    #[cfg(test)]
+    notify_admission_hook: SpinLock<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 impl<D: VirtioDeviceCore> VirtioPciTransport<D> {
@@ -184,6 +186,8 @@ impl<D: VirtioDeviceCore> VirtioPciTransport<D> {
             interrupts: Arc::new(VirtioPciInterruptCoordinator::new()),
             activity: Arc::new(QueueActivity::new()),
             core,
+            #[cfg(test)]
+            notify_admission_hook: SpinLock::new(None),
         })
     }
 
@@ -229,6 +233,26 @@ impl<D: VirtioDeviceCore> VirtioPciTransport<D> {
             self.interrupts.record_config_change()
         } else {
             self.interrupts.record_queue_completion(true)
+        }
+    }
+
+    /// Installs a test-only pause between queue snapshot and activity admission.
+    ///
+    /// This makes the reset/reconfiguration interleaving deterministic without
+    /// exposing a production scheduling hook.
+    #[cfg(test)]
+    pub(crate) fn set_notify_admission_hook<F>(&self, hook: F)
+    where
+        F: Fn() + Send + Sync + 'static,
+    {
+        *self.notify_admission_hook.lock() = Some(Arc::new(hook));
+    }
+
+    #[cfg(test)]
+    pub(super) fn run_notify_admission_hook(&self) {
+        let hook = self.notify_admission_hook.lock().clone();
+        if let Some(hook) = hook {
+            hook();
         }
     }
 
@@ -317,6 +341,10 @@ fn invalid_queue(index: u16) -> DeviceError {
     }
 }
 
+fn map_pci_error(error: VirtioError) -> DeviceError {
+    map_virtio_error(error, "virtio-pci queue")
+}
+
 fn reject_processing_queue(queue: &QueueState) -> DeviceResult {
     if queue.processing {
         Err(DeviceError::ResourceBusy {
@@ -325,13 +353,6 @@ fn reject_processing_queue(queue: &QueueState) -> DeviceResult {
         })
     } else {
         Ok(())
-    }
-}
-
-fn map_virtio_error(error: VirtioError) -> DeviceError {
-    DeviceError::InvalidData {
-        operation: "virtio-pci queue",
-        detail: format!("{error:?}"),
     }
 }
 

@@ -350,3 +350,159 @@ fn concurrent_notify_same_queue_does_not_fault_or_replace_owner_queue() {
     notification.complete();
     first.join().expect("first notify should finish");
 }
+
+#[test]
+fn stale_queue_notification_does_not_process_reconfigured_generation() {
+    let notify_calls = StdArc::new(std::sync::atomic::AtomicUsize::new(0));
+    let transport = StdArc::new(
+        VirtioPciTransport::try_new(CountingNotifyCore {
+            notify_calls: StdArc::clone(&notify_calls),
+        })
+        .expect("valid test transport"),
+    );
+    let mut configuration_memory = TestMemory {
+        reads: Cell::new(0),
+    };
+    write(
+        &transport,
+        DEVICE_STATUS,
+        AccessWidth::Byte,
+        0x0b,
+        &mut configuration_memory,
+    );
+    write(
+        &transport,
+        DEVICE_STATUS,
+        AccessWidth::Byte,
+        0x0f,
+        &mut configuration_memory,
+    );
+    write(
+        &transport,
+        QUEUE_DESC,
+        AccessWidth::Qword,
+        0x1000,
+        &mut configuration_memory,
+    );
+    write(
+        &transport,
+        QUEUE_DRIVER,
+        AccessWidth::Qword,
+        0x2000,
+        &mut configuration_memory,
+    );
+    write(
+        &transport,
+        QUEUE_DEVICE,
+        AccessWidth::Qword,
+        0x3000,
+        &mut configuration_memory,
+    );
+    write(
+        &transport,
+        QUEUE_ENABLE,
+        AccessWidth::Word,
+        1,
+        &mut configuration_memory,
+    );
+
+    let snapshot_taken = StdArc::new(Barrier::new(2));
+    let release_snapshot = StdArc::new(Barrier::new(2));
+    transport.set_notify_admission_hook({
+        let snapshot_taken = StdArc::clone(&snapshot_taken);
+        let release_snapshot = StdArc::clone(&release_snapshot);
+        move || {
+            snapshot_taken.wait();
+            release_snapshot.wait();
+        }
+    });
+
+    let notify_transport = StdArc::clone(&transport);
+    let notify_thread = thread::spawn(move || {
+        let mut memory = TestMemory {
+            reads: Cell::new(0),
+        };
+        notify_transport
+            .write_mmio_with_dma(
+                NOTIFY_CONFIG_OFFSET,
+                AccessWidth::Word,
+                0,
+                true,
+                &mut memory,
+            )
+            .expect("stale queue notify should be safely suppressed")
+    });
+    snapshot_taken.wait();
+
+    let old_generation = transport.queue_generation();
+    let reset_transition = transport
+        .reset()
+        .expect("reset should proceed before admission");
+    transport.complete_interrupt_transition(reset_transition, true);
+    transport.complete_reset();
+    assert_ne!(transport.queue_generation(), old_generation);
+
+    // Reopen a new, valid queue generation before allowing the old notify to
+    // acquire activity.  Generation validation, rather than queue.enabled,
+    // must reject the old operation here.
+    let mut reconfiguration_memory = TestMemory {
+        reads: Cell::new(0),
+    };
+    write(
+        &transport,
+        DEVICE_STATUS,
+        AccessWidth::Byte,
+        0x0b,
+        &mut reconfiguration_memory,
+    );
+    write(
+        &transport,
+        DEVICE_STATUS,
+        AccessWidth::Byte,
+        0x0f,
+        &mut reconfiguration_memory,
+    );
+    write(
+        &transport,
+        QUEUE_DESC,
+        AccessWidth::Qword,
+        0x4000,
+        &mut reconfiguration_memory,
+    );
+    write(
+        &transport,
+        QUEUE_DRIVER,
+        AccessWidth::Qword,
+        0x5000,
+        &mut reconfiguration_memory,
+    );
+    write(
+        &transport,
+        QUEUE_DEVICE,
+        AccessWidth::Qword,
+        0x6000,
+        &mut reconfiguration_memory,
+    );
+    write(
+        &transport,
+        QUEUE_ENABLE,
+        AccessWidth::Word,
+        1,
+        &mut reconfiguration_memory,
+    );
+
+    release_snapshot.wait();
+    let outcome = notify_thread
+        .join()
+        .expect("stale notification thread should finish");
+    let VirtioPciWriteOutcome::QueueNotified(notification) = outcome else {
+        panic!("expected stale queue notification");
+    };
+    assert_eq!(notification.outcome(), QueueNotifyOutcome::Idle);
+    notification.complete();
+    assert_eq!(
+        notify_calls.load(std::sync::atomic::Ordering::Acquire),
+        0,
+        "a notification from the old queue generation must not enter the core"
+    );
+}

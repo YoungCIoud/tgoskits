@@ -29,6 +29,33 @@ const APERTURE_SIZE: u64 = 0x10_0000;
 const BAR_SIZE: u64 = 0x1000;
 const INTX_CONTROLLER: InterruptControllerId = InterruptControllerId::new(0);
 
+struct TestPause {
+    entered: Arc<Barrier>,
+    release: Arc<Barrier>,
+    armed: AtomicBool,
+}
+
+impl TestPause {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            entered: Arc::new(Barrier::new(2)),
+            release: Arc::new(Barrier::new(2)),
+            armed: AtomicBool::new(true),
+        })
+    }
+
+    fn wait(&self) {
+        if self
+            .armed
+            .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            self.entered.wait();
+            self.release.wait();
+        }
+    }
+}
+
 fn host_key() -> PciHostKey {
     PciHostKey::new(HOST_KEY).expect("static PCI host key is valid")
 }
@@ -46,6 +73,7 @@ struct TestIrqSink {
     fail_deassert: AtomicBool,
     assert_calls: AtomicUsize,
     deassert_calls: AtomicUsize,
+    assert_pause: Mutex<Option<Arc<TestPause>>>,
 }
 
 impl TestIrqSink {
@@ -55,7 +83,15 @@ impl TestIrqSink {
             fail_deassert: AtomicBool::new(false),
             assert_calls: AtomicUsize::new(0),
             deassert_calls: AtomicUsize::new(0),
+            assert_pause: Mutex::new(None),
         }
+    }
+
+    fn pause_next_assert(&self, pause: Arc<TestPause>) {
+        *self
+            .assert_pause
+            .lock()
+            .expect("test IRQ pause lock should not be poisoned") = Some(pause);
     }
 
     fn failure(input: ControllerInputId, asserted: bool) -> IrqError {
@@ -77,6 +113,14 @@ impl TestIrqSink {
 impl WiredIrqSink for TestIrqSink {
     fn set_level(&self, input: ControllerInputId, asserted: bool) -> IrqResult {
         if asserted {
+            let pause = self
+                .assert_pause
+                .lock()
+                .expect("test IRQ pause lock should not be poisoned")
+                .take();
+            if let Some(pause) = pause {
+                pause.wait();
+            }
             self.assert_calls.fetch_add(1, Ordering::Relaxed);
             if self.fail_assert.load(Ordering::Relaxed) {
                 return Err(Self::failure(input, true));

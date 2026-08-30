@@ -4,7 +4,7 @@ use axdevice_base::{DeviceError, DeviceResult};
 
 use super::{
     ActivityPermit, QueueNotification, QueueNotifyOutcome, VirtioDeviceCore, VirtioPciTransport,
-    VirtioPciWriteOutcome, VirtioQueueGeneration, invalid_queue, map_virtio_error,
+    VirtioPciWriteOutcome, VirtioQueueGeneration, invalid_queue, map_pci_error,
 };
 use crate::{
     GuestMemory, NoGuestMemoryAccessor, VirtioQueue,
@@ -27,36 +27,16 @@ impl<D: VirtioDeviceCore> VirtioPciTransport<D> {
             if state.status & VIRTIO_STATUS_DRIVER_OK as u8 == 0
                 || state.status & VIRTIO_STATUS_DEVICE_NEEDS_RESET as u8 != 0
             {
-                return Ok(VirtioPciWriteOutcome::QueueNotified(QueueNotification {
-                    outcome: QueueNotifyOutcome::Idle,
-                    interrupt: InterruptTransition::None,
-                    activity: None,
-                    interrupts: Arc::clone(&self.interrupts),
-                }));
+                return Ok(self.idle_notification());
             }
             if !state.queues[queue_index as usize].enabled {
-                return Ok(VirtioPciWriteOutcome::QueueNotified(QueueNotification {
-                    outcome: QueueNotifyOutcome::Idle,
-                    interrupt: InterruptTransition::None,
-                    activity: None,
-                    interrupts: Arc::clone(&self.interrupts),
-                }));
+                return Ok(self.idle_notification());
             }
             if state.queues[queue_index as usize].processing {
-                return Ok(VirtioPciWriteOutcome::QueueNotified(QueueNotification {
-                    outcome: QueueNotifyOutcome::Idle,
-                    interrupt: InterruptTransition::None,
-                    activity: None,
-                    interrupts: Arc::clone(&self.interrupts),
-                }));
+                return Ok(self.idle_notification());
             }
             if !dma_enabled {
-                return Ok(VirtioPciWriteOutcome::QueueNotified(QueueNotification {
-                    outcome: QueueNotifyOutcome::Idle,
-                    interrupt: InterruptTransition::None,
-                    activity: None,
-                    interrupts: Arc::clone(&self.interrupts),
-                }));
+                return Ok(self.idle_notification());
             }
             (
                 queue_index as usize,
@@ -65,6 +45,8 @@ impl<D: VirtioDeviceCore> VirtioPciTransport<D> {
         };
 
         let (selected, generation) = selected;
+        #[cfg(test)]
+        self.run_notify_admission_hook();
         let activity = self
             .activity
             .acquire(generation)
@@ -75,16 +57,20 @@ impl<D: VirtioDeviceCore> VirtioPciTransport<D> {
 
         let mut queue = {
             let mut state = self.state.lock();
+            // The first snapshot was taken before activity admission. A
+            // reset may have completed in that gap, so validate every
+            // generation- and queue-owned admission condition again while
+            // holding the transport state lock. Once this permit is held, a
+            // reset cannot invalidate these conditions underneath processing.
+            let stale_admission = state.queue_generation != generation.value()
+                || state.status & VIRTIO_STATUS_DRIVER_OK as u8 == 0
+                || state.status & VIRTIO_STATUS_DEVICE_NEEDS_RESET as u8 != 0
+                || !dma_enabled;
             let queue = &mut state.queues[selected];
-            if queue.processing {
+            if stale_admission || !queue.enabled || queue.processing {
                 drop(state);
                 drop(activity);
-                return Ok(VirtioPciWriteOutcome::QueueNotified(QueueNotification {
-                    outcome: QueueNotifyOutcome::Idle,
-                    interrupt: InterruptTransition::None,
-                    activity: None,
-                    interrupts: Arc::clone(&self.interrupts),
-                }));
+                return Ok(self.idle_notification());
             }
             queue.processing = true;
             queue.queue.set_ready(true);
@@ -100,7 +86,7 @@ impl<D: VirtioDeviceCore> VirtioPciTransport<D> {
         // callback; the queue is temporarily owned by this operation instead.
         if let Err(error) = queue
             .validate_layout_with_memory(memory)
-            .map_err(map_virtio_error)
+            .map_err(map_pci_error)
         {
             // Publish the fatal state before releasing the queue lease, so a
             // competing notify cannot start another operation in the gap.
@@ -131,9 +117,7 @@ impl<D: VirtioDeviceCore> VirtioPciTransport<D> {
             return Ok(fault);
         }
         self.restore_queue(selected, queue);
-        let interrupt = if matches!(outcome, QueueNotifyOutcome::Completed { notify: true })
-            || matches!(outcome, QueueNotifyOutcome::Deferred { notify: true })
-        {
+        let interrupt = if matches!(outcome, QueueNotifyOutcome::Completed { notify: true }) {
             self.interrupts.record_queue_completion(true)
         } else {
             InterruptTransition::None
@@ -144,6 +128,15 @@ impl<D: VirtioDeviceCore> VirtioPciTransport<D> {
             activity: Some(activity),
             interrupts: Arc::clone(&self.interrupts),
         }))
+    }
+
+    fn idle_notification(&self) -> VirtioPciWriteOutcome {
+        VirtioPciWriteOutcome::QueueNotified(QueueNotification {
+            outcome: QueueNotifyOutcome::Idle,
+            interrupt: InterruptTransition::None,
+            activity: None,
+            interrupts: Arc::clone(&self.interrupts),
+        })
     }
 
     fn queue_fault(&self, error: DeviceError, activity: ActivityPermit) -> VirtioPciWriteOutcome {

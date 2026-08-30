@@ -1,15 +1,17 @@
-//! Configured VirtIO MMIO block device backed by memory or a file.
+//! Configured VirtIO block device with MMIO and modern PCI transports.
+//!
+//! MMIO devices may use memory or file-backed storage; the current PCI
+//! configuration accepts the synchronous ramdisk backend.
 
 #[cfg(feature = "fs")]
-use core::sync::atomic::AtomicUsize;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 #[cfg(feature = "fs")]
 use std::collections::VecDeque;
 use std::{
     boxed::Box,
     format,
     string::String,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, MutexGuard},
     vec,
     vec::Vec,
 };
@@ -19,11 +21,17 @@ use axdevice_base::{
     BusKind, Device, DeviceAccess, DeviceContext, DeviceError, DmaGrant, InterruptSharing,
     InterruptTrigger, IrqLine, Resource,
 };
-use axvirtio_blk::{BlockBackend, BlockDeviceEvent, VirtioBlockConfig, VirtioMmioBlockDevice};
-use axvirtio_common::{GuestMemory, NoGuestMemoryAccessor, VirtioError, VirtioResult};
+use axvirtio_blk::{
+    BlockBackend, BlockDeviceEvent, VirtioBlockConfig, VirtioBlockPciAdapter, VirtioMmioBlockDevice,
+};
+use axvirtio_common::{
+    GuestMemory, NoGuestMemoryAccessor, VirtioError, VirtioQueueGeneration, VirtioResult,
+    map_virtio_error,
+};
 use axvm_types::GuestPhysAddr;
 use axvmconfig::VirtualDeviceRequest;
 
+use super::virtio_pci::{VirtioPciFunction, virtio_capabilities};
 use crate::{ConfiguredDeviceError, ConfiguredModelRegistration, DeviceInstantiationContext};
 
 const MMIO_SLOT: &str = "mmio";
@@ -31,6 +39,8 @@ const IRQ_SLOT: &str = "irq";
 const MMIO_SIZE: u64 = 0x200;
 const SECTOR_SIZE: usize = 512;
 const DEFAULT_CAPACITY_BYTES: u64 = 2 * 1024 * 1024;
+const PCI_BAR_SIZE: u64 = 0x1000;
+const PCI_INTX_SLOT: &str = "virtio-intx";
 
 /// Catalog entry for `[[devices.virtual]] model = "virtio-blk"`.
 pub const REGISTRATION: ConfiguredModelRegistration = ConfiguredModelRegistration {
@@ -49,8 +59,31 @@ fn create_device_node(
     request: &VirtualDeviceRequest,
     context: &DeviceInstantiationContext,
 ) -> Result<DeviceNodeSpec, ConfiguredDeviceError> {
+    validate_known_options(request)?;
+    let transport = parse_transport(request)?;
     let capacity_bytes = parse_capacity(request)?;
     let backend_config = parse_backend(request)?;
+    let read_only = parse_read_only(request)?;
+    let host = match transport {
+        VirtioBlkTransport::Mmio => None,
+        VirtioBlkTransport::Pci => {
+            Some(context.default_pci_host_key().cloned().ok_or_else(|| {
+                ConfiguredDeviceError::Instantiation {
+                    device: request.id.clone(),
+                    model: request.model.clone(),
+                    detail: "virtio-blk PCI transport requires a configured PCI host".into(),
+                }
+            })?)
+        }
+    };
+    if matches!(&transport, VirtioBlkTransport::Pci)
+        && !matches!(&backend_config, BackendConfig::RamDisk)
+    {
+        return Err(invalid_options(
+            request,
+            "PCI transport requires `backend = \"ramdisk\"`",
+        ));
+    }
     let backend = VirtioBlkBackend::open(&backend_config, capacity_bytes).map_err(|error| {
         ConfiguredDeviceError::Instantiation {
             device: request.id.clone(),
@@ -69,12 +102,62 @@ fn create_device_node(
     let model: Arc<dyn DeviceModel> = Arc::new(VirtioBlkModel {
         backend: Mutex::new(Some(backend)),
         controller,
+        transport: match (transport, host) {
+            (VirtioBlkTransport::Mmio, None) => VirtioBlkTransportConfig::Mmio,
+            (VirtioBlkTransport::Pci, Some(host)) => VirtioBlkTransportConfig::Pci { host },
+            _ => unreachable!("transport and PCI host are validated together"),
+        },
+        read_only,
     });
     let mut node = DeviceNodeSpec::virtual_device(id, model);
     if let Some(controller_node) = context.default_wired_controller_node() {
         node = node.with_dependency(controller_node.clone());
     }
     Ok(node)
+}
+
+fn validate_known_options(request: &VirtualDeviceRequest) -> Result<(), ConfiguredDeviceError> {
+    for key in request.options.keys() {
+        if !matches!(
+            key.as_str(),
+            "transport" | "backend" | "capacity" | "capacity_sectors" | "path" | "read_only"
+        ) {
+            return Err(invalid_options(
+                request,
+                &format!("unknown virtio-blk option `{key}`"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn parse_transport(
+    request: &VirtualDeviceRequest,
+) -> Result<VirtioBlkTransport, ConfiguredDeviceError> {
+    match request.options.get("transport") {
+        None => Ok(VirtioBlkTransport::Mmio),
+        Some(value) => match value.as_str() {
+            Some("mmio") => Ok(VirtioBlkTransport::Mmio),
+            Some("pci") => Ok(VirtioBlkTransport::Pci),
+            _ => Err(invalid_options(
+                request,
+                "`transport` must be `mmio` or `pci`",
+            )),
+        },
+    }
+}
+
+fn parse_read_only(request: &VirtualDeviceRequest) -> Result<bool, ConfiguredDeviceError> {
+    request
+        .options
+        .get("read_only")
+        .map(|value| {
+            value
+                .as_bool()
+                .ok_or_else(|| invalid_options(request, "`read_only` must be a boolean"))
+        })
+        .transpose()
+        .map(|value| value.unwrap_or(false))
 }
 
 fn invalid_options(request: &VirtualDeviceRequest, detail: &str) -> ConfiguredDeviceError {
@@ -209,6 +292,18 @@ fn allocate_zeroed_backend_buffer(
 struct VirtioBlkModel {
     backend: Mutex<Option<VirtioBlkBackend>>,
     controller: axdevice_base::InterruptControllerId,
+    transport: VirtioBlkTransportConfig,
+    read_only: bool,
+}
+
+enum VirtioBlkTransportConfig {
+    Mmio,
+    Pci { host: PciHostKey },
+}
+
+enum VirtioBlkTransport {
+    Mmio,
+    Pci,
 }
 
 enum BackendConfig {
@@ -218,23 +313,46 @@ enum BackendConfig {
 
 impl DeviceModel for VirtioBlkModel {
     fn requirements(&self) -> DeviceManagerResult<DeviceRequirements> {
-        DeviceRequirements::new()
-            .with_mmio(
-                ResourceSlot::new(MMIO_SLOT)?,
-                MMIO_SIZE,
-                MMIO_SIZE,
-                ResourceRequest::Auto,
-            )?
-            .with_wired_irq(
-                ResourceSlot::new(IRQ_SLOT)?,
-                self.controller,
-                InterruptTrigger::EdgeTriggered,
-                InterruptSharing::Exclusive,
-                ResourceRequest::Auto,
-            )
+        let irq = ResourceSlot::new(PCI_INTX_SLOT)?;
+        match &self.transport {
+            VirtioBlkTransportConfig::Mmio => DeviceRequirements::new()
+                .with_mmio(
+                    ResourceSlot::new(MMIO_SLOT)?,
+                    MMIO_SIZE,
+                    MMIO_SIZE,
+                    ResourceRequest::Auto,
+                )?
+                .with_wired_irq(
+                    ResourceSlot::new(IRQ_SLOT)?,
+                    self.controller,
+                    InterruptTrigger::EdgeTriggered,
+                    InterruptSharing::Exclusive,
+                    ResourceRequest::Auto,
+                ),
+            VirtioBlkTransportConfig::Pci { host } => {
+                let capabilities =
+                    virtio_capabilities(&axvirtio_common::pci::VirtioPciCapabilitySet::new(16))
+                        .map_err(DeviceManagerError::Pci)?;
+                let mut requirement = PciFunctionRequirement::new(
+                    host.clone(),
+                    PciEndpointIdentity::new(0x1af4, 0x1042, PciClass::new(0x01, 0x80, 0x00))
+                        .with_revision(1)
+                        .with_subsystem_ids(0x1af4, 0x1042),
+                )
+                .with_bar(PciMemoryBar::new(PciBarIndex::new(0)?, PCI_BAR_SIZE)?)?
+                .with_intx(PciIntxRequirement::new(PciIntxPin::A, irq))?;
+                for capability in capabilities {
+                    requirement = requirement.with_capability(capability);
+                }
+                DeviceRequirements::new().with_pci_function(requirement)
+            }
+        }
     }
 
     fn firmware(&self) -> DeviceFirmwareSpec {
+        if matches!(&self.transport, VirtioBlkTransportConfig::Pci { .. }) {
+            return DeviceFirmwareSpec::None;
+        }
         let registers = ResourceSlot::new(MMIO_SLOT).expect("static slot is valid");
         let interrupt = ResourceSlot::new(IRQ_SLOT).expect("static slot is valid");
         DeviceFirmwareSpec::interfaces(
@@ -254,9 +372,6 @@ impl DeviceModel for VirtioBlkModel {
     }
 
     fn build(&self, context: &mut DeviceBuildContext<'_>) -> DeviceManagerResult<DeviceBundle> {
-        let (base, size) = context.mmio(MMIO_SLOT)?;
-        let irq = context.irq(IRQ_SLOT)?;
-        let irq_id = irq.input().value() as u32;
         let backend = self
             .backend
             .lock()
@@ -275,39 +390,70 @@ impl DeviceModel for VirtioBlkModel {
             })?;
         let config = VirtioBlockConfig {
             capacity: backend.capacity_sectors(),
+            read_only: self.read_only,
+            flush_supported: !self.read_only,
             ..Default::default()
         };
-        let model = Arc::new(
-            VirtioMmioBlockDevice::new(
-                GuestPhysAddr::from(base as usize),
-                size as usize,
-                backend,
-                config,
-                NoGuestMemoryAccessor,
-            )
-            .map_err(|error| DeviceManagerError::InvalidConfig {
-                operation: "construct virtio-blk device",
-                detail: format!("{error:?}"),
-            })?,
-        );
-        let grant = DmaGrant::new();
-        let device = Arc::new(VirtioBlkRuntimeDevice {
-            model,
-            irq,
-            grant: grant.clone(),
-            queue_pending: AtomicBool::new(false),
-            resources: vec![
-                Resource::MmioRange { base, size },
-                Resource::IrqLine {
-                    line: irq_id,
-                    trigger: axdevice_base::InterruptTriggerMode::EdgeTriggered,
-                },
-            ]
-            .into_boxed_slice(),
-        });
-        let mut bundle = DeviceBundle::new();
-        bundle.add_dma_pollable_device(device.clone(), device, grant);
-        Ok(bundle)
+        match &self.transport {
+            VirtioBlkTransportConfig::Mmio => {
+                let (base, size) = context.mmio(MMIO_SLOT)?;
+                let irq = context.irq(IRQ_SLOT)?;
+                let irq_id = irq.input().value() as u32;
+                let model = Arc::new(
+                    VirtioMmioBlockDevice::new(
+                        GuestPhysAddr::from(base as usize),
+                        size as usize,
+                        backend,
+                        config,
+                        NoGuestMemoryAccessor,
+                    )
+                    .map_err(|error| DeviceManagerError::InvalidConfig {
+                        operation: "construct virtio-blk device",
+                        detail: format!("{error:?}"),
+                    })?,
+                );
+                let grant = DmaGrant::new();
+                let device = Arc::new(VirtioBlkRuntimeDevice {
+                    model,
+                    irq,
+                    grant: grant.clone(),
+                    queue_pending: PendingQueueNotification::new(),
+                    resources: vec![
+                        Resource::MmioRange { base, size },
+                        Resource::IrqLine {
+                            line: irq_id,
+                            trigger: axdevice_base::InterruptTriggerMode::EdgeTriggered,
+                        },
+                    ]
+                    .into_boxed_slice(),
+                });
+                let mut bundle = DeviceBundle::new();
+                bundle.add_dma_pollable_device(device.clone(), device, grant);
+                Ok(bundle)
+            }
+            VirtioBlkTransportConfig::Pci { .. } => {
+                if backend.requires_deferred_processing() {
+                    return Err(invalid_device_config(
+                        "construct virtio-blk PCI device",
+                        "PCI transport requires a synchronous backend",
+                    ));
+                }
+                let irq = context.irq(PCI_INTX_SLOT)?;
+                let grant = DmaGrant::new();
+                let function = Arc::new(
+                    VirtioPciFunction::try_new(
+                        VirtioBlockPciAdapter::new(backend, config),
+                        grant.clone(),
+                        irq,
+                    )
+                    .map_err(DeviceManagerError::Device)?,
+                );
+                let mut bundle = DeviceBundle::new();
+                let device_index = bundle.add_pci_function(function)?;
+                bundle.grant_guest_memory_to_device(device_index, grant);
+                Ok(bundle)
+            }
+        }
     }
 }
 
@@ -691,8 +837,66 @@ struct VirtioBlkRuntimeDevice {
     model: Arc<VirtioMmioBlockDevice<VirtioBlkBackend, NoGuestMemoryAccessor>>,
     irq: IrqLine,
     grant: DmaGrant,
-    queue_pending: AtomicBool,
+    queue_pending: PendingQueueNotification,
     resources: Box<[Resource]>,
+}
+
+/// Deferred queue work and its generation form one schedulable state.
+///
+/// The generation is updated monotonically while holding the same lock as the
+/// pending marker, so an old notification that arrives late cannot overwrite a
+/// newer notification and hide it from the poller.
+struct PendingQueueNotification {
+    generation: Mutex<Option<VirtioQueueGeneration>>,
+}
+
+impl PendingQueueNotification {
+    fn new() -> Self {
+        Self {
+            generation: Mutex::new(None),
+        }
+    }
+
+    /// Recovers the pending state after a poisoned lock instead of turning a
+    /// deferred notification into a permanent panic path.
+    fn lock(&self) -> MutexGuard<'_, Option<VirtioQueueGeneration>> {
+        self.generation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn record(&self, generation: VirtioQueueGeneration) {
+        let mut pending = self.lock();
+        let replace = match *pending {
+            None => true,
+            Some(current) => current == generation || is_newer_generation(generation, current),
+        };
+        if replace {
+            *pending = Some(generation);
+        }
+    }
+
+    fn take(&self) -> Option<VirtioQueueGeneration> {
+        self.lock().take()
+    }
+
+    fn clear_before(&self, reset_generation: VirtioQueueGeneration) {
+        let mut pending = self.lock();
+        let clear = match *pending {
+            Some(current) => {
+                current != reset_generation && is_newer_generation(reset_generation, current)
+            }
+            None => false,
+        };
+        if clear {
+            *pending = None;
+        }
+    }
+}
+
+fn is_newer_generation(candidate: VirtioQueueGeneration, current: VirtioQueueGeneration) -> bool {
+    let distance = candidate.value().wrapping_sub(current.value());
+    distance != 0 && distance < (1u64 << 63)
 }
 
 impl Device for VirtioBlkRuntimeDevice {
@@ -720,7 +924,7 @@ impl Device for VirtioBlkRuntimeDevice {
                 access.width(),
             )
             .map(|value| value as u64)
-            .map_err(map_virtio_error)
+            .map_err(|error| map_virtio_error(error, "access virtio-blk MMIO transport"))
     }
 
     fn write(
@@ -746,7 +950,7 @@ impl Device for VirtioBlkRuntimeDevice {
                 value as usize,
                 &mut memory,
             )
-            .map_err(map_virtio_error)?;
+            .map_err(|error| map_virtio_error(error, "access virtio-blk MMIO transport"))?;
         match event {
             BlockDeviceEvent::InterruptPending => {
                 self.irq.pulse().map_err(|error| DeviceError::Backend {
@@ -754,15 +958,20 @@ impl Device for VirtioBlkRuntimeDevice {
                     detail: format!("{error}"),
                 })?
             }
-            BlockDeviceEvent::QueuePending(0) => self.queue_pending.store(true, Ordering::Release),
-            BlockDeviceEvent::QueuePending(_) => {
+            BlockDeviceEvent::QueuePending {
+                index: 0,
+                generation,
+            } => {
+                self.queue_pending.record(generation);
+            }
+            BlockDeviceEvent::QueuePending { .. } => {
                 return Err(DeviceError::InvalidInput {
                     operation: "notify virtio-blk queue",
                     detail: "only queue 0 is supported".into(),
                 });
             }
-            BlockDeviceEvent::Reset => {
-                self.queue_pending.store(false, Ordering::Release);
+            BlockDeviceEvent::Reset { generation } => {
+                self.queue_pending.clear_before(generation);
             }
             BlockDeviceEvent::None => {}
         }
@@ -777,13 +986,13 @@ impl DmaPollableDeviceOps for VirtioBlkRuntimeDevice {
         context: &mut dyn DeviceContext,
         grant: &DmaGrant,
     ) -> DeviceManagerResult {
-        if !self.queue_pending.swap(false, Ordering::AcqRel) {
+        let Some(generation) = self.queue_pending.take() else {
             return Ok(());
-        }
+        };
         let mut memory = ScopedDeviceMemory { context, grant };
         let event = self
             .model
-            .process_pending_queue(0, &mut memory)
+            .process_pending_queue(0, generation, &mut memory)
             .map_err(|error| DeviceManagerError::InvalidState {
                 operation: "process deferred virtio-blk queue",
                 detail: format!("{error:?}"),
@@ -797,31 +1006,53 @@ impl DmaPollableDeviceOps for VirtioBlkRuntimeDevice {
                         detail: format!("{error}"),
                     })?;
             }
-            BlockDeviceEvent::QueuePending(0) => {
-                self.queue_pending.store(true, Ordering::Release);
+            BlockDeviceEvent::QueuePending {
+                index: 0,
+                generation,
+            } => {
+                self.queue_pending.record(generation);
             }
-            BlockDeviceEvent::QueuePending(_) => {
+            BlockDeviceEvent::QueuePending { .. } => {
                 return Err(DeviceManagerError::InvalidState {
                     operation: "process deferred virtio-blk queue",
                     detail: "only queue 0 is supported".into(),
                 });
             }
-            BlockDeviceEvent::None | BlockDeviceEvent::Reset => {}
+            BlockDeviceEvent::None | BlockDeviceEvent::Reset { .. } => {}
         }
         Ok(())
     }
 }
 
-fn map_virtio_error(error: VirtioError) -> DeviceError {
-    DeviceError::InvalidInput {
-        operation: "access virtio-blk MMIO transport",
-        detail: format!("{error:?}"),
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{allocate_zeroed_backend_buffer, parse_capacity_bytes};
+    use toml::map::Map;
+
+    use super::*;
+
+    fn request(options: &[(&str, toml::Value)]) -> VirtualDeviceRequest {
+        VirtualDeviceRequest {
+            id: "disk0".into(),
+            model: "virtio-blk".into(),
+            options: options
+                .iter()
+                .map(|(key, value)| ((*key).into(), value.clone()))
+                .collect::<Map<_, _>>(),
+        }
+    }
+
+    fn context(with_pci_host: bool) -> DeviceInstantiationContext {
+        let controller = DeviceNodeId::new("controller").unwrap();
+        let context = DeviceInstantiationContext::new().with_default_wired_controller(
+            controller,
+            axdevice_base::InterruptControllerId::new(0),
+        );
+        if with_pci_host {
+            context.with_default_pci_host_key(PciHostKey::new("x86-q35").unwrap())
+        } else {
+            context
+        }
+    }
 
     #[test]
     fn parses_decimal_and_binary_capacity_suffixes() {
@@ -840,5 +1071,127 @@ mod tests {
     #[test]
     fn oversized_backend_capacity_returns_configuration_error() {
         assert!(allocate_zeroed_backend_buffer(u64::MAX, "test virtio-blk allocation").is_err());
+    }
+
+    #[test]
+    fn unknown_options_are_rejected_before_backend_creation() {
+        let request = request(&[
+            ("backend", toml::Value::String("ramdisk".into())),
+            ("unknown", toml::Value::Boolean(true)),
+        ]);
+        assert!(matches!(
+            create_device_node(
+                DeviceNodeId::new("disk0").unwrap(),
+                &request,
+                &context(false)
+            ),
+            Err(ConfiguredDeviceError::InvalidOptions { .. })
+        ));
+    }
+
+    #[test]
+    fn pci_transport_requires_explicit_ramdisk_backend() {
+        let request = request(&[("transport", toml::Value::String("pci".into()))]);
+        let result = create_device_node(
+            DeviceNodeId::new("disk0").unwrap(),
+            &request,
+            &context(true),
+        );
+        assert!(matches!(
+            result,
+            Err(ConfiguredDeviceError::InvalidOptions { .. })
+        ));
+    }
+
+    #[test]
+    fn pci_transport_declares_only_pci_resources() {
+        let request = request(&[
+            ("transport", toml::Value::String("pci".into())),
+            ("backend", toml::Value::String("ramdisk".into())),
+            ("capacity", toml::Value::String("1MiB".into())),
+        ]);
+        let node = create_device_node(
+            DeviceNodeId::new("disk0").unwrap(),
+            &request,
+            &context(true),
+        )
+        .unwrap();
+        let mut builder = DeviceGraphBuilder::new();
+        builder.add(node).unwrap();
+        let requests = builder.requests().unwrap();
+        let requirements = requests[0].requirements();
+        assert!(requirements.entries().is_empty());
+        let pci = requirements.pci_function().unwrap();
+        assert_eq!(pci.host(), &PciHostKey::new("x86-q35").unwrap());
+    }
+
+    #[test]
+    fn default_transport_remains_mmio() {
+        let request = request(&[("backend", toml::Value::String("ramdisk".into()))]);
+        let node = create_device_node(
+            DeviceNodeId::new("disk0").unwrap(),
+            &request,
+            &context(false),
+        )
+        .unwrap();
+        let mut builder = DeviceGraphBuilder::new();
+        builder.add(node).unwrap();
+        let requests = builder.requests().unwrap();
+        let requirements = requests[0].requirements();
+        assert!(requirements.pci_function().is_none());
+        assert_eq!(requirements.entries().len(), 2);
+    }
+
+    #[test]
+    fn stale_deferred_notification_cannot_replace_new_generation() {
+        let pending = PendingQueueNotification::new();
+        let old_generation = VirtioQueueGeneration::from_value(0);
+        let new_generation = VirtioQueueGeneration::from_value(1);
+
+        pending.record(old_generation);
+        pending.record(new_generation);
+        pending.record(old_generation);
+
+        assert_eq!(pending.take(), Some(new_generation));
+    }
+
+    #[test]
+    fn reset_does_not_clear_new_generation_pending_notification() {
+        let pending = PendingQueueNotification::new();
+        let old_generation = VirtioQueueGeneration::from_value(0);
+        let new_generation = VirtioQueueGeneration::from_value(1);
+
+        pending.record(old_generation);
+        pending.record(new_generation);
+        pending.clear_before(new_generation);
+
+        assert_eq!(pending.take(), Some(new_generation));
+
+        let pending = PendingQueueNotification::new();
+        pending.record(old_generation);
+        pending.clear_before(new_generation);
+
+        assert_eq!(pending.take(), None);
+
+        let pending = PendingQueueNotification::new();
+        pending.record(new_generation);
+        pending.clear_before(new_generation);
+
+        assert_eq!(pending.take(), Some(new_generation));
+    }
+
+    #[test]
+    fn poisoned_pending_lock_remains_usable() {
+        let pending = Arc::new(PendingQueueNotification::new());
+        let poisoned = Arc::clone(&pending);
+        let join = std::thread::spawn(move || {
+            let _guard = poisoned.generation.lock().unwrap();
+            panic!("poison the pending notification lock");
+        });
+        assert!(join.join().is_err());
+
+        let generation = VirtioQueueGeneration::from_value(1);
+        pending.record(generation);
+        assert_eq!(pending.take(), Some(generation));
     }
 }
