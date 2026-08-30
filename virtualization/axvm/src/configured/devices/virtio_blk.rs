@@ -1117,9 +1117,18 @@ mod tests {
         )
         .unwrap();
         let mut builder = DeviceGraphBuilder::new();
+        builder
+            .add(DeviceNodeSpec::firmware_only(
+                DeviceNodeId::new("controller").unwrap(),
+            ))
+            .unwrap();
         builder.add(node).unwrap();
         let requests = builder.requests().unwrap();
-        let requirements = requests[0].requirements();
+        let requirements = requests
+            .iter()
+            .find(|request| request.id() == "disk0")
+            .unwrap()
+            .requirements();
         assert!(requirements.entries().is_empty());
         let pci = requirements.pci_function().unwrap();
         assert_eq!(pci.host(), &PciHostKey::new("x86-q35").unwrap());
@@ -1135,9 +1144,18 @@ mod tests {
         )
         .unwrap();
         let mut builder = DeviceGraphBuilder::new();
+        builder
+            .add(DeviceNodeSpec::firmware_only(
+                DeviceNodeId::new("controller").unwrap(),
+            ))
+            .unwrap();
         builder.add(node).unwrap();
         let requests = builder.requests().unwrap();
-        let requirements = requests[0].requirements();
+        let requirements = requests
+            .iter()
+            .find(|request| request.id() == "disk0")
+            .unwrap()
+            .requirements();
         assert!(requirements.pci_function().is_none());
         assert_eq!(requirements.entries().len(), 2);
     }

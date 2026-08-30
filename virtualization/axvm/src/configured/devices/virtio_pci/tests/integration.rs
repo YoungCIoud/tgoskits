@@ -16,6 +16,106 @@ struct BlockEndpointContext {
     active_dma_grant: Option<DmaGrant>,
 }
 
+#[test]
+fn serialized_virtio_block_config_passes_ovmf_modern_probe() {
+    let (root, binding, bdf, _runtime) = build_bound_endpoint();
+    let mut context = TestEndpointContext::new();
+    let mut config = [0_u8; 0x100];
+    let pci_cfg_offset = usize::from(
+        root.topology()
+            .function(&node("virtio-pci"))
+            .expect("VirtIO PCI function is present")
+            .capabilities()
+            .nth(4)
+            .expect("VirtIO PCI_CFG capability is present")
+            .offset()
+            .value(),
+    );
+    for (offset, byte) in config.iter_mut().enumerate() {
+        if (pci_cfg_offset + 16..pci_cfg_offset + 20).contains(&offset) {
+            // `pci_cfg_data` is an effect register, not a static image byte;
+            // without a guest-selected target it has no readable value.  Its
+            // capability header and selectors are validated below, while the
+            // data window remains zero in this power-on probe image.
+            continue;
+        }
+        *byte = binding
+            .read_config_with_context(
+                bdf,
+                ConfigOffset::new(offset as u16).expect("conventional config offset is valid"),
+                AccessWidth::Byte,
+                &mut context,
+            )
+            .expect("serialized PCI config byte should be readable") as u8;
+    }
+
+    // These are the identity predicates used by OVMF's modern VirtIO PCI
+    // binding.  The device type is derived from Device ID, not Subsystem ID.
+    assert_eq!(u16::from_le_bytes([config[0], config[1]]), 0x1af4);
+    let device_id = u16::from_le_bytes([config[2], config[3]]);
+    assert!(
+        (0x1040..=0x107f).contains(&device_id),
+        "unexpected VirtIO modern device ID: {device_id:#06x}"
+    );
+    assert_eq!(device_id - 0x1040, 2, "device must be VirtIO Block");
+    assert!(config[0x08] >= 1, "modern VirtIO requires revision >= 1");
+    assert_eq!(u16::from_le_bytes([config[0x2c], config[0x2d]]), 0x1af4);
+    assert_eq!(u16::from_le_bytes([config[0x2e], config[0x2f]]), 0x1042);
+    assert_ne!(config[0x06] & 0x10, 0, "capability list must be advertised");
+
+    let mut pointer = config[0x34] as usize;
+    let mut visited = [false; 0x100];
+    let mut capabilities = Vec::new();
+    while pointer != 0 {
+        assert!(pointer >= 0x40 && pointer.is_multiple_of(4));
+        assert!(pointer + 2 <= config.len());
+        assert!(!visited[pointer], "capability list contains a cycle");
+        visited[pointer] = true;
+        assert_eq!(
+            config[pointer], 0x09,
+            "VirtIO capabilities are vendor-specific"
+        );
+
+        let cap_len = config[pointer + 2] as usize;
+        assert!(matches!(cap_len, 16 | 20));
+        assert!(pointer + cap_len <= config.len());
+        let cfg_type = config[pointer + 3];
+        let bar = config[pointer + 4];
+        let offset = u32::from_le_bytes(
+            config[pointer + 8..pointer + 12]
+                .try_into()
+                .expect("VirtIO capability offset has four bytes"),
+        );
+        let length = u32::from_le_bytes(
+            config[pointer + 12..pointer + 16]
+                .try_into()
+                .expect("VirtIO capability length has four bytes"),
+        );
+        let multiplier = if cap_len == 20 {
+            u32::from_le_bytes(
+                config[pointer + 16..pointer + 20]
+                    .try_into()
+                    .expect("VirtIO notify multiplier has four bytes"),
+            )
+        } else {
+            0
+        };
+        capabilities.push((cfg_type, cap_len, bar, offset, length, multiplier));
+        pointer = config[pointer + 1] as usize;
+    }
+
+    assert_eq!(
+        capabilities,
+        vec![
+            (1, 16, 0, 0x000, 0x38, 0),
+            (2, 20, 0, 0x100, 0x04, 4),
+            (3, 16, 0, 0x200, 0x01, 0),
+            (4, 16, 0, 0x300, 16, 0),
+            (5, 20, 0, 0x000, 0, 0),
+        ]
+    );
+}
+
 const READ_DATA: usize = 0x4400;
 
 impl BlockEndpointContext {
