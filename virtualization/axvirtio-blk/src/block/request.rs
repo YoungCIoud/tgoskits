@@ -97,6 +97,8 @@ impl<B: BlockBackend> VirtioBlockRequestCore<B> {
                 head
             } else if let Some(head) = queue.pop_available_head_with_memory(memory)? {
                 head
+            } else if queue.rearm_available_event_with_memory(memory)? {
+                continue;
             } else {
                 break;
             };

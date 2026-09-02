@@ -4,14 +4,15 @@
 //! configuration accepts the synchronous ramdisk backend.
 
 #[cfg(feature = "fs")]
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::sync::atomic::AtomicUsize;
+use core::sync::atomic::{AtomicBool, Ordering};
 #[cfg(feature = "fs")]
 use std::collections::VecDeque;
 use std::{
     boxed::Box,
     format,
     string::String,
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{Arc, Mutex},
     vec,
     vec::Vec,
 };
@@ -25,8 +26,7 @@ use axvirtio_blk::{
     BlockBackend, BlockDeviceEvent, VirtioBlockConfig, VirtioBlockPciAdapter, VirtioMmioBlockDevice,
 };
 use axvirtio_common::{
-    GuestMemory, NoGuestMemoryAccessor, VirtioError, VirtioQueueGeneration, VirtioResult,
-    map_virtio_error,
+    GuestMemory, NoGuestMemoryAccessor, VirtioError, VirtioResult, map_virtio_error,
 };
 use axvm_types::GuestPhysAddr;
 use axvmconfig::VirtualDeviceRequest;
@@ -417,7 +417,7 @@ impl DeviceModel for VirtioBlkModel {
                     model,
                     irq,
                     grant: grant.clone(),
-                    queue_pending: PendingQueueNotification::new(),
+                    queue_pending: AtomicBool::new(false),
                     resources: vec![
                         Resource::MmioRange { base, size },
                         Resource::IrqLine {
@@ -837,66 +837,8 @@ struct VirtioBlkRuntimeDevice {
     model: Arc<VirtioMmioBlockDevice<VirtioBlkBackend, NoGuestMemoryAccessor>>,
     irq: IrqLine,
     grant: DmaGrant,
-    queue_pending: PendingQueueNotification,
+    queue_pending: AtomicBool,
     resources: Box<[Resource]>,
-}
-
-/// Deferred queue work and its generation form one schedulable state.
-///
-/// The generation is updated monotonically while holding the same lock as the
-/// pending marker, so an old notification that arrives late cannot overwrite a
-/// newer notification and hide it from the poller.
-struct PendingQueueNotification {
-    generation: Mutex<Option<VirtioQueueGeneration>>,
-}
-
-impl PendingQueueNotification {
-    fn new() -> Self {
-        Self {
-            generation: Mutex::new(None),
-        }
-    }
-
-    /// Recovers the pending state after a poisoned lock instead of turning a
-    /// deferred notification into a permanent panic path.
-    fn lock(&self) -> MutexGuard<'_, Option<VirtioQueueGeneration>> {
-        self.generation
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
-    fn record(&self, generation: VirtioQueueGeneration) {
-        let mut pending = self.lock();
-        let replace = match *pending {
-            None => true,
-            Some(current) => current == generation || is_newer_generation(generation, current),
-        };
-        if replace {
-            *pending = Some(generation);
-        }
-    }
-
-    fn take(&self) -> Option<VirtioQueueGeneration> {
-        self.lock().take()
-    }
-
-    fn clear_before(&self, reset_generation: VirtioQueueGeneration) {
-        let mut pending = self.lock();
-        let clear = match *pending {
-            Some(current) => {
-                current != reset_generation && is_newer_generation(reset_generation, current)
-            }
-            None => false,
-        };
-        if clear {
-            *pending = None;
-        }
-    }
-}
-
-fn is_newer_generation(candidate: VirtioQueueGeneration, current: VirtioQueueGeneration) -> bool {
-    let distance = candidate.value().wrapping_sub(current.value());
-    distance != 0 && distance < (1u64 << 63)
 }
 
 impl Device for VirtioBlkRuntimeDevice {
@@ -958,20 +900,15 @@ impl Device for VirtioBlkRuntimeDevice {
                     detail: format!("{error}"),
                 })?
             }
-            BlockDeviceEvent::QueuePending {
-                index: 0,
-                generation,
-            } => {
-                self.queue_pending.record(generation);
-            }
-            BlockDeviceEvent::QueuePending { .. } => {
+            BlockDeviceEvent::QueuePending(0) => self.queue_pending.store(true, Ordering::Release),
+            BlockDeviceEvent::QueuePending(_) => {
                 return Err(DeviceError::InvalidInput {
                     operation: "notify virtio-blk queue",
                     detail: "only queue 0 is supported".into(),
                 });
             }
-            BlockDeviceEvent::Reset { generation } => {
-                self.queue_pending.clear_before(generation);
+            BlockDeviceEvent::Reset => {
+                self.queue_pending.store(false, Ordering::Release);
             }
             BlockDeviceEvent::None => {}
         }
@@ -986,13 +923,13 @@ impl DmaPollableDeviceOps for VirtioBlkRuntimeDevice {
         context: &mut dyn DeviceContext,
         grant: &DmaGrant,
     ) -> DeviceManagerResult {
-        let Some(generation) = self.queue_pending.take() else {
+        if !self.queue_pending.swap(false, Ordering::AcqRel) {
             return Ok(());
-        };
+        }
         let mut memory = ScopedDeviceMemory { context, grant };
         let event = self
             .model
-            .process_pending_queue(0, generation, &mut memory)
+            .process_pending_queue(0, &mut memory)
             .map_err(|error| DeviceManagerError::InvalidState {
                 operation: "process deferred virtio-blk queue",
                 detail: format!("{error:?}"),
@@ -1006,19 +943,16 @@ impl DmaPollableDeviceOps for VirtioBlkRuntimeDevice {
                         detail: format!("{error}"),
                     })?;
             }
-            BlockDeviceEvent::QueuePending {
-                index: 0,
-                generation,
-            } => {
-                self.queue_pending.record(generation);
+            BlockDeviceEvent::QueuePending(0) => {
+                self.queue_pending.store(true, Ordering::Release);
             }
-            BlockDeviceEvent::QueuePending { .. } => {
+            BlockDeviceEvent::QueuePending(_) => {
                 return Err(DeviceManagerError::InvalidState {
                     operation: "process deferred virtio-blk queue",
                     detail: "only queue 0 is supported".into(),
                 });
             }
-            BlockDeviceEvent::None | BlockDeviceEvent::Reset { .. } => {}
+            BlockDeviceEvent::None | BlockDeviceEvent::Reset => {}
         }
         Ok(())
     }
@@ -1158,58 +1092,5 @@ mod tests {
             .requirements();
         assert!(requirements.pci_function().is_none());
         assert_eq!(requirements.entries().len(), 2);
-    }
-
-    #[test]
-    fn stale_deferred_notification_cannot_replace_new_generation() {
-        let pending = PendingQueueNotification::new();
-        let old_generation = VirtioQueueGeneration::from_value(0);
-        let new_generation = VirtioQueueGeneration::from_value(1);
-
-        pending.record(old_generation);
-        pending.record(new_generation);
-        pending.record(old_generation);
-
-        assert_eq!(pending.take(), Some(new_generation));
-    }
-
-    #[test]
-    fn reset_does_not_clear_new_generation_pending_notification() {
-        let pending = PendingQueueNotification::new();
-        let old_generation = VirtioQueueGeneration::from_value(0);
-        let new_generation = VirtioQueueGeneration::from_value(1);
-
-        pending.record(old_generation);
-        pending.record(new_generation);
-        pending.clear_before(new_generation);
-
-        assert_eq!(pending.take(), Some(new_generation));
-
-        let pending = PendingQueueNotification::new();
-        pending.record(old_generation);
-        pending.clear_before(new_generation);
-
-        assert_eq!(pending.take(), None);
-
-        let pending = PendingQueueNotification::new();
-        pending.record(new_generation);
-        pending.clear_before(new_generation);
-
-        assert_eq!(pending.take(), Some(new_generation));
-    }
-
-    #[test]
-    fn poisoned_pending_lock_remains_usable() {
-        let pending = Arc::new(PendingQueueNotification::new());
-        let poisoned = Arc::clone(&pending);
-        let join = std::thread::spawn(move || {
-            let _guard = poisoned.generation.lock().unwrap();
-            panic!("poison the pending notification lock");
-        });
-        assert!(join.join().is_err());
-
-        let generation = VirtioQueueGeneration::from_value(1);
-        pending.record(generation);
-        assert_eq!(pending.take(), Some(generation));
     }
 }

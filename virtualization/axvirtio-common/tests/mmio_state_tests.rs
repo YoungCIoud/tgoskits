@@ -1,16 +1,11 @@
 //! Shared MMIO transport state tests (plan section 13.2).
 
-use std::{
-    sync::{Arc, mpsc},
-    thread,
-    time::Duration,
-};
+use std::sync::Arc;
 
 use ax_memory_addr::PhysAddr;
 use axaddrspace::GuestMemoryAccessor;
 use axvirtio_common::{
-    GuestMemory, MmioReadOutcome, MmioWriteAction, VirtioError, VirtioMmioState, VirtioQueue,
-    constants as vc,
+    MmioReadOutcome, MmioWriteAction, VirtioMmioState, VirtioQueue, constants as vc,
 };
 use axvm_types::{AccessWidth, GuestPhysAddr};
 
@@ -210,14 +205,9 @@ fn accepted_features_are_sealed_until_transport_reset() {
 #[test]
 fn queue_notify_returns_action() {
     let s = state(0);
-    s.set_status(vc::VIRTIO_STATUS_DRIVER_OK);
-    let generation = s.queue_generation();
     assert_eq!(
         wr(&s, vc::VIRTIO_MMIO_QUEUE_NOTIFY, 0),
-        MmioWriteAction::QueueNotified {
-            index: 0,
-            generation,
-        }
+        MmioWriteAction::QueueNotified(0)
     );
 }
 
@@ -227,299 +217,12 @@ fn status_zero_resets() {
     wr(&s, vc::VIRTIO_MMIO_DRIVER_FEATURES_SEL, 0);
     wr(&s, vc::VIRTIO_MMIO_DRIVER_FEATURES, 0x1234);
     assert_eq!(wr(&s, vc::VIRTIO_MMIO_STATUS, 0), MmioWriteAction::Reset);
-    s.complete_reset().unwrap();
     assert_eq!(rd(&s, vc::VIRTIO_MMIO_STATUS), 0);
     wr(&s, vc::VIRTIO_MMIO_DRIVER_FEATURES_SEL, 0);
     assert_eq!(
         rd(&s, vc::VIRTIO_MMIO_DRIVER_FEATURES),
         0,
         "reset must clear driver features"
-    );
-}
-
-#[test]
-fn queue_processing_lease_excludes_duplicate_and_reset_state_revival() {
-    let s = state(0);
-    wr(&s, vc::VIRTIO_MMIO_QUEUE_SEL, 0);
-    wr(&s, vc::VIRTIO_MMIO_QUEUE_NUM, 4);
-    s.set_status(vc::VIRTIO_STATUS_DRIVER_OK);
-
-    let mut lease = s
-        .take_queue_for_processing(0, s.queue_generation())
-        .expect("the first queue processor must acquire the queue");
-    assert!(
-        s.take_queue_for_processing(0, lease.generation()).is_none(),
-        "a second MMIO processor must not take the same queue"
-    );
-
-    // Queue configuration writes target only the temporary placeholder while
-    // processing owns the real queue; they must not mutate the owned queue.
-    wr(&s, vc::VIRTIO_MMIO_QUEUE_NUM, 8);
-    assert_eq!(lease.queue().expect("lease owns queue").size, 4);
-    assert!(matches!(s.reset(), Err(VirtioError::WouldBlock)));
-    assert_eq!(s.status(), vc::VIRTIO_STATUS_DRIVER_OK);
-
-    lease.restore_queue();
-    drop(lease);
-    assert!(s.reset().is_ok());
-    assert_eq!(s.status(), 0);
-    assert!(
-        s.take_queue_for_processing(0, s.queue_generation())
-            .is_none(),
-        "a reset queue must not be admitted before DRIVER_OK"
-    );
-    s.set_status(vc::VIRTIO_STATUS_DRIVER_OK);
-    assert!(
-        s.take_queue_for_processing(0, s.queue_generation())
-            .is_some()
-    );
-}
-
-#[test]
-fn queue_reads_and_writes_are_serialized_with_processing_lease() {
-    let s = state(0);
-    wr(&s, vc::VIRTIO_MMIO_QUEUE_SEL, 0);
-    wr(&s, vc::VIRTIO_MMIO_QUEUE_NUM, 4);
-    s.set_status(vc::VIRTIO_STATUS_DRIVER_OK);
-
-    let mut lease = s
-        .take_queue_for_processing(0, s.queue_generation())
-        .expect("the queue operation must acquire the queue");
-    let original_size = lease.queue().expect("lease owns queue").size;
-    let original_desc = lease.queue().expect("lease owns queue").desc_table_addr;
-
-    wr(&s, vc::VIRTIO_MMIO_QUEUE_NUM, 8);
-    wr(&s, vc::VIRTIO_MMIO_QUEUE_DESC_LOW, 0x1000);
-    assert_eq!(rd(&s, vc::VIRTIO_MMIO_QUEUE_NUM), original_size as u32);
-    assert_eq!(lease.queue().expect("lease owns queue").size, original_size);
-    assert_eq!(
-        lease.queue().expect("lease owns queue").desc_table_addr,
-        original_desc
-    );
-
-    lease.restore_queue();
-    assert!(lease.queue().is_none());
-    assert!(lease.queue_mut().is_none());
-}
-
-struct ReentrantMemory {
-    state: Arc<VirtioMmioState<Mem>>,
-    backing: Mem,
-}
-
-impl GuestMemory for ReentrantMemory {
-    fn read(
-        &mut self,
-        guest_addr: GuestPhysAddr,
-        data: &mut [u8],
-    ) -> axvirtio_common::VirtioResult<()> {
-        let (done, result) = mpsc::channel();
-        let state = Arc::clone(&self.state);
-        thread::spawn(move || {
-            let readable = state
-                .mmio_read(
-                    GuestPhysAddr::from(BASE + vc::VIRTIO_MMIO_QUEUE_NUM),
-                    AccessWidth::Dword,
-                )
-                .is_ok();
-            let _ = done.send(readable);
-        });
-        if !result
-            .recv_timeout(Duration::from_millis(100))
-            .unwrap_or(false)
-        {
-            return Err(VirtioError::MemoryError);
-        }
-
-        let offset = guest_addr.as_usize();
-        let Some(end) = offset.checked_add(data.len()) else {
-            return Err(VirtioError::InvalidAddress);
-        };
-        let Some(source) = self.backing.buf.get(offset..end) else {
-            return Err(VirtioError::InvalidAddress);
-        };
-        data.copy_from_slice(source);
-        Ok(())
-    }
-
-    fn write(
-        &mut self,
-        guest_addr: GuestPhysAddr,
-        data: &[u8],
-    ) -> axvirtio_common::VirtioResult<()> {
-        let offset = guest_addr.as_usize();
-        let Some(end) = offset.checked_add(data.len()) else {
-            return Err(VirtioError::InvalidAddress);
-        };
-        let Some(destination) =
-            Arc::get_mut(&mut self.backing.buf).and_then(|buf| buf.get_mut(offset..end))
-        else {
-            return Err(VirtioError::InvalidAddress);
-        };
-        destination.copy_from_slice(data);
-        Ok(())
-    }
-}
-
-struct BlockingMemory {
-    backing: Mem,
-    started: Option<mpsc::Sender<()>>,
-    release: mpsc::Receiver<()>,
-}
-
-impl GuestMemory for BlockingMemory {
-    fn read(
-        &mut self,
-        guest_addr: GuestPhysAddr,
-        data: &mut [u8],
-    ) -> axvirtio_common::VirtioResult<()> {
-        if let Some(started) = self.started.take() {
-            started.send(()).unwrap();
-            self.release.recv().unwrap();
-        }
-
-        let offset = guest_addr.as_usize();
-        let Some(end) = offset.checked_add(data.len()) else {
-            return Err(VirtioError::InvalidAddress);
-        };
-        let Some(source) = self.backing.buf.get(offset..end) else {
-            return Err(VirtioError::InvalidAddress);
-        };
-        data.copy_from_slice(source);
-        Ok(())
-    }
-
-    fn write(
-        &mut self,
-        _guest_addr: GuestPhysAddr,
-        _data: &[u8],
-    ) -> axvirtio_common::VirtioResult<()> {
-        Err(VirtioError::InvalidAddress)
-    }
-}
-
-#[test]
-fn queue_ready_validates_memory_without_holding_queue_lock() {
-    let state = Arc::new(state(0));
-    for (reg, val) in [
-        (vc::VIRTIO_MMIO_QUEUE_SEL, 0),
-        (vc::VIRTIO_MMIO_QUEUE_NUM, 4),
-        (vc::VIRTIO_MMIO_QUEUE_DESC_LOW, 0x1000),
-        (vc::VIRTIO_MMIO_QUEUE_AVAIL_LOW, 0x2000),
-        (vc::VIRTIO_MMIO_QUEUE_USED_LOW, 0x3000),
-    ] {
-        wr(&state, reg, val);
-    }
-
-    let backing = mem();
-    let mut memory = ReentrantMemory {
-        state: Arc::clone(&state),
-        backing,
-    };
-    state
-        .mmio_write_with_memory(
-            GuestPhysAddr::from(BASE + vc::VIRTIO_MMIO_QUEUE_READY),
-            AccessWidth::Dword,
-            1,
-            &mut memory,
-        )
-        .unwrap();
-
-    assert_eq!(rd(&state, vc::VIRTIO_MMIO_QUEUE_READY), 1);
-}
-
-#[test]
-fn queue_ready_validation_rejects_stale_generation() {
-    let state = Arc::new(state(0));
-    for (reg, val) in [
-        (vc::VIRTIO_MMIO_QUEUE_SEL, 0),
-        (vc::VIRTIO_MMIO_QUEUE_NUM, 4),
-        (vc::VIRTIO_MMIO_QUEUE_DESC_LOW, 0x1000),
-        (vc::VIRTIO_MMIO_QUEUE_AVAIL_LOW, 0x2000),
-        (vc::VIRTIO_MMIO_QUEUE_USED_LOW, 0x3000),
-    ] {
-        wr(&state, reg, val);
-    }
-
-    let (started_tx, started_rx) = mpsc::channel();
-    let (release_tx, release_rx) = mpsc::channel();
-    let mut memory = BlockingMemory {
-        backing: mem(),
-        started: Some(started_tx),
-        release: release_rx,
-    };
-    let worker_state = Arc::clone(&state);
-    let worker = thread::spawn(move || {
-        worker_state
-            .mmio_write_with_memory(
-                GuestPhysAddr::from(BASE + vc::VIRTIO_MMIO_QUEUE_READY),
-                AccessWidth::Dword,
-                1,
-                &mut memory,
-            )
-            .unwrap()
-    });
-
-    started_rx
-        .recv_timeout(Duration::from_millis(100))
-        .expect("QUEUE_READY validation must reach guest memory");
-    state.reset().unwrap();
-    for (reg, val) in [
-        (vc::VIRTIO_MMIO_QUEUE_SEL, 0),
-        (vc::VIRTIO_MMIO_QUEUE_NUM, 4),
-        (vc::VIRTIO_MMIO_QUEUE_DESC_LOW, 0x1000),
-        (vc::VIRTIO_MMIO_QUEUE_AVAIL_LOW, 0x2000),
-        (vc::VIRTIO_MMIO_QUEUE_USED_LOW, 0x3000),
-    ] {
-        wr(&state, reg, val);
-    }
-    release_tx.send(()).unwrap();
-
-    assert_eq!(worker.join().unwrap(), MmioWriteAction::None);
-    assert_eq!(rd(&state, vc::VIRTIO_MMIO_QUEUE_READY), 0);
-}
-
-#[test]
-fn queue_activity_covers_interrupt_publication() {
-    let s = state(0);
-    s.set_status(vc::VIRTIO_STATUS_DRIVER_OK);
-    let mut lease = s
-        .take_queue_for_processing(0, s.queue_generation())
-        .expect("the queue operation must acquire activity");
-
-    // The queue can be returned before the interrupt bit is published, but
-    // the lease must remain alive so reset cannot clear that publication.
-    lease.restore_queue();
-    s.set_interrupt(vc::VIRTIO_MMIO_INT_VRING);
-    assert!(matches!(s.reset(), Err(VirtioError::WouldBlock)));
-    assert_eq!(s.interrupt_status(), vc::VIRTIO_MMIO_INT_VRING);
-
-    drop(lease);
-    s.reset()
-        .expect("reset should proceed after interrupt publication");
-    assert_eq!(s.status(), 0);
-    assert_eq!(s.interrupt_status(), 0);
-}
-
-#[test]
-fn stale_mmio_generation_cannot_admit_after_reset() {
-    let s = state(0);
-    s.set_status(vc::VIRTIO_STATUS_DRIVER_OK);
-    let old_generation = s.queue_generation();
-
-    s.reset()
-        .expect("reset should advance the queue generation");
-    s.set_status(vc::VIRTIO_STATUS_DRIVER_OK);
-
-    assert_ne!(s.queue_generation(), old_generation);
-    assert!(
-        s.take_queue_for_processing(0, old_generation).is_none(),
-        "a pre-reset notification must not enter the new queue generation"
-    );
-    assert!(
-        s.take_queue_for_processing(0, s.queue_generation())
-            .is_some(),
-        "the current queue generation remains admissible"
     );
 }
 

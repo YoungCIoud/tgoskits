@@ -66,7 +66,6 @@ let device = VirtioMmioNetDevice::new(
 match device.mmio_write(addr, width, value)? {
     DeviceEvent::InterruptPending => { /* VMM injects a virtual IRQ */ }
     DeviceEvent::Reset => { /* device fully reset */ }
-    DeviceEvent::QueueFaulted => { /* guest reset required */ }
     DeviceEvent::None => {}
 }
 let v = device.mmio_read(addr, width)?;
