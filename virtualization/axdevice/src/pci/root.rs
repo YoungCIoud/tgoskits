@@ -493,11 +493,23 @@ impl PciRootState {
         }
     }
 
-    pub(crate) fn unbind_device(&self, device: DeviceId) {
-        self.state
-            .lock_irqsave()
-            .bindings
-            .retain(|_, token| token.device_id() != device);
+    /// Revokes the root route for one stable endpoint binding identity.
+    ///
+    /// The admission epoch is intentionally not part of this match: a full
+    /// lifecycle reset replaces the epoch while preserving the binding
+    /// generation.  Matching the generation as well as the device prevents a
+    /// stale lease from removing a later binding for the same device.
+    pub(crate) fn unbind_route_for_binding(&self, route: &EndpointRouteToken) {
+        let device = route.device_id();
+        let binding_generation = route.binding_generation();
+        self.state.lock_irqsave().bindings.retain(|_, token| {
+            token.device_id() != device || token.binding_generation() != binding_generation
+        });
+    }
+
+    /// Revokes every root route before router teardown starts.
+    pub(crate) fn unbind_all_routes(&self) {
+        self.state.lock_irqsave().bindings.clear();
     }
 
     /// Restores every function's root-owned power-on config and BAR route.

@@ -10,7 +10,7 @@ use super::{
         EndpointIrqTransitionPermit, LegacyPciEndpointContext, OwnerPciEndpointContext,
         PciEndpointContext, PciFunction, RoutedPciEndpointContext,
     },
-    lifecycle::{BindingLifecycleState, PendingIrqWithdrawal},
+    lifecycle::PendingIrqWithdrawal,
     pci_config_error,
 };
 use crate::{
@@ -59,13 +59,10 @@ impl PciRootBinding {
     pub(crate) fn reset_lifecycle(&self) -> DeviceManagerResult {
         let operation = self.begin_reset_operation()?;
         let result = self.reset_routes();
-        if result.is_err()
-            && let Err(error) = self.router.close_admissions_and_drain()
-        {
-            warn!("PCI reset failure cleanup could not drain routed endpoint activity: {error}");
-        }
         if result.is_err() {
-            operation.finish(BindingLifecycleState::ResetFailed);
+            if let Err(error) = operation.finish_reset_failure() {
+                warn!("PCI reset failure handoff could not complete: {error}");
+            }
             return result;
         }
         operation.finish_reset()
@@ -140,7 +137,12 @@ impl PciRootBinding {
             self.rollback_unpublished_endpoint(&token, function);
             return Err(error.into());
         }
-        lifecycle.finish(BindingLifecycleState::Running);
+        if let Err(error) = lifecycle.finish_restore() {
+            // The route publication itself succeeded. Deferred withdrawals
+            // remove their routes before reporting an IRQ cleanup failure, so
+            // retain the new binding while the closed IRQ owner is retried.
+            warn!("PCI binding completion could not finish deferred cleanup: {error}");
+        }
         Ok(PciBindingLease {
             binding: self.clone(),
             token,
