@@ -261,7 +261,7 @@ impl PciRootState {
                 relative,
                 width,
                 snapshot,
-                command.bus_master_enable(),
+                command,
             )),
         })
     }
@@ -364,7 +364,20 @@ impl PciRootState {
                     return Ok(PciConfigWriteOutcome::Complete);
                 }
                 let previous = state.functions[function_index].command_state();
+                let command_changes =
+                    state.functions[function_index].command_write_changes(offset, size, value);
+                if command_changes {
+                    // Check the revision before mutating the config image so
+                    // exhaustion cannot leave a guest-visible partial write.
+                    state.functions[function_index]
+                        .command_state()
+                        .revision()
+                        .next()?;
+                }
                 state.functions[function_index].write_non_bar(offset, size, value);
+                if command_changes {
+                    state.functions[function_index].bump_command_revision()?;
+                }
                 let command = state.functions[function_index].command_state();
                 let command_changed = previous.bus_master_enable() != command.bus_master_enable()
                     || previous.interrupt_disable() != command.interrupt_disable();
@@ -390,7 +403,7 @@ impl PciRootState {
                     relative,
                     width,
                     snapshot,
-                    command.bus_master_enable(),
+                    command,
                 ),
                 value,
             )),
@@ -488,23 +501,37 @@ impl PciRootState {
     }
 
     /// Restores every function's root-owned power-on config and BAR route.
-    pub fn reset(&self) {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PciError::CommandRevisionExhausted`] if a command snapshot
+    /// revision cannot advance without wrapping.
+    pub fn reset(&self) -> PciResult {
         let mut state = self.state.lock_irqsave();
+        for function in &state.functions {
+            function.command_state().revision().next()?;
+        }
         state.pending_bindings.clear();
         for function in &mut state.functions {
-            function.reset();
+            function.reset()?
         }
+        Ok(())
     }
 
     /// Resets root-owned state and snapshots the fresh command state for all
     /// currently bound endpoint device identities.
-    pub(crate) fn reset_and_snapshot_commands(&self) -> Vec<(DeviceId, PciCommandState)> {
+    pub(crate) fn reset_and_snapshot_commands(
+        &self,
+    ) -> PciResult<Vec<(DeviceId, PciCommandState)>> {
         let mut state = self.state.lock_irqsave();
+        for function in &state.functions {
+            function.command_state().revision().next()?;
+        }
         state.pending_bindings.clear();
         for function in &mut state.functions {
-            function.reset();
+            function.reset()?
         }
-        state
+        Ok(state
             .bindings
             .iter()
             .filter_map(|(bdf, token)| {
@@ -514,7 +541,7 @@ impl PciRootState {
                     .find(|function| function.bdf() == *bdf)
                     .map(|function| (token.device_id(), function.command_state()))
             })
-            .collect()
+            .collect())
     }
 }
 

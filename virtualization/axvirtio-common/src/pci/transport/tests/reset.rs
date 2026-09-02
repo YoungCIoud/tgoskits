@@ -161,6 +161,79 @@ fn reset_waits_for_command_interrupt_transition() {
 }
 
 #[test]
+fn command_disable_commits_before_reset_closes_activity() {
+    let allow_reset = StdArc::new(AtomicBool::new(false));
+    let transport = StdArc::new(
+        VirtioPciTransport::try_new(BlockingResetCore {
+            entered: StdArc::new(Barrier::new(1)),
+            release: StdArc::new(Barrier::new(1)),
+            reset_calls: StdArc::new(AtomicUsize::new(0)),
+            allow_reset: Some(StdArc::clone(&allow_reset)),
+        })
+        .expect("valid test transport"),
+    );
+    let entered = StdArc::new(Barrier::new(2));
+    let release = StdArc::new(Barrier::new(2));
+    let hook_entered = StdArc::clone(&entered);
+    let hook_release = StdArc::clone(&release);
+    transport.set_reset_before_core_hook(move || {
+        hook_entered.wait();
+        hook_release.wait();
+    });
+    let reset_transport = StdArc::clone(&transport);
+    let reset = thread::spawn(move || reset_transport.reset());
+    entered.wait();
+
+    assert!(matches!(
+        transport.set_interrupt_disabled(true),
+        Err(DeviceError::InvalidState { .. })
+    ));
+    allow_reset.store(true, Ordering::Release);
+    release.wait();
+    let reset_transition = reset.join().expect("reset thread should finish").unwrap();
+    assert_eq!(reset_transition, InterruptTransition::None);
+    transport.complete_reset();
+
+    // The failed physical synchronization did not roll back the logical
+    // INTx-disable command. A completion therefore records ISR state without
+    // requesting an assertion; re-enabling later produces the pending assert.
+    assert_eq!(transport.record_interrupt(false), InterruptTransition::None);
+    let transition = transport
+        .set_interrupt_disabled(false)
+        .expect("control activity should be reopened after reset");
+    assert_eq!(transition.transition(), InterruptTransition::Assert);
+    transport.complete_interrupt_transition(transition.transition(), true);
+}
+
+#[test]
+fn stale_command_transition_is_suppressed_after_reset() {
+    let transport = VirtioPciTransport::try_new(TestCore).expect("valid test transport");
+    let disabled = transport.update_interrupt_disabled_logical(true);
+    assert_eq!(disabled.transition(), InterruptTransition::None);
+    assert!(!transport.interrupt_pending());
+
+    assert_eq!(transport.record_interrupt(false), InterruptTransition::None);
+    let intent = transport.update_interrupt_disabled_logical(false);
+    assert_eq!(intent.transition(), InterruptTransition::Assert);
+
+    assert_eq!(
+        transport.reset().expect("reset should succeed"),
+        InterruptTransition::None
+    );
+    transport.complete_reset();
+
+    assert!(
+        transport
+            .admit_interrupt_transition(intent)
+            .expect("stale intent admission should be classified")
+            .is_none()
+    );
+    assert!(!transport.interrupt_pending());
+    assert!(!transport.interrupts.asserted());
+    assert!(!transport.interrupts.needs_resync());
+}
+
+#[test]
 fn reset_waits_for_isr_read_transition() {
     let allow_reset = StdArc::new(AtomicBool::new(false));
     let transport = StdArc::new(

@@ -457,7 +457,7 @@ fn reset_restores_root_owned_command_bar_and_route_state() {
         .unwrap();
     assert!(root.resolve_bar(relocated, AccessWidth::Byte).is_some());
 
-    root.reset();
+    root.reset().unwrap();
 
     assert_eq!(
         root.read_config(endpoint_bdf, offset(4), AccessWidth::Word)

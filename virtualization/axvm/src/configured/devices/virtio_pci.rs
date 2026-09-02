@@ -1,8 +1,11 @@
 //! AxVM-owned adapter from VirtIO transport state to a generic PCI endpoint.
 
+#[cfg(test)]
+use std::sync::Arc;
 use std::vec::Vec;
 
-use axdevice::PciConfigEffectId;
+use ax_sync::SpinLock;
+use axdevice::{PciCommandRevision, PciConfigEffectId};
 use axdevice_base::{DeviceResult, DmaGrant, IrqLine, Resource};
 use axvirtio_common::pci::{VIRTIO_PCI_CONFIG_EFFECT_ID, VirtioDeviceCore, VirtioPciTransport};
 
@@ -21,6 +24,9 @@ pub struct VirtioPciFunction<D: VirtioDeviceCore> {
     pub(super) dma_grant: DmaGrant,
     pub(super) irq_line: IrqLine,
     pub(super) resources: Vec<Resource>,
+    pub(super) command_revision: SpinLock<Option<PciCommandRevision>>,
+    #[cfg(test)]
+    pub(super) command_revision_hook: SpinLock<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 impl<D: VirtioDeviceCore> VirtioPciFunction<D> {
@@ -40,12 +46,31 @@ impl<D: VirtioDeviceCore> VirtioPciFunction<D> {
             dma_grant,
             irq_line,
             resources: Vec::new(),
+            command_revision: SpinLock::new(None),
+            #[cfg(test)]
+            command_revision_hook: SpinLock::new(None),
         })
     }
 
     /// Returns the shared transport.
     pub fn transport(&self) -> &VirtioPciTransport<D> {
         &self.transport
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_command_revision_hook<F>(&self, hook: F)
+    where
+        F: Fn() + Send + Sync + 'static,
+    {
+        *self.command_revision_hook.lock() = Some(Arc::new(hook));
+    }
+
+    #[cfg(test)]
+    pub(super) fn notify_command_revision_hook(&self) {
+        let hook = self.command_revision_hook.lock().clone();
+        if let Some(hook) = hook {
+            hook();
+        }
     }
 }
 

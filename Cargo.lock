@@ -1636,6 +1636,7 @@ dependencies = [
  "ax-memory-set",
  "ax-plat",
  "ax-std",
+ "ax-sync",
  "axaddrspace",
  "axdevice",
  "axdevice_base",

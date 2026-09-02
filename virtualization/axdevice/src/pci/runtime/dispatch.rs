@@ -73,7 +73,10 @@ impl PciRootBinding {
 
     fn reset_routes(&self) -> DeviceManagerResult {
         let replacements = self.router.reset_admissions()?;
-        let commands = self.root.reset_and_snapshot_commands();
+        let commands = self
+            .root
+            .reset_and_snapshot_commands()
+            .map_err(DeviceManagerError::Pci)?;
         self.router.reset_endpoints(&commands)?;
         self.root.replace_endpoint_tokens(&replacements);
         Ok(())
@@ -249,10 +252,7 @@ impl PciRootBinding {
             .resolve_bound_bar(address, width)
             .ok_or(DeviceError::NotFound)?;
         self.dispatch_legacy(&token, command.bus_master_enable(), |endpoint, context| {
-            endpoint.read_bar(
-                PciBarAccess::new(route, command.bus_master_enable()),
-                context,
-            )
+            endpoint.read_bar(PciBarAccess::new(route, command), context)
         })
     }
 
@@ -271,12 +271,7 @@ impl PciRootBinding {
             &token,
             command.bus_master_enable(),
             context,
-            |endpoint, context| {
-                endpoint.read_bar(
-                    PciBarAccess::new(route, command.bus_master_enable()),
-                    context,
-                )
-            },
+            |endpoint, context| endpoint.read_bar(PciBarAccess::new(route, command), context),
         )
     }
 
@@ -287,11 +282,7 @@ impl PciRootBinding {
             .resolve_bound_bar(address, width)
             .ok_or(DeviceError::NotFound)?;
         self.dispatch_legacy(&token, command.bus_master_enable(), |endpoint, context| {
-            endpoint.write_bar(
-                PciBarAccess::new(route, command.bus_master_enable()),
-                value,
-                context,
-            )
+            endpoint.write_bar(PciBarAccess::new(route, command), value, context)
         })
     }
 
@@ -312,11 +303,7 @@ impl PciRootBinding {
             command.bus_master_enable(),
             context,
             |endpoint, context| {
-                endpoint.write_bar(
-                    PciBarAccess::new(route, command.bus_master_enable()),
-                    value,
-                    context,
-                )
+                endpoint.write_bar(PciBarAccess::new(route, command), value, context)
             },
         )
     }

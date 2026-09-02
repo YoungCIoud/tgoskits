@@ -10,7 +10,7 @@ pub use capability::{
 };
 pub use interrupt::{InterruptReadOutcome, InterruptTransition, VirtioPciInterruptCoordinator};
 pub use transport::{
-    ActivityPermit, InterruptPublicationRequest, InterruptTransitionRequest, QueueNotification,
-    QueueNotifyOutcome, VirtioDeviceCore, VirtioPciTransport, VirtioPciWriteOutcome,
-    VirtioQueueGeneration,
+    ActivityPermit, InterruptPublicationRequest, InterruptTransitionIntent,
+    InterruptTransitionRequest, QueueNotification, QueueNotifyOutcome, VirtioDeviceCore,
+    VirtioPciTransport, VirtioPciWriteOutcome, VirtioQueueGeneration,
 };

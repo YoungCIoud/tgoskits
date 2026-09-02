@@ -136,6 +136,36 @@ impl InterruptPublicationRequest {
     }
 }
 
+/// Immutable Command.INTx transition intent bound to one VirtIO queue
+/// generation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InterruptTransitionIntent {
+    transition: InterruptTransition,
+    generation: VirtioQueueGeneration,
+}
+
+impl InterruptTransitionIntent {
+    pub(super) const fn new(
+        transition: InterruptTransition,
+        generation: VirtioQueueGeneration,
+    ) -> Self {
+        Self {
+            transition,
+            generation,
+        }
+    }
+
+    /// Returns the physical transition that may be published for this intent.
+    pub const fn transition(self) -> InterruptTransition {
+        self.transition
+    }
+
+    /// Returns the VirtIO queue generation captured with this intent.
+    pub const fn generation(self) -> VirtioQueueGeneration {
+        self.generation
+    }
+}
+
 /// Identity of one queue configuration lifetime.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct VirtioQueueGeneration(pub(super) u64);

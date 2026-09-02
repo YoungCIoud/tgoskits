@@ -25,6 +25,8 @@ impl<D: VirtioDeviceCore> VirtioPciTransport<D> {
                 detail: "queue activity did not drain before the bounded limit".into(),
             });
         }
+        #[cfg(test)]
+        self.run_reset_before_core_hook();
         if let Err(error) = self.core.reset() {
             self.abort_reset();
             return Err(error);

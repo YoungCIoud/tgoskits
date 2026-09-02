@@ -83,12 +83,12 @@ pub use model::{
 pub use pci::{
     ConfigOffset, EndpointIrqTransitionPermit, PciBarAccess, PciBarIndex, PciBarRoute, PciBdf,
     PciCapabilityByteMode, PciCapabilityEffectAccess, PciCapabilityEffectRegion, PciCapabilityId,
-    PciCapabilityLayout, PciCapabilitySnapshot, PciCapabilitySpec, PciClass, PciCommandState,
-    PciConfigEffectId, PciConfigReadEffect, PciConfigWriteEffect, PciEndpointContext,
-    PciEndpointIdentity, PciError, PciFunction, PciFunctionRequirement, PciFunctionSpec,
-    PciHostKey, PciHostProvider, PciIntxPin, PciIntxRequirement, PciIntxRouter, PciMemoryBar,
-    PciResult, PciRootBinding, PciRootBindingKey, PciRootState, PciSegment, ResolvedPciBar,
-    ResolvedPciFunction, ResolvedPciIntx, ResolvedPciTopology,
+    PciCapabilityLayout, PciCapabilitySnapshot, PciCapabilitySpec, PciClass, PciCommandRevision,
+    PciCommandState, PciConfigEffectId, PciConfigReadEffect, PciConfigWriteEffect,
+    PciEndpointContext, PciEndpointIdentity, PciError, PciFunction, PciFunctionRequirement,
+    PciFunctionSpec, PciHostKey, PciHostProvider, PciIntxPin, PciIntxRequirement, PciIntxRouter,
+    PciMemoryBar, PciResult, PciRootBinding, PciRootBindingKey, PciRootState, PciSegment,
+    ResolvedPciBar, ResolvedPciFunction, ResolvedPciIntx, ResolvedPciTopology,
 };
 pub(crate) use pci::{PciTopologyBuilder, all_ones, read_bytes};
 pub use registration::{
