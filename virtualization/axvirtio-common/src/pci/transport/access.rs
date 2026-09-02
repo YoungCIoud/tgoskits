@@ -159,7 +159,7 @@ impl<D: super::VirtioDeviceCore> VirtioPciTransport<D> {
             }
             MSIX_CONFIG => {
                 require_width(width, AccessWidth::Word)?;
-                Ok(state.msix_config as u64)
+                Ok(u16::MAX as u64)
             }
             NUM_QUEUES => {
                 require_width(width, AccessWidth::Word)?;
@@ -294,11 +294,7 @@ impl<D: super::VirtioDeviceCore> VirtioPciTransport<D> {
                     queue.queue.set_ready(false);
                 }
             }
-            MSIX_CONFIG => {
-                require_width(width, AccessWidth::Word)?;
-                state.msix_config = value as u16;
-            }
-            QUEUE_MSIX_VECTOR => {
+            MSIX_CONFIG | QUEUE_MSIX_VECTOR => {
                 require_width(width, AccessWidth::Word)?;
             }
             DEVICE_FEATURE | NUM_QUEUES | CONFIG_GENERATION | QUEUE_NOTIFY_OFF => {
