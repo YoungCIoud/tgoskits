@@ -538,8 +538,17 @@ fn bound_virtio_endpoint_serializes_dispatches_and_relocates_bar() {
         Ok(split_queue_address)
     );
 
+    for status in [1, 3, 0x0b, 0x0f] {
+        binding
+            .write_bar_with_context(
+                bar.address() + 0x14,
+                AccessWidth::Byte,
+                status,
+                &mut context,
+            )
+            .unwrap();
+    }
     for (offset, width, value) in [
-        (0x14, AccessWidth::Byte, 0x0f),
         (0x20, AccessWidth::Qword, 0x1000),
         (0x28, AccessWidth::Qword, 0x2000),
         (0x30, AccessWidth::Qword, 0x3000),

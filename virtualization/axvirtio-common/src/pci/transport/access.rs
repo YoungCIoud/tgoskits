@@ -1,4 +1,4 @@
-use alloc::{format, sync::Arc};
+use alloc::sync::Arc;
 
 use axdevice_base::{AccessWidth, DeviceError, DeviceResult};
 use axvm_types::GuestPhysAddr;
@@ -11,14 +11,7 @@ use super::{
     QUEUE_SIZE, VirtioPciTransport, VirtioPciWriteOutcome, access_in_region, feature_word,
     invalid_queue, map_pci_error, reject_processing_queue, require_width,
 };
-use crate::{
-    GuestMemory,
-    constants::{
-        VIRTIO_STATUS_ACKNOWLEDGE, VIRTIO_STATUS_DEVICE_NEEDS_RESET, VIRTIO_STATUS_DRIVER,
-        VIRTIO_STATUS_DRIVER_OK, VIRTIO_STATUS_FAILED, VIRTIO_STATUS_FEATURES_OK,
-    },
-    pci::InterruptTransition,
-};
+use crate::{GuestMemory, pci::InterruptTransition};
 
 impl<D: super::VirtioDeviceCore> VirtioPciTransport<D> {
     pub fn read_mmio(&self, offset: u64, width: AccessWidth) -> DeviceResult<u64> {
@@ -250,10 +243,12 @@ impl<D: super::VirtioDeviceCore> VirtioPciTransport<D> {
             }
             DRIVER_FEATURE_SELECT => {
                 require_width(width, AccessWidth::Dword)?;
+                state.ensure_feature_negotiation_open()?;
                 state.driver_feature_select = value as u32;
             }
             DRIVER_FEATURE => {
                 require_width(width, AccessWidth::Dword)?;
+                state.ensure_feature_negotiation_open()?;
                 if state.driver_feature_select > 1 {
                     return Ok(VirtioPciWriteOutcome::None);
                 }
@@ -263,30 +258,7 @@ impl<D: super::VirtioDeviceCore> VirtioPciTransport<D> {
             }
             DEVICE_STATUS => {
                 let status = value as u8;
-                if status
-                    & !(VIRTIO_STATUS_ACKNOWLEDGE
-                        | VIRTIO_STATUS_DRIVER
-                        | VIRTIO_STATUS_DRIVER_OK
-                        | VIRTIO_STATUS_FEATURES_OK
-                        | VIRTIO_STATUS_DEVICE_NEEDS_RESET
-                        | VIRTIO_STATUS_FAILED) as u8
-                    != 0
-                {
-                    return Err(DeviceError::InvalidInput {
-                        operation: "virtio-pci status",
-                        detail: format!("unknown status bits: {status:#x}"),
-                    });
-                }
-                if status & VIRTIO_STATUS_FEATURES_OK as u8 != 0
-                    && (state.driver_features & !self.core.device_features()) != 0
-                {
-                    state.status |= VIRTIO_STATUS_FAILED as u8;
-                } else {
-                    state.status = status & !(VIRTIO_STATUS_DEVICE_NEEDS_RESET as u8);
-                    if state.device_needs_reset {
-                        state.status |= VIRTIO_STATUS_DEVICE_NEEDS_RESET as u8;
-                    }
-                }
+                state.write_driver_status(status, self.core.device_features())?;
             }
             QUEUE_SELECT => {
                 require_width(width, AccessWidth::Word)?;

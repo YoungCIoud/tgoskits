@@ -1,6 +1,10 @@
 use core::cell::Cell;
 use std::{
-    sync::{Arc as StdArc, Barrier, mpsc},
+    sync::{
+        Arc as StdArc, Barrier,
+        atomic::{AtomicUsize, Ordering},
+        mpsc,
+    },
     thread,
 };
 
@@ -10,12 +14,81 @@ use super::{super::*, fixtures::*};
 use crate::VIRTIO_STATUS_DEVICE_NEEDS_RESET;
 
 #[test]
+fn failed_status_stops_queue_processing() {
+    let notify_calls = StdArc::new(AtomicUsize::new(0));
+    let transport = VirtioPciTransport::try_new(CountingNotifyCore {
+        notify_calls: StdArc::clone(&notify_calls),
+    })
+    .expect("valid test transport");
+    let mut memory = TestMemory {
+        reads: Cell::new(0),
+    };
+    acknowledge_driver(&transport, &mut memory);
+    for status in [0x0b, 0x0f] {
+        write(
+            &transport,
+            DEVICE_STATUS,
+            AccessWidth::Byte,
+            status,
+            &mut memory,
+        );
+    }
+    for (offset, width, value) in [
+        (QUEUE_DESC, AccessWidth::Qword, 0x1000),
+        (QUEUE_DRIVER, AccessWidth::Qword, 0x2000),
+        (QUEUE_DEVICE, AccessWidth::Qword, 0x3000),
+        (QUEUE_ENABLE, AccessWidth::Word, 1),
+    ] {
+        write(&transport, offset, width, value, &mut memory);
+    }
+
+    let first = transport
+        .write_mmio_with_dma(
+            NOTIFY_CONFIG_OFFSET,
+            AccessWidth::Word,
+            0,
+            true,
+            &mut memory,
+        )
+        .expect("running queue notification should succeed");
+    let VirtioPciWriteOutcome::QueueNotified(first) = first else {
+        panic!("expected queue notification");
+    };
+    first.complete();
+    assert_eq!(notify_calls.load(Ordering::Acquire), 1);
+
+    write(
+        &transport,
+        DEVICE_STATUS,
+        AccessWidth::Byte,
+        0x8f,
+        &mut memory,
+    );
+    let stopped = transport
+        .write_mmio_with_dma(
+            NOTIFY_CONFIG_OFFSET,
+            AccessWidth::Word,
+            0,
+            true,
+            &mut memory,
+        )
+        .expect("failed driver status should stop the queue without faulting");
+    let VirtioPciWriteOutcome::QueueNotified(stopped) = stopped else {
+        panic!("expected stopped queue notification");
+    };
+    assert_eq!(stopped.outcome(), QueueNotifyOutcome::Idle);
+    stopped.complete();
+    assert_eq!(notify_calls.load(Ordering::Acquire), 1);
+}
+
+#[test]
 fn queue_notify_probes_the_programmed_ring() {
     let transport = VirtioPciTransport::try_new(TestCore).expect("valid test transport");
     let mut memory = TestMemory {
         reads: Cell::new(0),
     };
 
+    acknowledge_driver(&transport, &mut memory);
     write(
         &transport,
         DEVICE_STATUS,
@@ -76,6 +149,7 @@ fn admitted_queue_fault_sets_needs_reset_and_config_isr_once() {
     let mut configuration_memory = TestMemory {
         reads: Cell::new(0),
     };
+    acknowledge_driver(&transport, &mut configuration_memory);
     write(
         &transport,
         DEVICE_STATUS,
@@ -157,9 +231,17 @@ fn stale_fault_publication_does_not_leave_config_isr_pending() {
     let mut configuration_memory = TestMemory {
         reads: Cell::new(0),
     };
+    acknowledge_driver(&transport, &mut configuration_memory);
+    for status in [0x0b, 0x0f] {
+        write(
+            &transport,
+            DEVICE_STATUS,
+            AccessWidth::Byte,
+            status,
+            &mut configuration_memory,
+        );
+    }
     for (offset, width, value) in [
-        (DEVICE_STATUS, AccessWidth::Byte, 0x0b),
-        (DEVICE_STATUS, AccessWidth::Byte, 0x0f),
         (QUEUE_DESC, AccessWidth::Qword, 0x1000),
         (QUEUE_DRIVER, AccessWidth::Qword, 0x2000),
         (QUEUE_DEVICE, AccessWidth::Qword, 0x3000),
@@ -192,6 +274,7 @@ fn queue_fault_activity_blocks_reset_until_terminal_publication() {
     let mut configuration_memory = TestMemory {
         reads: Cell::new(0),
     };
+    acknowledge_driver(&transport, &mut configuration_memory);
     write(
         &transport,
         DEVICE_STATUS,
@@ -296,6 +379,7 @@ fn concurrent_notify_same_queue_does_not_fault_or_replace_owner_queue() {
     let mut configuration_memory = TestMemory {
         reads: Cell::new(0),
     };
+    acknowledge_driver(&transport, &mut configuration_memory);
     write(
         &transport,
         DEVICE_STATUS,
@@ -407,6 +491,7 @@ fn stale_queue_notification_does_not_process_reconfigured_generation() {
     let mut configuration_memory = TestMemory {
         reads: Cell::new(0),
     };
+    acknowledge_driver(&transport, &mut configuration_memory);
     write(
         &transport,
         DEVICE_STATUS,
@@ -492,6 +577,7 @@ fn stale_queue_notification_does_not_process_reconfigured_generation() {
     let mut reconfiguration_memory = TestMemory {
         reads: Cell::new(0),
     };
+    acknowledge_driver(&transport, &mut reconfiguration_memory);
     write(
         &transport,
         DEVICE_STATUS,

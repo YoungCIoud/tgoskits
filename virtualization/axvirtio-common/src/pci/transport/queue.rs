@@ -9,7 +9,10 @@ use super::{
 };
 use crate::{
     GuestMemory, NoGuestMemoryAccessor, VirtioQueue,
-    constants::{VIRTIO_STATUS_DEVICE_NEEDS_RESET, VIRTIO_STATUS_DRIVER_OK},
+    constants::{
+        VIRTIO_STATUS_DEVICE_NEEDS_RESET, VIRTIO_STATUS_DRIVER_OK, VIRTIO_STATUS_FAILED,
+        VIRTIO_STATUS_FEATURES_OK,
+    },
 };
 
 impl<D: VirtioDeviceCore> VirtioPciTransport<D> {
@@ -24,9 +27,7 @@ impl<D: VirtioDeviceCore> VirtioPciTransport<D> {
             if queue_index as usize >= state.queues.len() {
                 return Err(invalid_queue(queue_index));
             }
-            if state.status & VIRTIO_STATUS_DRIVER_OK as u8 == 0
-                || state.status & VIRTIO_STATUS_DEVICE_NEEDS_RESET as u8 != 0
-            {
+            if !queue_processing_enabled(state.status) {
                 return Ok(self.idle_notification());
             }
             if !state.queues[queue_index as usize].enabled {
@@ -63,8 +64,7 @@ impl<D: VirtioDeviceCore> VirtioPciTransport<D> {
             // holding the transport state lock. Once this permit is held, a
             // reset cannot invalidate these conditions underneath processing.
             let stale_admission = state.queue_generation != generation.value()
-                || state.status & VIRTIO_STATUS_DRIVER_OK as u8 == 0
-                || state.status & VIRTIO_STATUS_DEVICE_NEEDS_RESET as u8 != 0
+                || !queue_processing_enabled(state.status)
                 || !dma_enabled;
             let queue = &mut state.queues[selected];
             if stale_admission || !queue.enabled || queue.processing {
@@ -173,4 +173,10 @@ impl<D: VirtioDeviceCore> VirtioPciTransport<D> {
         queue_state.queue = queue;
         queue_state.processing = false;
     }
+}
+
+fn queue_processing_enabled(status: u8) -> bool {
+    let required = (VIRTIO_STATUS_FEATURES_OK | VIRTIO_STATUS_DRIVER_OK) as u8;
+    let stopped = (VIRTIO_STATUS_DEVICE_NEEDS_RESET | VIRTIO_STATUS_FAILED) as u8;
+    status & required == required && status & stopped == 0
 }

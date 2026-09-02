@@ -1,8 +1,23 @@
-use alloc::sync::Arc;
+use alloc::{format, sync::Arc};
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+use axdevice_base::{DeviceError, DeviceResult};
+
 use super::VirtioQueueGeneration;
-use crate::{NoGuestMemoryAccessor, VirtioQueue, constants::VIRTIO_STATUS_DEVICE_NEEDS_RESET};
+use crate::{
+    NoGuestMemoryAccessor, VirtioQueue,
+    constants::{
+        VIRTIO_STATUS_ACKNOWLEDGE, VIRTIO_STATUS_DEVICE_NEEDS_RESET, VIRTIO_STATUS_DRIVER,
+        VIRTIO_STATUS_DRIVER_OK, VIRTIO_STATUS_FAILED, VIRTIO_STATUS_FEATURES_OK,
+    },
+};
+
+const DRIVER_PHASE_BITS: u8 = (VIRTIO_STATUS_ACKNOWLEDGE
+    | VIRTIO_STATUS_DRIVER
+    | VIRTIO_STATUS_FEATURES_OK
+    | VIRTIO_STATUS_DRIVER_OK) as u8;
+const DRIVER_STATUS_BITS: u8 = DRIVER_PHASE_BITS | VIRTIO_STATUS_FAILED as u8;
+const KNOWN_STATUS_BITS: u8 = DRIVER_STATUS_BITS | VIRTIO_STATUS_DEVICE_NEEDS_RESET as u8;
 
 #[derive(Debug)]
 pub(super) struct QueueActivity {
@@ -145,5 +160,100 @@ impl TransportState {
             queue.processing = false;
             queue.queue.reset();
         }
+    }
+
+    pub(super) fn write_driver_status(
+        &mut self,
+        requested: u8,
+        device_features: u64,
+    ) -> DeviceResult {
+        if requested & !KNOWN_STATUS_BITS != 0 {
+            return Err(DeviceError::InvalidInput {
+                operation: "virtio-pci status",
+                detail: format!("unknown status bits: {requested:#x}"),
+            });
+        }
+
+        let current_driver = self.status & DRIVER_STATUS_BITS;
+        let requested_driver = requested & DRIVER_STATUS_BITS;
+        if current_driver & !requested_driver != 0 {
+            return Err(DeviceError::InvalidState {
+                operation: "update virtio-pci status",
+                detail: format!(
+                    "nonzero status writes cannot clear driver bits: {current_driver:#x} -> \
+                     {requested_driver:#x}"
+                ),
+            });
+        }
+        if current_driver & VIRTIO_STATUS_FAILED as u8 != 0 && requested_driver != current_driver {
+            return Err(DeviceError::InvalidState {
+                operation: "update virtio-pci status",
+                detail: "FAILED status requires a device reset before further progress".into(),
+            });
+        }
+
+        let current_phase = current_driver & DRIVER_PHASE_BITS;
+        let requested_phase = requested_driver & DRIVER_PHASE_BITS;
+        let added_phase = requested_phase & !current_phase;
+        let expected_bit = next_driver_status_bit(current_phase)?;
+        let adds_failed = requested_driver & VIRTIO_STATUS_FAILED as u8 != 0
+            && current_driver & VIRTIO_STATUS_FAILED as u8 == 0;
+        if added_phase != 0 && (added_phase != expected_bit || adds_failed) {
+            return Err(DeviceError::InvalidState {
+                operation: "update virtio-pci status",
+                detail: format!(
+                    "driver status phase is out of order: {current_phase:#x} -> \
+                     {requested_phase:#x}"
+                ),
+            });
+        }
+
+        let device_status = if self.device_needs_reset {
+            VIRTIO_STATUS_DEVICE_NEEDS_RESET as u8
+        } else {
+            0
+        };
+        if added_phase == VIRTIO_STATUS_FEATURES_OK as u8
+            && self.driver_features & !device_features != 0
+        {
+            self.status = current_phase | VIRTIO_STATUS_FAILED as u8 | device_status;
+            return Ok(());
+        }
+
+        self.status = requested_driver | device_status;
+        Ok(())
+    }
+
+    pub(super) fn ensure_feature_negotiation_open(&self) -> DeviceResult {
+        if self.status & (VIRTIO_STATUS_FEATURES_OK | VIRTIO_STATUS_FAILED) as u8 != 0 {
+            Err(DeviceError::InvalidState {
+                operation: "update virtio-pci driver features",
+                detail: "driver features are frozen after feature negotiation closes".into(),
+            })
+        } else {
+            Ok(())
+        }
+    }
+}
+
+fn next_driver_status_bit(current: u8) -> DeviceResult<u8> {
+    match current {
+        0 => Ok(VIRTIO_STATUS_ACKNOWLEDGE as u8),
+        value if value == VIRTIO_STATUS_ACKNOWLEDGE as u8 => Ok(VIRTIO_STATUS_DRIVER as u8),
+        value if value == (VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER) as u8 => {
+            Ok(VIRTIO_STATUS_FEATURES_OK as u8)
+        }
+        value
+            if value
+                == (VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER | VIRTIO_STATUS_FEATURES_OK)
+                    as u8 =>
+        {
+            Ok(VIRTIO_STATUS_DRIVER_OK as u8)
+        }
+        value if value == DRIVER_PHASE_BITS => Ok(0),
+        invalid => Err(DeviceError::InvalidState {
+            operation: "update virtio-pci status",
+            detail: format!("current driver status is invalid: {invalid:#x}"),
+        }),
     }
 }

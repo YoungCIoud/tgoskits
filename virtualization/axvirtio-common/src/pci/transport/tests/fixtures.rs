@@ -273,3 +273,12 @@ pub(crate) fn write<D: VirtioDeviceCore>(
         .write_mmio_with_dma(offset, width, value, true, memory)
         .expect("test transport write should succeed");
 }
+
+pub(crate) fn acknowledge_driver<D: VirtioDeviceCore>(
+    transport: &VirtioPciTransport<D>,
+    memory: &mut TestMemory,
+) {
+    for status in [1, 3] {
+        write(transport, DEVICE_STATUS, AccessWidth::Byte, status, memory);
+    }
+}
