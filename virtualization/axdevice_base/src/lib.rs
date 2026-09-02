@@ -432,6 +432,7 @@ struct RoutedGrantAdmission {
 }
 
 impl RoutedGrantAdmission {
+    #[cfg(feature = "runtime-internal")]
     fn new(epoch: RoutedAdmissionEpoch) -> Self {
         Self {
             open: AtomicBool::new(true),
@@ -443,17 +444,67 @@ impl RoutedGrantAdmission {
         self.epoch.load(Ordering::Acquire) == epoch.value() && self.open.load(Ordering::Acquire)
     }
 
+    #[cfg(feature = "runtime-internal")]
     fn close(&self) {
         self.open.store(false, Ordering::Release);
     }
 
+    #[cfg(feature = "runtime-internal")]
     fn reopen(&self, epoch: RoutedAdmissionEpoch) {
         self.epoch.store(epoch.value(), Ordering::Release);
         self.open.store(true, Ordering::Release);
     }
 }
 
-/// An inert handle for temporarily entering one runtime-routed device.
+/// Lifetime state for a grant that has already passed routed admission.
+///
+/// This state is deliberately separate from [`RoutedGrantAdmission`]. The
+/// latter controls whether a new callback may be admitted; this state keeps
+/// one callback admitted until its runtime-owned scope guard is dropped.
+struct ScopedRoutedGrantAdmission {
+    active: AtomicBool,
+}
+
+impl ScopedRoutedGrantAdmission {
+    #[cfg(feature = "runtime-internal")]
+    fn new() -> Self {
+        Self {
+            active: AtomicBool::new(true),
+        }
+    }
+
+    fn is_active(&self) -> bool {
+        // Acquire observes the Release performed by the scope guard's Drop.
+        self.active.load(Ordering::Acquire)
+    }
+
+    #[cfg(feature = "runtime-internal")]
+    fn close(&self) {
+        self.active.store(false, Ordering::Release);
+    }
+}
+
+/// Runtime-owned guard that keeps an admitted routed grant valid.
+///
+/// This type is only constructed by the device runtime after a route
+/// admission succeeds. Cloning the associated grant does not extend this
+/// guard's lifetime: every clone observes the same active bit.
+#[cfg(feature = "runtime-internal")]
+#[doc(hidden)]
+#[must_use = "the scope guard keeps an admitted routed grant valid"]
+pub struct RoutedGrantScope {
+    admission: Arc<ScopedRoutedGrantAdmission>,
+}
+
+#[cfg(feature = "runtime-internal")]
+impl Drop for RoutedGrantScope {
+    fn drop(&mut self) {
+        self.admission.close();
+    }
+}
+
+/// An inert or scope-bound handle for temporarily entering one runtime-routed
+/// device.
 #[derive(Clone)]
 pub struct RoutedDeviceGrant {
     device_id: DeviceId,
@@ -462,6 +513,7 @@ pub struct RoutedDeviceGrant {
     dma_enabled: bool,
     token: Arc<()>,
     admission: Arc<RoutedGrantAdmission>,
+    scoped_admission: Option<Arc<ScopedRoutedGrantAdmission>>,
 }
 
 impl RoutedDeviceGrant {
@@ -481,6 +533,7 @@ impl RoutedDeviceGrant {
             dma_enabled,
             token: Arc::new(()),
             admission: Arc::new(RoutedGrantAdmission::new(admission_epoch)),
+            scoped_admission: None,
         }
     }
 
@@ -509,10 +562,33 @@ impl RoutedDeviceGrant {
         Arc::ptr_eq(&self.token, &other.token)
     }
 
-    /// Returns whether this snapshot belongs to the currently open admission
-    /// epoch of its binding.
+    /// Returns whether this snapshot may enter a routed device context.
+    ///
+    /// Ordinary snapshots require their shared admission epoch to remain
+    /// open. A snapshot produced by the runtime's admission conversion
+    /// instead remains valid until its scope guard is dropped, so closing the
+    /// shared admission does not revoke an already admitted callback.
     pub fn admission_is_open(&self) -> bool {
-        self.admission.is_open_at(self.admission_epoch)
+        self.scoped_admission.as_ref().map_or_else(
+            || self.admission.is_open_at(self.admission_epoch),
+            |admission| admission.is_active(),
+        )
+    }
+
+    /// Converts an already validated, currently admitted grant into a
+    /// scope-bound grant.
+    ///
+    /// The caller must retain the returned guard for the full callback
+    /// lifetime. Dropping it invalidates this grant and all of its clones.
+    #[cfg(feature = "runtime-internal")]
+    #[doc(hidden)]
+    pub fn admit(mut self) -> Option<(Self, RoutedGrantScope)> {
+        if self.scoped_admission.is_some() || !self.admission.is_open_at(self.admission_epoch) {
+            return None;
+        }
+        let admission = Arc::new(ScopedRoutedGrantAdmission::new());
+        self.scoped_admission = Some(admission.clone());
+        Some((self, RoutedGrantScope { admission }))
     }
 
     /// Closes validation for this grant's current epoch.
@@ -534,6 +610,7 @@ impl RoutedDeviceGrant {
             dma_enabled: self.dma_enabled,
             token: self.token.clone(),
             admission: self.admission.clone(),
+            scoped_admission: None,
         }
     }
 
@@ -555,6 +632,7 @@ impl RoutedDeviceGrant {
             dma_enabled,
             token: self.token.clone(),
             admission: self.admission.clone(),
+            scoped_admission: self.scoped_admission.clone(),
         }
     }
 }

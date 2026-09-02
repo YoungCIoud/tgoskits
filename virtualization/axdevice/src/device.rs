@@ -1267,6 +1267,18 @@ impl DeviceRuntime {
             access_ports: &self.access_ports,
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn with_routed_grant_for_test<T>(
+        &mut self,
+        index: usize,
+        grant: RoutedDeviceGrant,
+        callback: impl FnOnce(&mut dyn DeviceContext) -> T,
+    ) -> T {
+        self.routed_grants.push(grant);
+        let mut context = self.context_for(index, None);
+        callback(&mut context)
+    }
 }
 
 fn access_error(
@@ -1451,6 +1463,47 @@ mod tests {
         context.with_routed_device(&routed, &mut callback).unwrap();
         assert_eq!(bytes, [0x5a; 2]);
         assert_eq!(memory.reads, 1);
+    }
+
+    #[test]
+    fn routed_context_keeps_an_admitted_grant_alive_until_scope_drop() {
+        let mut runtime = DeviceRuntime::empty();
+        let target = DeviceId::new(7);
+        let ordinary = RoutedDeviceGrant::new(
+            target,
+            RoutedBindingGeneration::new(1),
+            RoutedAdmissionEpoch::new(1),
+            true,
+        );
+        runtime.routed_grants.push(ordinary.clone());
+        let (admitted, scope) = ordinary
+            .clone()
+            .admit()
+            .expect("open ordinary grant can be admitted");
+        let retained = admitted.clone();
+        ordinary.close_admission();
+        assert!(ordinary.clone().admit().is_none());
+        let dma_disabled = admitted.with_dma_enabled(false);
+        let next_epoch = admitted.with_admission_epoch(RoutedAdmissionEpoch::new(2));
+        assert!(!dma_disabled.dma_enabled());
+        assert!(dma_disabled.admission_is_open());
+        assert!(!next_epoch.admission_is_open());
+
+        let mut context = runtime.context_for(0, None);
+        let mut callback = |_nested: &mut dyn DeviceContext| Ok(());
+        context
+            .with_routed_device(&admitted, &mut callback)
+            .expect("an already admitted callback survives global close");
+        assert!(matches!(
+            context.with_routed_device(&ordinary, &mut callback),
+            Err(DeviceError::Unsupported { .. })
+        ));
+
+        drop(scope);
+        assert!(matches!(
+            context.with_routed_device(&retained, &mut callback),
+            Err(DeviceError::Unsupported { .. })
+        ));
     }
 
     #[test]

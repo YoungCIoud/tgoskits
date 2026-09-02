@@ -4,7 +4,7 @@ use core::fmt;
 use ax_sync::SpinLock;
 use axdevice_base::{
     DeviceError, DeviceId, DeviceResult, RoutedAdmissionEpoch as RoutedGrantAdmissionEpoch,
-    RoutedBindingGeneration, RoutedDeviceGrant,
+    RoutedBindingGeneration, RoutedDeviceGrant, RoutedGrantScope,
 };
 
 use super::{
@@ -38,20 +38,13 @@ impl EndpointAdmission {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn acquire(
         self: &Arc<Self>,
         token: &EndpointRouteToken,
     ) -> DeviceResult<AdmissionLease> {
         let mut state = self.state.lock_irqsave();
-        if !state.open
-            || token.binding_generation != self.generation
-            || token.admission_epoch != self.epoch
-        {
-            return Err(DeviceError::InvalidState {
-                operation: "admit PCI endpoint route",
-                detail: "PCI endpoint route admission is closed or stale".into(),
-            });
-        }
+        Self::validate_route(&state, self.generation, self.epoch, token)?;
         state.leases = state
             .leases
             .checked_add(1)
@@ -62,6 +55,55 @@ impl EndpointAdmission {
         Ok(AdmissionLease {
             admission: self.clone(),
         })
+    }
+
+    /// Validates and upgrades one routed callback while holding the binding
+    /// admission gate. Once this returns successfully, closing the shared
+    /// admission cannot revoke the callback before its scope is dropped.
+    pub(super) fn acquire_scoped(
+        self: &Arc<Self>,
+        token: &EndpointRouteToken,
+        dma_enabled: bool,
+    ) -> DeviceResult<(AdmissionLease, RoutedDeviceGrant, RoutedGrantScope)> {
+        let mut state = self.state.lock_irqsave();
+        Self::validate_route(&state, self.generation, self.epoch, token)?;
+        let (grant, grant_scope) =
+            token
+                .grant(dma_enabled)
+                .admit()
+                .ok_or(DeviceError::InvalidState {
+                    operation: "admit PCI endpoint route",
+                    detail: "PCI endpoint grant admission is closed or stale".into(),
+                })?;
+        state.leases = state
+            .leases
+            .checked_add(1)
+            .ok_or(DeviceError::InvalidState {
+                operation: "admit PCI endpoint route",
+                detail: "PCI endpoint route lease count is exhausted".into(),
+            })?;
+        Ok((
+            AdmissionLease {
+                admission: self.clone(),
+            },
+            grant,
+            grant_scope,
+        ))
+    }
+
+    fn validate_route(
+        state: &AdmissionState,
+        generation: EndpointBindingGeneration,
+        epoch: RoutedAdmissionEpoch,
+        token: &EndpointRouteToken,
+    ) -> DeviceResult {
+        if !state.open || token.binding_generation != generation || token.admission_epoch != epoch {
+            return Err(DeviceError::InvalidState {
+                operation: "admit PCI endpoint route",
+                detail: "PCI endpoint route admission is closed or stale".into(),
+            });
+        }
+        Ok(())
     }
 
     pub(super) fn acquire_irq_permit(self: &Arc<Self>) -> DeviceResult<IrqPermitLease> {
@@ -84,8 +126,16 @@ impl EndpointAdmission {
         })
     }
 
+    #[cfg(test)]
     pub(super) fn close(&self) {
         self.state.lock_irqsave().open = false;
+    }
+
+    /// Closes new route admission and its ordinary grant under one gate.
+    pub(super) fn close_with_grant(&self, grant: &RoutedDeviceGrant) {
+        let mut state = self.state.lock_irqsave();
+        state.open = false;
+        grant.close_admission();
     }
 
     pub(super) fn wait_for_irq_permits(&self) -> DeviceManagerResult {
@@ -126,8 +176,16 @@ impl EndpointAdmission {
         })
     }
 
-    pub(super) fn open(&self) {
-        self.state.lock_irqsave().open = true;
+    /// Reopens a fresh route admission and publishes the matching grant epoch
+    /// under one gate.
+    pub(super) fn open_with_grant(
+        &self,
+        grant: &RoutedDeviceGrant,
+        epoch: RoutedGrantAdmissionEpoch,
+    ) {
+        let mut state = self.state.lock_irqsave();
+        state.open = true;
+        grant.reopen_admission(epoch);
     }
 }
 
@@ -221,6 +279,8 @@ pub(super) struct RoutedEndpointLease {
     pub(super) _admission: Arc<EndpointAdmission>,
     pub(super) _lease: AdmissionLease,
     pub(super) grant: RoutedDeviceGrant,
+    // The scoped grant remains admitted until this lease is dropped.
+    pub(super) _grant_scope: RoutedGrantScope,
 }
 
 pub(super) struct RoutedEndpoint {
@@ -300,8 +360,7 @@ impl EndpointRouter {
             .is_some_and(|entry| entry.token == *token)
         {
             let entry = state.endpoints.remove(&token.device)?;
-            entry.token.admission.close();
-            entry.token.grant.close_admission();
+            entry.token.admission.close_with_grant(&entry.token.grant);
             return Some(entry.function);
         }
         None
@@ -313,8 +372,7 @@ impl EndpointRouter {
     ) -> Option<(Arc<dyn PciFunction>, Arc<EndpointAdmission>)> {
         let mut state = self.state.lock_irqsave();
         let entry = state.endpoints.remove(&device)?;
-        entry.token.admission.close();
-        entry.token.grant.close_admission();
+        entry.token.admission.close_with_grant(&entry.token.grant);
         Some((entry.function, entry.token.admission))
     }
 
@@ -340,12 +398,14 @@ impl EndpointRouter {
         dma_enabled: bool,
     ) -> DeviceResult<RoutedEndpointLease> {
         let endpoint = self.endpoint(token)?;
-        let lease = token.admission.clone().acquire(token)?;
+        let (lease, grant, grant_scope) =
+            token.admission.clone().acquire_scoped(token, dma_enabled)?;
         Ok(RoutedEndpointLease {
             endpoint,
             _admission: token.admission.clone(),
             _lease: lease,
-            grant: token.grant(dma_enabled),
+            grant,
+            _grant_scope: grant_scope,
         })
     }
 
@@ -413,22 +473,22 @@ impl EndpointRouter {
             for endpoint in state.endpoints.values_mut() {
                 let old = endpoint.token.clone();
                 let epoch = old.admission_epoch() + 1;
-                old.admission.close();
-                old.grant.close_admission();
+                old.admission.close_with_grant(&old.grant);
                 old_admissions.push(old.admission.clone());
                 let admission = Arc::new(EndpointAdmission::new(
                     old.binding_generation,
                     RoutedAdmissionEpoch(epoch),
                 ));
-                admission.close();
+                let grant = old
+                    .grant
+                    .with_admission_epoch(RoutedGrantAdmissionEpoch::new(epoch));
+                admission.close_with_grant(&grant);
                 let token = EndpointRouteToken {
                     device: old.device,
                     binding_generation: old.binding_generation,
                     admission_epoch: RoutedAdmissionEpoch(epoch),
                     admission,
-                    grant: old
-                        .grant
-                        .with_admission_epoch(RoutedGrantAdmissionEpoch::new(epoch)),
+                    grant,
                 };
                 endpoint.token = token.clone();
                 replacements.push((old, token));
@@ -445,8 +505,10 @@ impl EndpointRouter {
         let admissions = {
             let state = self.state.lock_irqsave();
             for endpoint in state.endpoints.values() {
-                endpoint.token.admission.close();
-                endpoint.token.grant.close_admission();
+                endpoint
+                    .token
+                    .admission
+                    .close_with_grant(&endpoint.token.grant);
             }
             state
                 .endpoints
@@ -467,8 +529,10 @@ impl EndpointRouter {
                 .endpoints
                 .values()
                 .map(|endpoint| {
-                    endpoint.token.admission.close();
-                    endpoint.token.grant.close_admission();
+                    endpoint
+                        .token
+                        .admission
+                        .close_with_grant(&endpoint.token.grant);
                     PendingIrqWithdrawal {
                         device: endpoint.token.device_id(),
                         function: endpoint.function.clone(),
@@ -493,13 +557,10 @@ impl EndpointRouter {
     pub(super) fn open_admissions(&self) {
         let state = self.state.lock_irqsave();
         for endpoint in state.endpoints.values() {
-            endpoint.token.admission.open();
-            endpoint
-                .token
-                .grant
-                .reopen_admission(RoutedGrantAdmissionEpoch::new(
-                    endpoint.token.admission_epoch(),
-                ));
+            endpoint.token.admission.open_with_grant(
+                &endpoint.token.grant,
+                RoutedGrantAdmissionEpoch::new(endpoint.token.admission_epoch()),
+            );
         }
     }
 }
