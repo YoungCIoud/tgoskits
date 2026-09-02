@@ -511,6 +511,33 @@ fn bound_virtio_endpoint_serializes_dispatches_and_relocates_bar() {
     assert_eq!(through_pci_cfg, direct);
 
     let mut context = TestEndpointContext::new();
+    let split_queue_address = 0x0000_0001_0000_1000_u64;
+    for (target, value) in [
+        (0x20, split_queue_address & u32::MAX as u64),
+        (0x24, split_queue_address >> 32),
+    ] {
+        root.write_config(
+            bdf,
+            ConfigOffset::new(capability_offset as u16 + 8).unwrap(),
+            AccessWidth::Dword,
+            target,
+        )
+        .unwrap();
+        binding
+            .write_config_with_context(
+                bdf,
+                ConfigOffset::new(capability_offset as u16 + 16).unwrap(),
+                AccessWidth::Dword,
+                value,
+                &mut context,
+            )
+            .unwrap();
+    }
+    assert_eq!(
+        binding.read_bar(bar.address() + 0x20, AccessWidth::Qword),
+        Ok(split_queue_address)
+    );
+
     for (offset, width, value) in [
         (0x14, AccessWidth::Byte, 0x0f),
         (0x20, AccessWidth::Qword, 0x1000),
