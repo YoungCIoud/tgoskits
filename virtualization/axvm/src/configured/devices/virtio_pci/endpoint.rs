@@ -5,11 +5,35 @@ use axdevice::{
     PciConfigReadEffect, PciConfigWriteEffect, PciEndpointContext, PciFunction,
 };
 use axdevice_base::{Device, DeviceAccess, DeviceContext, DeviceError, DeviceResult, Resource};
-use axvirtio_common::pci::{InterruptTransition, VirtioDeviceCore};
+use axvirtio_common::pci::{InterruptTransition, InterruptTransitionIntent, VirtioDeviceCore};
 
 use super::{PCI_CFG_EFFECTS, VirtioPciFunction, config::decode_pci_cfg};
 
 impl<D: VirtioDeviceCore> VirtioPciFunction<D> {
+    pub(super) fn apply_command_revision(
+        &self,
+        command: PciCommandState,
+        allow_equal: bool,
+    ) -> Option<InterruptTransitionIntent> {
+        let transition = {
+            let mut last = self.command_revision.lock();
+            let revision = command.revision();
+            if last.is_some_and(|previous| {
+                revision < previous || (!allow_equal && revision == previous)
+            }) {
+                return None;
+            }
+            let transition = self
+                .transport
+                .update_interrupt_disabled_logical(command.interrupt_disable());
+            *last = Some(revision);
+            transition
+        };
+        #[cfg(test)]
+        self.notify_command_revision_hook();
+        Some(transition)
+    }
+
     fn require_bar_zero(access: PciBarAccess) -> DeviceResult {
         if access.bar().value() == 0 {
             Ok(())
@@ -89,7 +113,7 @@ impl<D: VirtioDeviceCore> PciFunction for VirtioPciFunction<D> {
             access.offset(),
             access.width(),
             value,
-            access.bus_master_enable(),
+            access.command(),
             context,
         )
     }
@@ -127,7 +151,7 @@ impl<D: VirtioDeviceCore> PciFunction for VirtioPciFunction<D> {
             target,
             effect.width(),
             effect.value(),
-            effect.bus_master_enable(),
+            effect.command(),
             context,
         )
     }
@@ -137,17 +161,21 @@ impl<D: VirtioDeviceCore> PciFunction for VirtioPciFunction<D> {
         command: PciCommandState,
         context: &mut dyn PciEndpointContext,
     ) -> DeviceResult {
-        let transition = self
-            .transport
-            .set_interrupt_disabled(command.interrupt_disable())?;
+        let Some(transition) = self.apply_command_revision(command, false) else {
+            return Ok(());
+        };
+        let Some(transition) = self.transport.admit_interrupt_transition(transition)? else {
+            return Ok(());
+        };
         self.finish_transition_request(context, transition)
     }
 
     fn reset(&self, command: PciCommandState) -> DeviceResult {
         let _interrupt = self.transport.reset()?;
         let transition = self
-            .transport
-            .set_interrupt_disabled_during_reset(command.interrupt_disable())?;
+            .apply_command_revision(command, true)
+            .map(InterruptTransitionIntent::transition)
+            .unwrap_or(InterruptTransition::None);
         if transition != InterruptTransition::None {
             self.transport
                 .complete_interrupt_transition(transition, false);

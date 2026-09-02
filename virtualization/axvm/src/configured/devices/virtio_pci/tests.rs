@@ -331,6 +331,7 @@ impl DeviceModel for HostModel {
 
 struct EndpointModel {
     fail_notify: bool,
+    command_revision_hook: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl DeviceModel for EndpointModel {
@@ -368,6 +369,9 @@ impl DeviceModel for EndpointModel {
             )
             .map_err(DeviceManagerError::Device)?,
         );
+        if let Some(hook) = self.command_revision_hook.clone() {
+            function.set_command_revision_hook(move || hook());
+        }
         let mut bundle = DeviceBundle::new();
         let device_index = bundle.add_pci_function(function)?;
         bundle.grant_guest_memory_to_device(device_index, grant);
@@ -387,6 +391,19 @@ fn build_bound_endpoint() -> (
 
 fn build_bound_endpoint_with_options(
     fail_notify: bool,
+) -> (
+    Arc<axdevice::PciRootState>,
+    Arc<PciRootBinding>,
+    axdevice::PciBdf,
+    axdevice::DeviceRuntime,
+    Arc<TestIrqSink>,
+) {
+    build_bound_endpoint_with_command_hook(fail_notify, None)
+}
+
+fn build_bound_endpoint_with_command_hook(
+    fail_notify: bool,
+    command_revision_hook: Option<Arc<dyn Fn() + Send + Sync>>,
 ) -> (
     Arc<axdevice::PciRootState>,
     Arc<PciRootBinding>,
@@ -424,7 +441,10 @@ fn build_bound_endpoint_with_options(
     builder
         .add(DeviceNodeSpec::virtual_device(
             node("virtio-pci"),
-            Arc::new(EndpointModel { fail_notify }),
+            Arc::new(EndpointModel {
+                fail_notify,
+                command_revision_hook,
+            }),
         ))
         .unwrap();
     let mut pools = ResourcePools::new();

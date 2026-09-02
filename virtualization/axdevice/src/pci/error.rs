@@ -35,6 +35,9 @@ pub enum PciError {
         /// Diagnostic reason.
         detail: &'static str,
     },
+    /// A function's command snapshot revision cannot advance without wrapping.
+    #[error("PCI command snapshot revision exhausted")]
+    CommandRevisionExhausted,
     /// A platform-owned config byte conflicts with core-owned state.
     #[error("invalid PCI config patch at {offset:#x}: {detail}")]
     InvalidConfigPatch {

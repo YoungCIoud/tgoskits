@@ -26,8 +26,8 @@ pub use state::ActivityPermit;
 use state::{QueueActivity, QueueState, TransportState};
 use transition::InterruptPublicationKind;
 pub use transition::{
-    InterruptPublicationRequest, InterruptTransitionRequest, QueueNotification,
-    VirtioQueueGeneration,
+    InterruptPublicationRequest, InterruptTransitionIntent, InterruptTransitionRequest,
+    QueueNotification, VirtioQueueGeneration,
 };
 
 pub(super) const COMMON_CONFIG_SIZE: u64 = 0x38;
@@ -147,6 +147,8 @@ pub struct VirtioPciTransport<D: VirtioDeviceCore> {
     device_config_size: u32,
     #[cfg(test)]
     notify_admission_hook: SpinLock<Option<Arc<dyn Fn() + Send + Sync>>>,
+    #[cfg(test)]
+    reset_before_core_hook: SpinLock<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 impl<D: VirtioDeviceCore> VirtioPciTransport<D> {
@@ -188,6 +190,8 @@ impl<D: VirtioDeviceCore> VirtioPciTransport<D> {
             core,
             #[cfg(test)]
             notify_admission_hook: SpinLock::new(None),
+            #[cfg(test)]
+            reset_before_core_hook: SpinLock::new(None),
         })
     }
 
@@ -256,29 +260,91 @@ impl<D: VirtioDeviceCore> VirtioPciTransport<D> {
         }
     }
 
+    /// Installs a test-only pause after activity has drained and before the
+    /// device-specific reset begins. This makes reset handoff tests
+    /// deterministic without exposing a production scheduling hook.
+    #[cfg(test)]
+    pub(crate) fn set_reset_before_core_hook<F>(&self, hook: F)
+    where
+        F: Fn() + Send + Sync + 'static,
+    {
+        *self.reset_before_core_hook.lock() = Some(Arc::new(hook));
+    }
+
+    #[cfg(test)]
+    pub(super) fn run_reset_before_core_hook(&self) {
+        let hook = self.reset_before_core_hook.lock().clone();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    /// Updates the logical PCI Command.INTx Disable state and returns the
+    /// resulting physical-line transition intent.
+    ///
+    /// This operation is intentionally infallible and does not acquire
+    /// activity or IRQ-transition admission. The endpoint adapter uses it
+    /// while holding its per-function Command revision lock; the returned
+    /// intent must be admitted and executed only after that lock is released.
+    pub fn update_interrupt_disabled_logical(&self, disabled: bool) -> InterruptTransitionIntent {
+        // Capture the queue generation before changing the coordinator.  If a
+        // reset wins before activity admission, this intent must be rejected
+        // rather than acquiring a permit from the reopened generation.
+        let generation = self.queue_generation();
+        let transition = self.interrupts.set_disabled(disabled);
+        InterruptTransitionIntent::new(transition, generation)
+    }
+
+    /// Acquires control activity for a previously committed interrupt
+    /// transition intent.
+    ///
+    /// Logical Command state is already committed when this method runs. If
+    /// reset has closed activity admission, only the unexecuted physical
+    /// intent is cancelled; the logical disabled state remains available for
+    /// the next reset or synchronization point.
+    pub fn admit_interrupt_transition(
+        &self,
+        intent: InterruptTransitionIntent,
+    ) -> DeviceResult<Option<InterruptTransitionRequest>> {
+        let Some(activity) = self.activity.acquire(intent.generation()) else {
+            // The logical command state is committed before admission is
+            // acquired. If reset closed admission, cancel only the
+            // unexecuted physical intent; the desired state remains in
+            // the coordinator for the reset owner to preserve/retry.
+            self.interrupts.cancel_transition(intent.transition());
+            return Ok(None);
+        };
+
+        // Activity admission and reset close are linearized by the same gate,
+        // but the generation advances only when the reset core state is
+        // committed. Revalidate after acquiring the permit so an intent that
+        // waited through a completed reset cannot reach the endpoint IRQ
+        // callback.
+        if self.queue_generation() != intent.generation() {
+            self.interrupts
+                .suppress_stale_transition(intent.transition());
+            drop(activity);
+            return Ok(None);
+        }
+
+        Ok(Some(InterruptTransitionRequest::new(
+            Arc::clone(&self.interrupts),
+            intent.transition(),
+            Some(activity),
+        )))
+    }
+
     /// Applies PCI Command.INTx Disable and returns a line transition intent.
     pub fn set_interrupt_disabled(
         &self,
         disabled: bool,
     ) -> DeviceResult<InterruptTransitionRequest> {
-        let activity = self.acquire_control_activity()?;
-        let transition = self.interrupts.set_disabled(disabled);
-        Ok(InterruptTransitionRequest::new(
-            Arc::clone(&self.interrupts),
-            transition,
-            Some(activity),
-        ))
-    }
-
-    /// Applies the logical PCI Command.INTx Disable state while reset has
-    /// already closed activity admission. The endpoint owns the physical
-    /// cleanup at the reset boundary and therefore receives the raw intent
-    /// without acquiring a queue activity permit.
-    pub fn set_interrupt_disabled_during_reset(
-        &self,
-        disabled: bool,
-    ) -> DeviceResult<InterruptTransition> {
-        Ok(self.interrupts.set_disabled(disabled))
+        let intent = self.update_interrupt_disabled_logical(disabled);
+        self.admit_interrupt_transition(intent)?
+            .ok_or(DeviceError::InvalidState {
+                operation: "update VirtIO PCI interrupt state",
+                detail: "transport reset is in progress or the transition is stale".into(),
+            })
     }
 
     /// Commits an interrupt-line operation executed through the endpoint
@@ -291,9 +357,13 @@ impl<D: VirtioDeviceCore> VirtioPciTransport<D> {
         self.interrupts.complete_transition(transition, success)
     }
 
-    /// Suppresses a stale endpoint transition without recording a line error.
-    pub fn suppress_interrupt_transition(&self, transition: InterruptTransition) {
-        self.interrupts.suppress_transition(transition);
+    /// Suppresses a transition whose endpoint IRQ admission became stale.
+    ///
+    /// Admission closure is not a physical-line failure. Only release the
+    /// matching in-flight transition; preserve any retry state that was
+    /// already recorded by a real line operation failure.
+    pub fn suppress_stale_interrupt_transition(&self, transition: InterruptTransition) {
+        self.interrupts.suppress_stale_transition(transition);
     }
 
     /// Returns a retry intent for a previously failed line synchronization.

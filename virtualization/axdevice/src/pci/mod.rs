@@ -38,9 +38,9 @@ pub use graph::{
 pub use root::{PciBarRoute, PciRootState};
 pub(crate) use runtime::PciBindingLease;
 pub use runtime::{
-    EndpointIrqTransitionPermit, EndpointRouteToken, PciBarAccess, PciCommandState,
-    PciConfigReadEffect, PciConfigWriteEffect, PciEndpointContext, PciFunction, PciRootBinding,
-    PciRootBindingKey,
+    EndpointIrqTransitionPermit, EndpointRouteToken, PciBarAccess, PciCommandRevision,
+    PciCommandState, PciConfigReadEffect, PciConfigWriteEffect, PciEndpointContext, PciFunction,
+    PciRootBinding, PciRootBindingKey,
 };
 pub(crate) use topology::PciTopologyBuilder;
 pub use topology::{ResolvedPciBar, ResolvedPciFunction, ResolvedPciTopology};

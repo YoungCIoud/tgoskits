@@ -61,7 +61,8 @@ impl<D: VirtioDeviceCore> VirtioPciFunction<D> {
                         .complete_interrupt_transition(transition, true);
                 }
                 TransitionResult::Suppressed => {
-                    self.transport.suppress_interrupt_transition(transition);
+                    self.transport
+                        .suppress_stale_interrupt_transition(transition);
                     transition = InterruptTransition::None;
                 }
                 TransitionResult::Failed(error) => {
@@ -143,18 +144,32 @@ impl<D: VirtioDeviceCore> VirtioPciFunction<D> {
         offset: u64,
         width: AccessWidth,
         value: u64,
-        dma_enabled: bool,
+        command: axdevice::PciCommandState,
         context: &mut dyn PciEndpointContext,
     ) -> DeviceResult {
         let outcome = {
             let mut memory = DeviceContextMemory::new(context, &self.dma_grant);
-            self.transport
-                .write_bar_with_dma(offset, width, value, dma_enabled, &mut memory)?
+            self.transport.write_bar_with_dma(
+                offset,
+                width,
+                value,
+                command.bus_master_enable(),
+                &mut memory,
+            )?
         };
         match outcome {
             VirtioPciWriteOutcome::None => Ok(()),
             VirtioPciWriteOutcome::Reset { interrupt } => {
                 if let Err(error) = self.finish_transition(context, interrupt) {
+                    self.transport.abort_reset();
+                    return Err(error);
+                }
+                let transition = self
+                    .apply_command_revision(command, true)
+                    .filter(|intent| self.transport.queue_generation() == intent.generation())
+                    .map(|intent| intent.transition())
+                    .unwrap_or(InterruptTransition::None);
+                if let Err(error) = self.finish_transition(context, transition) {
                     self.transport.abort_reset();
                     return Err(error);
                 }

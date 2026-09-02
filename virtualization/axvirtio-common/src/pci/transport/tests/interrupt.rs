@@ -44,6 +44,20 @@ fn dropping_interrupt_transition_request_keeps_transition_retryable() {
 }
 
 #[test]
+fn stale_endpoint_irq_suppression_does_not_create_retry_state() {
+    let transport = VirtioPciTransport::try_new(TestCore).expect("valid test transport");
+    let transition = transport.record_interrupt(false);
+    assert_eq!(transition, InterruptTransition::Assert);
+    assert!(!transport.interrupts.needs_resync());
+
+    // A closed endpoint IRQ admission suppresses the transition before any
+    // ISR publication or physical-line operation. It must not turn the
+    // intentionally discarded effect into a new retry request.
+    transport.suppress_stale_interrupt_transition(transition);
+    assert!(!transport.interrupts.needs_resync());
+}
+
+#[test]
 fn isr_read_is_read_to_clear() {
     let transport = VirtioPciTransport::try_new(TestCore).expect("valid test transport");
     let transition = transport.record_interrupt(false);

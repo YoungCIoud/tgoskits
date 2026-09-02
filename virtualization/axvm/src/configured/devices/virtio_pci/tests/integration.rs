@@ -438,6 +438,163 @@ fn adapter_records_isr_deassert_failure_for_command_retry() {
 }
 
 #[test]
+fn real_endpoint_serializes_command_revision_with_interrupt_state() {
+    let entered = Arc::new(Barrier::new(2));
+    let release = Arc::new(Barrier::new(2));
+    let armed = Arc::new(AtomicBool::new(false));
+    let command_revision_hook = {
+        let entered = Arc::clone(&entered);
+        let release = Arc::clone(&release);
+        let armed = Arc::clone(&armed);
+        Arc::new(move || {
+            if armed
+                .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                entered.wait();
+                release.wait();
+            }
+        })
+    };
+    let (root, binding, bdf, _runtime, sink) =
+        build_bound_endpoint_with_command_hook(false, Some(command_revision_hook));
+    let function = root.topology().function(&node("virtio-pci")).unwrap();
+    let bar = function.bar(PciBarIndex::new(0).unwrap()).unwrap();
+    let mut context = TestEndpointContext::new();
+    configure_running_endpoint(&root, &binding, bdf, bar.address(), &mut context);
+    binding
+        .write_bar_with_context(bar.address() + 0x100, AccessWidth::Word, 0, &mut context)
+        .expect("completion should assert the line before the command race");
+    let assert_calls_before = sink.assert_calls.load(Ordering::Relaxed);
+
+    armed.store(true, Ordering::Release);
+    let first_binding = Arc::clone(&binding);
+    let first = thread::spawn(move || {
+        let mut context = TestEndpointContext::new();
+        first_binding.write_config_with_context(
+            bdf,
+            ConfigOffset::new(4).unwrap(),
+            AccessWidth::Word,
+            0x406,
+            &mut context,
+        )
+    });
+    entered.wait();
+
+    let mut second_context = TestEndpointContext::new();
+    binding
+        .write_config_with_context(
+            bdf,
+            ConfigOffset::new(4).unwrap(),
+            AccessWidth::Word,
+            6,
+            &mut second_context,
+        )
+        .expect("newer command callback should complete while the old one is paused");
+    release.wait();
+    first
+        .join()
+        .expect("older command callback should finish")
+        .expect("older command callback should not fail");
+
+    assert_eq!(
+        root.read_config(bdf, ConfigOffset::new(4).unwrap(), AccessWidth::Word),
+        Ok(6)
+    );
+    assert_eq!(
+        sink.assert_calls.load(Ordering::Relaxed),
+        assert_calls_before + 1,
+        "the latest INTx-enable command must win after the older transition completes"
+    );
+}
+
+#[test]
+fn stale_command_transition_cannot_assert_after_status_reset() {
+    let entered = Arc::new(Barrier::new(2));
+    let release = Arc::new(Barrier::new(2));
+    let armed = Arc::new(AtomicBool::new(false));
+    let command_revision_hook = {
+        let entered = Arc::clone(&entered);
+        let release = Arc::clone(&release);
+        let armed = Arc::clone(&armed);
+        Arc::new(move || {
+            if armed
+                .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                entered.wait();
+                release.wait();
+            }
+        })
+    };
+    let (root, binding, bdf, _runtime, sink) =
+        build_bound_endpoint_with_command_hook(false, Some(command_revision_hook));
+    let function = root.topology().function(&node("virtio-pci")).unwrap();
+    let bar = function.bar(PciBarIndex::new(0).unwrap()).unwrap();
+    let mut context = TestEndpointContext::new();
+    configure_running_endpoint(&root, &binding, bdf, bar.address(), &mut context);
+
+    // Keep the ISR pending while INTx is disabled.  Re-enabling INTx below
+    // creates the old Assert intent that will be paused before admission.
+    binding
+        .write_config_with_context(
+            bdf,
+            ConfigOffset::new(4).unwrap(),
+            AccessWidth::Word,
+            0x406,
+            &mut context,
+        )
+        .expect("disabling INTx should succeed");
+    binding
+        .write_bar_with_context(bar.address() + 0x100, AccessWidth::Word, 0, &mut context)
+        .expect("completion should remain pending while INTx is disabled");
+    let assert_calls_before = sink.assert_calls.load(Ordering::Relaxed);
+
+    armed.store(true, Ordering::Release);
+    let command_binding = Arc::clone(&binding);
+    let command = thread::spawn(move || {
+        let mut command_context = TestEndpointContext::new();
+        command_binding.write_config_with_context(
+            bdf,
+            ConfigOffset::new(4).unwrap(),
+            AccessWidth::Word,
+            6,
+            &mut command_context,
+        )
+    });
+    entered.wait();
+
+    // Complete a new VirtIO generation while the old Command callback is
+    // paused after its logical update but before activity admission.
+    let mut reset_context = TestEndpointContext::new();
+    binding
+        .write_bar_with_context(
+            bar.address() + 0x14,
+            AccessWidth::Byte,
+            0,
+            &mut reset_context,
+        )
+        .expect("status reset should complete");
+    assert_eq!(
+        binding
+            .read_bar_with_context(bar.address() + 0x14, AccessWidth::Byte, &mut reset_context)
+            .expect("reset status should be readable"),
+        0
+    );
+
+    release.wait();
+    command
+        .join()
+        .expect("paused command callback should finish")
+        .expect("stale command transition should be suppressed without a line error");
+    assert_eq!(
+        sink.assert_calls.load(Ordering::Relaxed),
+        assert_calls_before,
+        "a stale pre-reset Command transition must not reassert INTx"
+    );
+}
+
+#[test]
 fn bound_virtio_endpoint_serializes_dispatches_and_relocates_bar() {
     let (root, binding, bdf, _runtime) = build_bound_endpoint();
     let function = root.topology().function(&node("virtio-pci")).unwrap();

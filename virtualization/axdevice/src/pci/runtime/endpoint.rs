@@ -6,7 +6,8 @@ use axdevice_base::{
 
 use super::{
     super::{
-        PciBarIndex, PciBarRoute, PciBdf, PciCapabilityId, PciCapabilitySnapshot, PciConfigEffectId,
+        PciBarIndex, PciBarRoute, PciBdf, PciCapabilityId, PciCapabilitySnapshot,
+        PciConfigEffectId, PciError, PciResult,
     },
     routing::EndpointAdmission,
 };
@@ -16,17 +17,43 @@ use crate::AccessWidth;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PciBarAccess {
     route: PciBarRoute,
-    dma_enabled: bool,
+    command: PciCommandState,
 }
 
 impl PciBarAccess {
-    pub(crate) const fn new(route: PciBarRoute, dma_enabled: bool) -> Self {
-        Self { route, dma_enabled }
+    pub(crate) const fn new(route: PciBarRoute, command: PciCommandState) -> Self {
+        Self { route, command }
     }
 
     /// Returns the root-captured bus-master-enable state for this access.
     pub const fn bus_master_enable(self) -> bool {
-        self.dma_enabled
+        self.command.bus_master_enable()
+    }
+
+    /// Returns the complete root-captured command-register state for this access.
+    pub const fn command(self) -> PciCommandState {
+        self.command
+    }
+}
+
+/// Monotonic revision of one root-owned PCI Command snapshot.
+///
+/// The revision orders callbacks that execute outside the root lock. It is
+/// local to one function's Command register and is not a route or queue
+/// generation.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct PciCommandRevision(u64);
+
+impl PciCommandRevision {
+    pub(crate) const fn initial() -> Self {
+        Self(0)
+    }
+
+    pub(crate) fn next(self) -> PciResult<Self> {
+        self.0
+            .checked_add(1)
+            .map(Self)
+            .ok_or(PciError::CommandRevisionExhausted)
     }
 }
 
@@ -36,6 +63,7 @@ pub struct PciCommandState {
     memory_space_enable: bool,
     bus_master_enable: bool,
     interrupt_disable: bool,
+    revision: PciCommandRevision,
 }
 
 impl PciCommandState {
@@ -43,11 +71,13 @@ impl PciCommandState {
         memory_space_enable: bool,
         bus_master_enable: bool,
         interrupt_disable: bool,
+        revision: PciCommandRevision,
     ) -> Self {
         Self {
             memory_space_enable,
             bus_master_enable,
             interrupt_disable,
+            revision,
         }
     }
 
@@ -65,6 +95,11 @@ impl PciCommandState {
     pub const fn interrupt_disable(self) -> bool {
         self.interrupt_disable
     }
+
+    /// Returns the root revision that orders this command snapshot.
+    pub const fn revision(self) -> PciCommandRevision {
+        self.revision
+    }
 }
 
 /// Snapshot of one endpoint configuration read effect.
@@ -75,7 +110,7 @@ pub struct PciConfigReadEffect {
     offset: u8,
     width: AccessWidth,
     capability_snapshot: PciCapabilitySnapshot,
-    bus_master_enable: bool,
+    command: PciCommandState,
 }
 
 impl PciConfigReadEffect {
@@ -85,7 +120,7 @@ impl PciConfigReadEffect {
         offset: u8,
         width: AccessWidth,
         capability_snapshot: PciCapabilitySnapshot,
-        bus_master_enable: bool,
+        command: PciCommandState,
     ) -> Self {
         Self {
             capability,
@@ -93,7 +128,7 @@ impl PciConfigReadEffect {
             offset,
             width,
             capability_snapshot,
-            bus_master_enable,
+            command,
         }
     }
 
@@ -124,7 +159,12 @@ impl PciConfigReadEffect {
 
     /// Returns the root-captured BME state for this config effect.
     pub const fn bus_master_enable(self) -> bool {
-        self.bus_master_enable
+        self.command.bus_master_enable()
+    }
+
+    /// Returns the complete root-captured command state for this config effect.
+    pub const fn command(self) -> PciCommandState {
+        self.command
     }
 }
 
@@ -168,6 +208,11 @@ impl PciConfigWriteEffect {
     /// Returns the root-captured BME state for this config effect.
     pub const fn bus_master_enable(self) -> bool {
         self.read.bus_master_enable()
+    }
+
+    /// Returns the complete root-captured command state for this config effect.
+    pub const fn command(self) -> PciCommandState {
+        self.read.command()
     }
 
     /// Returns the guest-provided write value.
@@ -406,7 +451,9 @@ pub trait PciFunction: Device {
     /// This callback runs without the root state lock or the binding
     /// lifecycle operation lock held. An implementation may re-enter the
     /// root or binding APIs; an operation that conflicts with the current
-    /// lifecycle phase returns a typed busy/invalid-state error.
+    /// lifecycle phase returns a typed busy/invalid-state error. The
+    /// implementation must ignore a snapshot whose [`PciCommandState::revision`]
+    /// is older than the newest snapshot it has accepted.
     fn command_changed(
         &self,
         _command: PciCommandState,

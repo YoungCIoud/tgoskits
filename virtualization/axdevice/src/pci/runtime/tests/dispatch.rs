@@ -1,4 +1,170 @@
+use std::{
+    sync::{
+        Arc, Barrier,
+        atomic::{AtomicBool, Ordering},
+    },
+    thread,
+};
+
+use axdevice_base::{Device, DeviceAccess, DeviceContext, DeviceError, Resource};
+
 use super::*;
+
+struct ReverseCommandFunction {
+    first_entered: Arc<Barrier>,
+    first_release: Arc<Barrier>,
+    second_finished: Arc<Barrier>,
+    first_started: AtomicBool,
+    callbacks: SpinLock<Vec<PciCommandState>>,
+    completions: SpinLock<Vec<PciCommandState>>,
+    applied: SpinLock<Option<PciCommandState>>,
+}
+
+impl Device for ReverseCommandFunction {
+    fn name(&self) -> &str {
+        "reverse-command-test-function"
+    }
+
+    fn resources(&self) -> &[Resource] {
+        &[]
+    }
+
+    fn read(&self, _access: &DeviceAccess, _context: &mut dyn DeviceContext) -> DeviceResult<u64> {
+        Err(DeviceError::NotFound)
+    }
+
+    fn write(
+        &self,
+        _access: &DeviceAccess,
+        _value: u64,
+        _context: &mut dyn DeviceContext,
+    ) -> DeviceResult {
+        Ok(())
+    }
+}
+
+impl PciFunction for ReverseCommandFunction {
+    fn read_bar(
+        &self,
+        _access: PciBarAccess,
+        _context: &mut dyn PciEndpointContext,
+    ) -> DeviceResult<u64> {
+        Ok(0)
+    }
+
+    fn write_bar(
+        &self,
+        _access: PciBarAccess,
+        _value: u64,
+        _context: &mut dyn PciEndpointContext,
+    ) -> DeviceResult {
+        Ok(())
+    }
+
+    fn command_changed(
+        &self,
+        command: PciCommandState,
+        _context: &mut dyn PciEndpointContext,
+    ) -> DeviceResult {
+        self.callbacks.lock_irqsave().push(command);
+        let mut applied = self.applied.lock_irqsave();
+        if applied.is_none_or(|previous| command.revision() > previous.revision()) {
+            *applied = Some(command);
+        }
+        drop(applied);
+        if command.interrupt_disable() {
+            self.first_started.store(true, Ordering::Release);
+            self.first_entered.wait();
+            self.first_release.wait();
+        } else if self.first_started.load(Ordering::Acquire) {
+            self.second_finished.wait();
+        }
+        self.completions.lock_irqsave().push(command);
+        Ok(())
+    }
+}
+
+#[test]
+fn command_callbacks_can_complete_in_reverse_order_without_stale_state() {
+    let function_id = DeviceNodeId::new("reverse-command-endpoint").unwrap();
+    let mut builder = PciTopologyBuilder::new();
+    builder
+        .add_function(PciFunctionSpec::new(
+            function_id.clone(),
+            PciEndpointIdentity::new(0x1af4, 0x1042, PciClass::new(0x01, 0x80, 0)),
+        ))
+        .unwrap();
+    let topology = Arc::new(builder.resolve(0xc000_0000..0xc100_0000).unwrap());
+    let bdf = topology.function(&function_id).unwrap().bdf();
+    let root = Arc::new(PciRootState::new(topology));
+    let binding = Arc::new(PciRootBinding::new(
+        DeviceNodeId::new("reverse-command-host").unwrap(),
+        root,
+    ));
+    let function = Arc::new(ReverseCommandFunction {
+        first_entered: Arc::new(Barrier::new(2)),
+        first_release: Arc::new(Barrier::new(2)),
+        second_finished: Arc::new(Barrier::new(2)),
+        first_started: AtomicBool::new(false),
+        callbacks: SpinLock::new(Vec::new()),
+        completions: SpinLock::new(Vec::new()),
+        applied: SpinLock::new(None),
+    });
+    let mut grants = Vec::new();
+    let lease = binding
+        .bind_registered(
+            &function_id,
+            DeviceId::new(31),
+            function.clone(),
+            &mut grants,
+        )
+        .unwrap();
+    function.callbacks.lock_irqsave().clear();
+    function.completions.lock_irqsave().clear();
+
+    let first_binding = Arc::clone(&binding);
+    let first = thread::spawn(move || {
+        first_binding
+            .write_config(
+                bdf,
+                ConfigOffset::new(4).unwrap(),
+                AccessWidth::Word,
+                0x0400,
+            )
+            .unwrap();
+    });
+    function.first_entered.wait();
+
+    let second_binding = Arc::clone(&binding);
+    let second = thread::spawn(move || {
+        second_binding
+            .write_config(bdf, ConfigOffset::new(4).unwrap(), AccessWidth::Word, 0)
+            .unwrap();
+    });
+    function.second_finished.wait();
+    second.join().unwrap();
+    function.first_release.wait();
+    first.join().unwrap();
+
+    let callbacks = function.callbacks.lock_irqsave();
+    assert_eq!(callbacks.len(), 2);
+    assert!(callbacks[0].interrupt_disable());
+    assert!(!callbacks[1].interrupt_disable());
+    assert!(callbacks[0].revision() < callbacks[1].revision());
+    let completions = function.completions.lock_irqsave();
+    assert_eq!(completions.len(), 2);
+    assert!(!completions[0].interrupt_disable());
+    assert!(completions[1].interrupt_disable());
+    assert!(
+        !function
+            .applied
+            .lock_irqsave()
+            .as_ref()
+            .unwrap()
+            .interrupt_disable()
+    );
+    drop(lease);
+}
 
 #[test]
 fn binding_dispatches_config_effects_and_command_transitions() {

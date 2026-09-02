@@ -17,7 +17,7 @@ use super::{
         CONFIG_VENDOR_ID_OFFSET, STATUS_CAPABILITIES_LIST,
     },
     function::PciConfigByte,
-    runtime::PciCommandState,
+    runtime::{PciCommandRevision, PciCommandState},
 };
 
 #[derive(Clone)]
@@ -102,6 +102,7 @@ pub(crate) struct FunctionState {
     power_on: PowerOnConfig,
     config: [u8; CONFIG_SPACE_SIZE],
     bars: Vec<BarState>,
+    command_revision: PciCommandRevision,
 }
 
 pub(crate) enum BarWriteAction {
@@ -122,6 +123,7 @@ impl FunctionState {
             config: power_on.bytes,
             power_on,
             bars: bars.iter().copied().map(BarState::new).collect(),
+            command_revision: PciCommandRevision::initial(),
         }
     }
 
@@ -142,7 +144,30 @@ impl FunctionState {
             self.config[CONFIG_COMMAND_OFFSET] & COMMAND_MEMORY_SPACE_ENABLE != 0,
             self.config[CONFIG_COMMAND_OFFSET] & COMMAND_BUS_MASTER_ENABLE != 0,
             self.config[CONFIG_COMMAND_OFFSET + 1] & COMMAND_INTERRUPT_DISABLE != 0,
+            self.command_revision,
         )
+    }
+
+    pub(crate) fn command_write_changes(&self, offset: usize, size: usize, value: u64) -> bool {
+        let mut candidate = self.config;
+        merge_bytes(
+            &mut candidate,
+            offset,
+            size,
+            value,
+            &self.power_on.write_mask,
+        );
+        candidate[CONFIG_COMMAND_OFFSET] & COMMAND_MEMORY_SPACE_ENABLE
+            != self.config[CONFIG_COMMAND_OFFSET] & COMMAND_MEMORY_SPACE_ENABLE
+            || candidate[CONFIG_COMMAND_OFFSET] & COMMAND_BUS_MASTER_ENABLE
+                != self.config[CONFIG_COMMAND_OFFSET] & COMMAND_BUS_MASTER_ENABLE
+            || candidate[CONFIG_COMMAND_OFFSET + 1] & COMMAND_INTERRUPT_DISABLE
+                != self.config[CONFIG_COMMAND_OFFSET + 1] & COMMAND_INTERRUPT_DISABLE
+    }
+
+    pub(crate) fn bump_command_revision(&mut self) -> PciResult {
+        self.command_revision = self.command_revision.next()?;
+        Ok(())
     }
 
     pub(crate) fn bars(&self) -> &[BarState] {
@@ -241,11 +266,12 @@ impl FunctionState {
         self.bars[bar].finish_relocation(accepted);
     }
 
-    pub(crate) fn reset(&mut self) {
+    pub(crate) fn reset(&mut self) -> PciResult {
         self.config = self.power_on.bytes;
         for bar in &mut self.bars {
             bar.reset();
         }
+        self.bump_command_revision()
     }
 
     fn bar_dword(&self, offset: usize) -> Option<usize> {

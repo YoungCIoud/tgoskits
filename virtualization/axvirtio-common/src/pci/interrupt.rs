@@ -164,6 +164,23 @@ impl VirtioPciInterruptCoordinator {
         let target = matches!(transition, InterruptTransition::Assert);
         if state.transition_in_flight == Some(target) {
             state.transition_in_flight = None;
+            let desired = !state.disabled && state.isr != 0;
+            state.needs_resync = state.asserted != desired;
+        }
+    }
+
+    /// Suppresses a transition whose VirtIO queue generation is stale.
+    ///
+    /// A stale generation is not a physical-line failure. Preserve any
+    /// existing retry state and only release the matching in-flight intent.
+    pub(super) fn suppress_stale_transition(&self, transition: InterruptTransition) {
+        if transition == InterruptTransition::None {
+            return;
+        }
+        let mut state = self.state.lock();
+        let target = matches!(transition, InterruptTransition::Assert);
+        if state.transition_in_flight == Some(target) {
+            state.transition_in_flight = None;
         }
     }
 
@@ -381,5 +398,17 @@ mod tests {
         assert_eq!(retry, InterruptTransition::Deassert);
         coordinator.complete_transition(retry, true);
         assert!(!coordinator.needs_resync());
+    }
+
+    #[test]
+    fn stale_transition_suppression_preserves_existing_retry_state() {
+        let coordinator = VirtioPciInterruptCoordinator::new();
+        let assert_transition = coordinator.record_queue_completion(true);
+        assert_eq!(assert_transition, InterruptTransition::Assert);
+        coordinator.complete_transition(assert_transition, false);
+        assert!(coordinator.needs_resync());
+
+        coordinator.suppress_stale_transition(InterruptTransition::Assert);
+        assert!(coordinator.needs_resync());
     }
 }
