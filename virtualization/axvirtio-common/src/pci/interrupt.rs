@@ -123,9 +123,8 @@ impl VirtioPciInterruptCoordinator {
 
     /// Commits the result of a transition executed by the endpoint context.
     ///
-    /// A failed physical operation is not converted into a guest-visible
-    /// access error.  The logical state is made retryable and the caller can
-    /// use [`Self::resynchronize`] on the next admitted transition point.
+    /// A failed physical operation leaves the logical state retryable; the
+    /// caller decides whether that failure also fails the guest-facing access.
     /// A successful transition returns a follow-up intent when another
     /// concurrent ISR/state change made the current physical target stale.
     pub fn complete_transition(

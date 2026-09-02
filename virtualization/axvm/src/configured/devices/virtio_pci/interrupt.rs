@@ -1,10 +1,10 @@
-use axdevice::PciEndpointContext;
+use axdevice::{EndpointIrqTransitionPermit, PciEndpointContext};
 use axdevice_base::{AccessWidth, DeviceError, DeviceResult};
 use axvirtio_common::{
     DeviceContextMemory,
     pci::{
-        InterruptPublication, InterruptTransition, InterruptTransitionRequest, VirtioDeviceCore,
-        VirtioPciWriteOutcome,
+        InterruptPublicationRequest, InterruptTransition, InterruptTransitionRequest,
+        VirtioDeviceCore, VirtioPciWriteOutcome,
     },
 };
 
@@ -17,6 +17,18 @@ enum TransitionResult {
 }
 
 impl<D: VirtioDeviceCore> VirtioPciFunction<D> {
+    fn execute_permitted_transition(
+        &self,
+        permit: &mut EndpointIrqTransitionPermit,
+        transition: InterruptTransition,
+    ) -> DeviceResult {
+        match transition {
+            InterruptTransition::Assert => permit.assert(&self.irq_line),
+            InterruptTransition::Deassert => permit.deassert(&self.irq_line),
+            InterruptTransition::None => Ok(()),
+        }
+    }
+
     fn execute_transition(
         &self,
         context: &mut dyn PciEndpointContext,
@@ -25,10 +37,8 @@ impl<D: VirtioDeviceCore> VirtioPciFunction<D> {
         if transition == InterruptTransition::None {
             return TransitionResult::Published;
         }
-        let result = context.with_irq_transition(&mut |permit| match transition {
-            InterruptTransition::Assert => permit.assert(&self.irq_line),
-            InterruptTransition::Deassert => permit.deassert(&self.irq_line),
-            InterruptTransition::None => Ok(()),
+        let result = context.with_irq_transition(&mut |permit| {
+            self.execute_permitted_transition(permit, transition)
         });
         match result {
             Ok(()) => TransitionResult::Published,
@@ -89,18 +99,43 @@ impl<D: VirtioDeviceCore> VirtioPciFunction<D> {
         let _ = self.finish_transition_request(context, request);
     }
 
+    fn publish_interrupt_request(
+        &self,
+        request: InterruptPublicationRequest,
+        context: &mut dyn PciEndpointContext,
+    ) -> DeviceResult {
+        if !request.requires_irq_permit() {
+            request.cancel();
+            return Ok(());
+        }
+
+        let mut request = Some(request);
+        let mut callback_entered = false;
+        let result = context.with_irq_transition(&mut |permit| {
+            callback_entered = true;
+            let Some(request) = request.take() else {
+                return Err(DeviceError::InvalidState {
+                    operation: "publish VirtIO PCI interrupt",
+                    detail: "IRQ transition callback ran more than once".into(),
+                });
+            };
+            request.publish(|transition| self.execute_permitted_transition(permit, transition))
+        });
+        if !callback_entered && matches!(result, Err(DeviceError::InvalidState { .. })) {
+            // Binding teardown won the IRQ admission race. The request has
+            // not recorded an ISR bit yet, so dropping it is a clean cancel.
+            drop(request);
+            return Ok(());
+        }
+        result
+    }
+
     fn publish_queue_notification(
         &self,
         notification: axvirtio_common::pci::QueueNotification,
         context: &mut dyn PciEndpointContext,
-    ) {
-        notification.publish(
-            |transition| match self.execute_transition(context, transition) {
-                TransitionResult::Published => InterruptPublication::Published,
-                TransitionResult::Suppressed => InterruptPublication::Suppressed,
-                TransitionResult::Failed(_) => InterruptPublication::Failed,
-            },
-        );
+    ) -> DeviceResult {
+        self.publish_interrupt_request(notification.into_interrupt_publication(), context)
     }
 
     pub(super) fn write_transport(
@@ -126,19 +161,12 @@ impl<D: VirtioDeviceCore> VirtioPciFunction<D> {
                 self.transport.complete_reset();
                 Ok(())
             }
-            VirtioPciWriteOutcome::Fault {
-                error,
-                interrupt,
-                activity,
-            } => {
-                let transition_result = self.finish_transition(context, interrupt);
-                drop(activity);
-                transition_result?;
+            VirtioPciWriteOutcome::Fault { error, publication } => {
+                self.publish_interrupt_request(publication, context)?;
                 Err(error)
             }
             VirtioPciWriteOutcome::QueueNotified(notification) => {
-                self.publish_queue_notification(notification, context);
-                Ok(())
+                self.publish_queue_notification(notification, context)
             }
         }
     }

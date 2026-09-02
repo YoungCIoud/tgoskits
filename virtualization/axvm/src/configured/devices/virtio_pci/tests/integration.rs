@@ -309,7 +309,7 @@ fn adapter_retries_completion_assert_after_irq_failure() {
     sink.fail_assert.store(true, Ordering::Relaxed);
     binding
         .write_bar_with_context(bar.address() + 0x100, AccessWidth::Word, 0, &mut context)
-        .expect("completion IRQ failure is not a queue access failure");
+        .expect_err("completion IRQ failure must be reported to the dispatcher");
     assert_eq!(sink.assert_calls.load(Ordering::Relaxed), 1);
 
     sink.fail_assert.store(false, Ordering::Relaxed);
