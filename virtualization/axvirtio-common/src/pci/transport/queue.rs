@@ -3,13 +3,13 @@ use alloc::sync::Arc;
 use axdevice_base::{DeviceError, DeviceResult};
 
 use super::{
-    ActivityPermit, QueueNotification, QueueNotifyOutcome, VirtioDeviceCore, VirtioPciTransport,
-    VirtioPciWriteOutcome, VirtioQueueGeneration, invalid_queue, map_pci_error,
+    ActivityPermit, InterruptPublicationKind, InterruptPublicationRequest, QueueNotification,
+    QueueNotifyOutcome, VirtioDeviceCore, VirtioPciTransport, VirtioPciWriteOutcome,
+    VirtioQueueGeneration, invalid_queue, map_pci_error,
 };
 use crate::{
     GuestMemory, NoGuestMemoryAccessor, VirtioQueue,
     constants::{VIRTIO_STATUS_DEVICE_NEEDS_RESET, VIRTIO_STATUS_DRIVER_OK},
-    pci::InterruptTransition,
 };
 
 impl<D: VirtioDeviceCore> VirtioPciTransport<D> {
@@ -117,25 +117,25 @@ impl<D: VirtioDeviceCore> VirtioPciTransport<D> {
             return Ok(fault);
         }
         self.restore_queue(selected, queue);
-        let interrupt = if matches!(outcome, QueueNotifyOutcome::Completed { notify: true }) {
-            self.interrupts.record_queue_completion(true)
+        let kind = if matches!(outcome, QueueNotifyOutcome::Completed { notify: true }) {
+            Some(InterruptPublicationKind::Queue)
         } else {
-            InterruptTransition::None
+            None
         };
         Ok(VirtioPciWriteOutcome::QueueNotified(QueueNotification {
             outcome,
-            interrupt,
-            activity: Some(activity),
-            interrupts: Arc::clone(&self.interrupts),
+            publication: InterruptPublicationRequest::new(
+                Arc::clone(&self.interrupts),
+                kind,
+                Some(activity),
+            ),
         }))
     }
 
     fn idle_notification(&self) -> VirtioPciWriteOutcome {
         VirtioPciWriteOutcome::QueueNotified(QueueNotification {
             outcome: QueueNotifyOutcome::Idle,
-            interrupt: InterruptTransition::None,
-            activity: None,
-            interrupts: Arc::clone(&self.interrupts),
+            publication: InterruptPublicationRequest::new(Arc::clone(&self.interrupts), None, None),
         })
     }
 
@@ -151,15 +151,18 @@ impl<D: VirtioDeviceCore> VirtioPciTransport<D> {
                 true
             }
         };
-        let interrupt = if report_interrupt {
-            self.interrupts.record_config_change()
+        let kind = if report_interrupt {
+            Some(InterruptPublicationKind::Configuration)
         } else {
-            InterruptTransition::None
+            None
         };
         VirtioPciWriteOutcome::Fault {
             error,
-            interrupt,
-            activity,
+            publication: InterruptPublicationRequest::new(
+                Arc::clone(&self.interrupts),
+                kind,
+                Some(activity),
+            ),
         }
     }
 

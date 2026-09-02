@@ -74,19 +74,23 @@ fn queue_notification_keeps_activity_until_irq_publication() {
     let permit = activity
         .acquire(transport.queue_generation())
         .expect("activity should be admitted");
-    let transition = interrupts.record_queue_completion(true);
     let notification = QueueNotification {
         outcome: QueueNotifyOutcome::Completed { notify: true },
-        interrupt: transition,
-        activity: Some(permit),
-        interrupts: Arc::clone(&interrupts),
+        publication: InterruptPublicationRequest::new(
+            Arc::clone(&interrupts),
+            Some(InterruptPublicationKind::Queue),
+            Some(permit),
+        ),
     };
+    assert!(!interrupts.pending());
     let published = Cell::new(false);
-    notification.publish(|actual| {
-        assert_eq!(actual, InterruptTransition::Assert);
-        published.set(true);
-        InterruptPublication::Published
-    });
+    notification
+        .publish(|actual| {
+            assert_eq!(actual, InterruptTransition::Assert);
+            published.set(true);
+            Ok(())
+        })
+        .expect("queue IRQ publication should succeed");
     assert!(published.get());
     assert!(!interrupts.needs_resync());
     activity.close_and_drain();

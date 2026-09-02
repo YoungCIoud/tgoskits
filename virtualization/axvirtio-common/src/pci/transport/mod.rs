@@ -24,8 +24,10 @@ mod transition;
 
 pub use state::ActivityPermit;
 use state::{QueueActivity, QueueState, TransportState};
+use transition::InterruptPublicationKind;
 pub use transition::{
-    InterruptPublication, InterruptTransitionRequest, QueueNotification, VirtioQueueGeneration,
+    InterruptPublicationRequest, InterruptTransitionRequest, QueueNotification,
+    VirtioQueueGeneration,
 };
 
 pub(super) const COMMON_CONFIG_SIZE: u64 = 0x38;
@@ -131,10 +133,8 @@ pub enum VirtioPciWriteOutcome {
     Fault {
         /// The processing error returned to the guest-facing dispatcher.
         error: DeviceError,
-        /// Physical interrupt-line transition for the config-change ISR bit.
-        interrupt: InterruptTransition,
-        /// Keeps reset quiescence active through terminal ISR/INTx handling.
-        activity: ActivityPermit,
+        /// Config-change ISR publication retained through terminal IRQ handling.
+        publication: InterruptPublicationRequest,
     },
 }
 

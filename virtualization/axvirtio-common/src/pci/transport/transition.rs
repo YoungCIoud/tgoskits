@@ -1,26 +1,21 @@
 use alloc::sync::Arc;
 
+use axdevice_base::DeviceResult;
+
 use super::{ActivityPermit, QueueNotifyOutcome};
 use crate::pci::{InterruptTransition, VirtioPciInterruptCoordinator};
 
-/// Result of attempting to publish one queue-completion transition.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum InterruptPublication {
-    /// The endpoint IRQ permit was acquired and the line operation succeeded.
-    Published,
-    /// The binding or queue generation was stale; suppress this completion.
-    Suppressed,
-    /// The line operation failed after admission.
-    Failed,
+pub(super) enum InterruptPublicationKind {
+    Queue,
+    Configuration,
 }
 
 /// Queue notification result whose activity permit remains alive until the
 /// endpoint has published or deliberately suppressed the completion interrupt.
 pub struct QueueNotification {
     pub(super) outcome: QueueNotifyOutcome,
-    pub(super) interrupt: InterruptTransition,
-    pub(super) activity: Option<ActivityPermit>,
-    pub(super) interrupts: Arc<VirtioPciInterruptCoordinator>,
+    pub(super) publication: InterruptPublicationRequest,
 }
 
 impl QueueNotification {
@@ -29,14 +24,74 @@ impl QueueNotification {
         self.outcome
     }
 
-    /// Returns the interrupt transition to execute under the endpoint IRQ
+    /// Returns whether publishing this notification requires an endpoint IRQ
     /// transition permit.
-    pub const fn interrupt_transition(&self) -> InterruptTransition {
-        self.interrupt
+    pub const fn requires_interrupt_publication(&self) -> bool {
+        self.publication.requires_irq_permit()
     }
 
     /// Returns the queue configuration generation covered by this terminal
     /// notification, if processing was admitted.
+    pub const fn generation(&self) -> Option<VirtioQueueGeneration> {
+        self.publication.generation()
+    }
+
+    /// Explicitly ends the activity lifetime without publishing an ISR bit.
+    pub fn complete(self) {
+        self.publication.cancel();
+    }
+
+    /// Publishes the completion ISR and line transition after endpoint IRQ
+    /// admission, then releases queue activity.
+    pub fn publish<F>(self, publish_transition: F) -> DeviceResult
+    where
+        F: FnMut(InterruptTransition) -> DeviceResult,
+    {
+        self.publication.publish(publish_transition)
+    }
+
+    /// Consumes this notification and returns its pending ISR publication.
+    pub fn into_interrupt_publication(self) -> InterruptPublicationRequest {
+        self.publication
+    }
+}
+
+/// ISR publication retained until the endpoint has acquired its IRQ permit.
+pub struct InterruptPublicationRequest {
+    kind: Option<InterruptPublicationKind>,
+    activity: Option<ActivityPermit>,
+    interrupts: Arc<VirtioPciInterruptCoordinator>,
+}
+
+impl core::fmt::Debug for InterruptPublicationRequest {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("InterruptPublicationRequest")
+            .field("kind", &self.kind)
+            .field("has_activity", &self.activity.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl InterruptPublicationRequest {
+    pub(super) fn new(
+        interrupts: Arc<VirtioPciInterruptCoordinator>,
+        kind: Option<InterruptPublicationKind>,
+        activity: Option<ActivityPermit>,
+    ) -> Self {
+        Self {
+            kind,
+            activity,
+            interrupts,
+        }
+    }
+
+    /// Returns whether ISR publication must be admitted by the endpoint.
+    pub const fn requires_irq_permit(&self) -> bool {
+        self.kind.is_some()
+    }
+
+    /// Returns the queue generation protected by the activity permit.
     pub const fn generation(&self) -> Option<VirtioQueueGeneration> {
         match &self.activity {
             Some(activity) => Some(activity.generation),
@@ -44,37 +99,39 @@ impl QueueNotification {
         }
     }
 
-    /// Explicitly ends the activity lifetime after completion publication.
-    pub fn complete(mut self) {
-        if self.interrupt != InterruptTransition::None {
-            self.interrupts.suppress_queue_completion(self.interrupt);
+    /// Records the ISR bit and executes all resulting line transitions.
+    ///
+    /// The caller must hold the endpoint IRQ transition permit before calling
+    /// this method. A failed line operation leaves the ISR state retryable and
+    /// is returned to the guest-facing dispatcher.
+    pub fn publish<F>(mut self, mut publish_transition: F) -> DeviceResult
+    where
+        F: FnMut(InterruptTransition) -> DeviceResult,
+    {
+        let Some(kind) = self.kind.take() else {
+            self.activity.take();
+            return Ok(());
+        };
+        let mut transition = match kind {
+            InterruptPublicationKind::Queue => self.interrupts.record_queue_completion(true),
+            InterruptPublicationKind::Configuration => self.interrupts.record_config_change(),
+        };
+        loop {
+            if let Err(error) = publish_transition(transition) {
+                self.interrupts.complete_transition(transition, false);
+                self.activity.take();
+                return Err(error);
+            }
+            transition = self.interrupts.complete_transition(transition, true);
+            if transition == InterruptTransition::None {
+                self.activity.take();
+                return Ok(());
+            }
         }
-        self.activity.take();
     }
 
-    /// Publishes the completion transition and then releases queue activity.
-    pub fn publish<F>(mut self, mut publish_transition: F)
-    where
-        F: FnMut(InterruptTransition) -> InterruptPublication,
-    {
-        let mut transition = self.interrupt;
-        loop {
-            match publish_transition(transition) {
-                InterruptPublication::Published => {
-                    transition = self.interrupts.complete_transition(transition, true);
-                }
-                InterruptPublication::Suppressed => {
-                    transition = self.interrupts.suppress_queue_completion(transition);
-                }
-                InterruptPublication::Failed => {
-                    self.interrupts.complete_transition(transition, false);
-                    transition = InterruptTransition::None;
-                }
-            }
-            if transition == InterruptTransition::None {
-                break;
-            }
-        }
+    /// Cancels publication and releases queue activity without recording an ISR bit.
+    pub fn cancel(mut self) {
         self.activity.take();
     }
 }

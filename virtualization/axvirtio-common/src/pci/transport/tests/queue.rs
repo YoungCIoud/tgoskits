@@ -129,21 +129,61 @@ fn admitted_queue_fault_sets_needs_reset_and_config_isr_once() {
             &mut failing_memory,
         )
         .expect("queue faults are reported as a transport outcome");
-    let VirtioPciWriteOutcome::Fault { interrupt, .. } = outcome else {
+    let VirtioPciWriteOutcome::Fault { publication, .. } = outcome else {
         panic!("expected a queue fault outcome");
     };
-    assert_eq!(interrupt, InterruptTransition::Assert);
+    assert!(publication.requires_irq_permit());
     assert_ne!(
         transport.status() & VIRTIO_STATUS_DEVICE_NEEDS_RESET as u8,
         0
     );
-    transport.complete_interrupt_transition(interrupt, true);
+    publication
+        .publish(|transition| {
+            assert_eq!(transition, InterruptTransition::Assert);
+            Ok(())
+        })
+        .expect("config-change IRQ publication should succeed");
     let (value, request) = transport
         .read_bar_with_interrupt(ISR_CONFIG_OFFSET, AccessWidth::Byte)
         .expect("ISR read should succeed");
     assert_eq!(value, 2);
     transport.complete_interrupt_transition(request.transition(), true);
     drop(request);
+}
+
+#[test]
+fn stale_fault_publication_does_not_leave_config_isr_pending() {
+    let transport = VirtioPciTransport::try_new(TestCore).expect("valid test transport");
+    let mut configuration_memory = TestMemory {
+        reads: Cell::new(0),
+    };
+    for (offset, width, value) in [
+        (DEVICE_STATUS, AccessWidth::Byte, 0x0b),
+        (DEVICE_STATUS, AccessWidth::Byte, 0x0f),
+        (QUEUE_DESC, AccessWidth::Qword, 0x1000),
+        (QUEUE_DRIVER, AccessWidth::Qword, 0x2000),
+        (QUEUE_DEVICE, AccessWidth::Qword, 0x3000),
+        (QUEUE_ENABLE, AccessWidth::Word, 1),
+    ] {
+        write(&transport, offset, width, value, &mut configuration_memory);
+    }
+
+    let mut failing_memory = FailingMemory;
+    let outcome = transport
+        .write_mmio_with_dma(
+            NOTIFY_CONFIG_OFFSET,
+            AccessWidth::Word,
+            0,
+            true,
+            &mut failing_memory,
+        )
+        .expect("queue faults are returned as a transport outcome");
+    let VirtioPciWriteOutcome::Fault { publication, .. } = outcome else {
+        panic!("expected a queue fault");
+    };
+
+    publication.cancel();
+    assert!(!transport.interrupt_pending());
 }
 
 #[test]
@@ -217,7 +257,7 @@ fn queue_fault_activity_blocks_reset_until_terminal_publication() {
         .recv()
         .expect("queue fault should be available before reset");
     fault_thread.join().expect("fault thread should finish");
-    let VirtioPciWriteOutcome::Fault { interrupt, .. } = outcome else {
+    let VirtioPciWriteOutcome::Fault { publication, .. } = outcome else {
         panic!("expected a queue fault");
     };
 
@@ -227,8 +267,12 @@ fn queue_fault_activity_blocks_reset_until_terminal_publication() {
         reset_thread.join().expect("reset thread should finish"),
         Err(DeviceError::InvalidState { .. })
     ));
-    transport.complete_interrupt_transition(interrupt, true);
-    drop(outcome);
+    publication
+        .publish(|transition| {
+            assert_eq!(transition, InterruptTransition::Assert);
+            Ok(())
+        })
+        .expect("fault publication should succeed");
 
     let reset_transition = transport
         .reset()
