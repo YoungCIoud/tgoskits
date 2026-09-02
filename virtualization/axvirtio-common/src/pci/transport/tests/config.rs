@@ -9,6 +9,24 @@ use crate::constants::{
 };
 
 #[test]
+fn msix_vector_registers_remain_unmapped_without_msix_capability() {
+    let transport = VirtioPciTransport::try_new(TestCore).expect("valid test transport");
+    let mut memory = TestMemory {
+        reads: Cell::new(0),
+    };
+
+    for offset in [MSIX_CONFIG, QUEUE_MSIX_VECTOR] {
+        write(&transport, offset, AccessWidth::Word, 7, &mut memory);
+        assert_eq!(
+            transport
+                .read_mmio(offset, AccessWidth::Word)
+                .expect("MSI-X vector register should be readable"),
+            u16::MAX as u64
+        );
+    }
+}
+
+#[test]
 fn device_status_accepts_cumulative_phases_but_rejects_clearing_bits() {
     let transport = VirtioPciTransport::try_new(TestCore).expect("valid test transport");
     let mut memory = TestMemory {

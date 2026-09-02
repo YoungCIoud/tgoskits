@@ -104,7 +104,6 @@ pub(super) struct TransportState {
     pub(super) device_feature_select: u32,
     pub(super) driver_feature_select: u32,
     pub(super) driver_features: u64,
-    pub(super) msix_config: u16,
     pub(super) status: u8,
     pub(super) queue_select: u16,
     pub(super) queue_size: u16,
@@ -129,7 +128,6 @@ impl TransportState {
             device_feature_select: 0,
             driver_feature_select: 0,
             driver_features: 0,
-            msix_config: u16::MAX,
             status: 0,
             queue_select: 0,
             queue_size: queue_size_max,
@@ -146,7 +144,6 @@ impl TransportState {
         self.device_feature_select = 0;
         self.driver_feature_select = 0;
         self.driver_features = 0;
-        self.msix_config = u16::MAX;
         self.status = VIRTIO_STATUS_DEVICE_NEEDS_RESET as u8;
         self.queue_select = 0;
         self.queue_size = queue_size_max;
