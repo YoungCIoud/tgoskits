@@ -470,8 +470,12 @@ fn configure_running_endpoint(
 ) {
     root.write_config(bdf, ConfigOffset::new(4).unwrap(), AccessWidth::Word, 6)
         .expect("VirtIO memory and bus mastering should enable");
+    for status in [1, 3, 0x0b, 0x0f] {
+        binding
+            .write_bar_with_context(bar + 0x14, AccessWidth::Byte, status, context)
+            .expect("VirtIO driver status should advance in order");
+    }
     for (offset, width, value) in [
-        (0x14, AccessWidth::Byte, 0x0f),
         (0x20, AccessWidth::Qword, 0x1000),
         (0x28, AccessWidth::Qword, 0x2000),
         (0x30, AccessWidth::Qword, 0x3000),

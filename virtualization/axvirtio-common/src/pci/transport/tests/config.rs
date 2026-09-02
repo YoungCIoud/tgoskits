@@ -3,7 +3,126 @@ use core::cell::Cell;
 use axdevice_base::{AccessWidth, DeviceError};
 
 use super::{super::*, fixtures::*};
-use crate::constants::VIRTIO_STATUS_DEVICE_NEEDS_RESET;
+use crate::constants::{
+    VIRTIO_F_VERSION_1, VIRTIO_STATUS_ACKNOWLEDGE, VIRTIO_STATUS_DEVICE_NEEDS_RESET,
+    VIRTIO_STATUS_DRIVER, VIRTIO_STATUS_DRIVER_OK, VIRTIO_STATUS_FAILED, VIRTIO_STATUS_FEATURES_OK,
+};
+
+#[test]
+fn device_status_rejects_skipped_and_cleared_driver_phases() {
+    let transport = VirtioPciTransport::try_new(TestCore).expect("valid test transport");
+    let mut memory = TestMemory {
+        reads: Cell::new(0),
+    };
+
+    assert!(matches!(
+        transport.write_mmio_with_dma(DEVICE_STATUS, AccessWidth::Byte, 0x0b, true, &mut memory,),
+        Err(DeviceError::InvalidState { .. })
+    ));
+    assert_eq!(transport.status(), 0);
+
+    write(&transport, DEVICE_STATUS, AccessWidth::Byte, 1, &mut memory);
+    write(&transport, DEVICE_STATUS, AccessWidth::Byte, 3, &mut memory);
+    assert!(matches!(
+        transport.write_mmio_with_dma(DEVICE_STATUS, AccessWidth::Byte, 1, true, &mut memory,),
+        Err(DeviceError::InvalidState { .. })
+    ));
+    assert_eq!(transport.status(), 3);
+}
+
+#[test]
+fn driver_features_are_frozen_after_features_ok() {
+    let transport = VirtioPciTransport::try_new(TestCore).expect("valid test transport");
+    let mut memory = TestMemory {
+        reads: Cell::new(0),
+    };
+    for status in [1, 3] {
+        write(
+            &transport,
+            DEVICE_STATUS,
+            AccessWidth::Byte,
+            status,
+            &mut memory,
+        );
+    }
+    write(
+        &transport,
+        DRIVER_FEATURE_SELECT,
+        AccessWidth::Dword,
+        1,
+        &mut memory,
+    );
+    write(
+        &transport,
+        DRIVER_FEATURE,
+        AccessWidth::Dword,
+        VIRTIO_F_VERSION_1 >> 32,
+        &mut memory,
+    );
+    write(
+        &transport,
+        DEVICE_STATUS,
+        AccessWidth::Byte,
+        0x0b,
+        &mut memory,
+    );
+
+    assert!(matches!(
+        transport.write_mmio_with_dma(
+            DRIVER_FEATURE_SELECT,
+            AccessWidth::Dword,
+            0,
+            true,
+            &mut memory,
+        ),
+        Err(DeviceError::InvalidState { .. })
+    ));
+    assert!(matches!(
+        transport.write_mmio_with_dma(DRIVER_FEATURE, AccessWidth::Dword, 0, true, &mut memory,),
+        Err(DeviceError::InvalidState { .. })
+    ));
+    assert_eq!(transport.driver_features(), VIRTIO_F_VERSION_1);
+}
+
+#[test]
+fn unsupported_driver_features_fail_negotiation_without_driver_ok() {
+    let transport = VirtioPciTransport::try_new(TestCore).expect("valid test transport");
+    let mut memory = TestMemory {
+        reads: Cell::new(0),
+    };
+    acknowledge_driver(&transport, &mut memory);
+    write(
+        &transport,
+        DRIVER_FEATURE_SELECT,
+        AccessWidth::Dword,
+        0,
+        &mut memory,
+    );
+    write(
+        &transport,
+        DRIVER_FEATURE,
+        AccessWidth::Dword,
+        1,
+        &mut memory,
+    );
+    write(
+        &transport,
+        DEVICE_STATUS,
+        AccessWidth::Byte,
+        (VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER | VIRTIO_STATUS_FEATURES_OK) as u64,
+        &mut memory,
+    );
+
+    let status = transport.status();
+    assert_eq!(
+        status,
+        (VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER | VIRTIO_STATUS_FAILED) as u8
+    );
+    assert_eq!(
+        status & (VIRTIO_STATUS_FEATURES_OK | VIRTIO_STATUS_DRIVER_OK) as u8,
+        0
+    );
+}
 
 #[test]
 fn queue_programming_does_not_probe_guest_memory() {
@@ -12,6 +131,7 @@ fn queue_programming_does_not_probe_guest_memory() {
         reads: Cell::new(0),
     };
 
+    acknowledge_driver(&transport, &mut memory);
     write(
         &transport,
         DEVICE_STATUS,
@@ -129,6 +249,7 @@ fn disabled_dma_stops_notify_before_guest_memory_access() {
     let mut memory = TestMemory {
         reads: Cell::new(0),
     };
+    acknowledge_driver(&transport, &mut memory);
     write(
         &transport,
         DEVICE_STATUS,
@@ -225,6 +346,7 @@ fn queue_fault_status_cannot_be_cleared_by_nonzero_status_write() {
     let mut configuration_memory = TestMemory {
         reads: Cell::new(0),
     };
+    acknowledge_driver(&transport, &mut configuration_memory);
     write(
         &transport,
         DEVICE_STATUS,
