@@ -6,17 +6,13 @@
 //! queue address LOW/HIGH, status, interrupt status/ack, config generation —
 //! is handled here so it is not duplicated per device.
 
-use alloc::{sync::Arc, vec, vec::Vec};
-use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use alloc::vec::Vec;
 
-use ax_sync::SpinLock as Mutex;
+use ax_sync::{SpinLock as Mutex, SpinLockIrqSaveGuard as MutexGuard};
 use axaddrspace::GuestMemoryAccessor;
 use axvm_types::{AccessWidth, GuestPhysAddr};
 
-use crate::{
-    VirtioQueue, VirtioResult, constants as vc, error::VirtioError, mmio::transport,
-    pci::VirtioQueueGeneration,
-};
+use crate::{VirtioQueue, VirtioResult, constants as vc, error::VirtioError, mmio::transport};
 
 /// Result of a standard-register MMIO read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,14 +29,8 @@ pub enum MmioWriteAction {
     /// Nothing for the device to do.
     None,
     /// The guest kicked a queue; the device runs its data path.
-    QueueNotified {
-        /// Queue selected by the guest notification.
-        index: u16,
-        /// Queue configuration lifetime observed for this notification.
-        generation: VirtioQueueGeneration,
-    },
-    /// The guest started a reset; the device adapter must complete
-    /// device-specific cleanup before final status publication.
+    QueueNotified(u16),
+    /// The guest wrote status 0; the device is fully reset.
     Reset,
     /// An acknowledged interrupt bit was raised again after the guest's last
     /// interrupt-status read and must be signalled again.
@@ -51,188 +41,6 @@ pub enum MmioWriteAction {
 struct InterruptState {
     pending: u32,
     raised_after_read: u32,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct QueueConfigurationSnapshot {
-    size: u16,
-    ready: bool,
-    desc_table_addr: GuestPhysAddr,
-    avail_ring_addr: GuestPhysAddr,
-    used_ring_addr: GuestPhysAddr,
-    event_idx_enabled: bool,
-}
-
-impl QueueConfigurationSnapshot {
-    fn from_queue<T: GuestMemoryAccessor + Clone>(queue: &VirtioQueue<T>) -> Self {
-        Self {
-            size: queue.size,
-            ready: queue.ready,
-            desc_table_addr: queue.desc_table_addr,
-            avail_ring_addr: queue.avail_ring_addr,
-            used_ring_addr: queue.used_ring_addr,
-            event_idx_enabled: queue.event_idx_enabled,
-        }
-    }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct QueueReadyValidationToken {
-    generation: VirtioQueueGeneration,
-    configuration: QueueConfigurationSnapshot,
-}
-
-struct QueueReadyValidationSnapshot<T: GuestMemoryAccessor + Clone> {
-    token: QueueReadyValidationToken,
-    queue: VirtioQueue<T>,
-}
-
-struct QueueActivity {
-    accepting: AtomicBool,
-    active: AtomicUsize,
-    resetting: AtomicBool,
-    generation: AtomicU64,
-}
-
-impl QueueActivity {
-    fn new() -> Self {
-        Self {
-            accepting: AtomicBool::new(true),
-            active: AtomicUsize::new(0),
-            resetting: AtomicBool::new(false),
-            generation: AtomicU64::new(0),
-        }
-    }
-
-    fn begin_reset(&self) -> bool {
-        if self
-            .resetting
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            return false;
-        }
-        self.accepting.store(false, Ordering::Release);
-        self.generation.fetch_add(1, Ordering::AcqRel);
-        true
-    }
-
-    fn current_generation(&self) -> VirtioQueueGeneration {
-        VirtioQueueGeneration::from_value(self.generation.load(Ordering::Acquire))
-    }
-
-    fn is_accepting(&self) -> bool {
-        self.accepting.load(Ordering::Acquire)
-    }
-
-    fn acquire(
-        self: &Arc<Self>,
-        expected_generation: VirtioQueueGeneration,
-    ) -> Option<MmioActivityPermit> {
-        if !self.is_accepting()
-            || self.generation.load(Ordering::Acquire) != expected_generation.value()
-        {
-            return None;
-        }
-        self.active.fetch_add(1, Ordering::AcqRel);
-        if self.is_accepting()
-            && self.generation.load(Ordering::Acquire) == expected_generation.value()
-        {
-            Some(MmioActivityPermit {
-                activity: Arc::clone(self),
-            })
-        } else {
-            self.active.fetch_sub(1, Ordering::Release);
-            None
-        }
-    }
-
-    fn close_and_drain(&self) -> bool {
-        self.accepting.store(false, Ordering::Release);
-        for _ in 0..(1 << 20) {
-            if self.active.load(Ordering::Acquire) == 0 {
-                return true;
-            }
-            core::hint::spin_loop();
-        }
-        false
-    }
-
-    fn reopen(&self) {
-        self.accepting.store(true, Ordering::Release);
-        self.resetting.store(false, Ordering::Release);
-    }
-
-    fn abort_reset(&self) {
-        // Keep admission closed after a bounded drain failure. A later
-        // status-zero write may retry the reset once the active operation has
-        // released its permit.
-        self.resetting.store(false, Ordering::Release);
-    }
-}
-
-struct MmioActivityPermit {
-    activity: Arc<QueueActivity>,
-}
-
-impl Drop for MmioActivityPermit {
-    fn drop(&mut self) {
-        self.activity.active.fetch_sub(1, Ordering::Release);
-    }
-}
-
-/// An MMIO queue temporarily owned by one queue-processing operation.
-pub struct MmioQueueLease<'state, T: GuestMemoryAccessor + Clone> {
-    state: &'state VirtioMmioState<T>,
-    index: u16,
-    generation: VirtioQueueGeneration,
-    queue: Option<VirtioQueue<T>>,
-    _activity: Option<MmioActivityPermit>,
-}
-
-impl<T: GuestMemoryAccessor + Clone> MmioQueueLease<'_, T> {
-    /// Accesses the queue owned by this processing operation, if not restored.
-    pub fn queue(&self) -> Option<&VirtioQueue<T>> {
-        self.queue.as_ref()
-    }
-
-    /// Mutably accesses the queue owned by this processing operation, if not restored.
-    pub fn queue_mut(&mut self) -> Option<&mut VirtioQueue<T>> {
-        self.queue.as_mut()
-    }
-
-    /// Returns the queue configuration lifetime admitted by this lease.
-    pub const fn generation(&self) -> VirtioQueueGeneration {
-        self.generation
-    }
-
-    /// Returns the queue while retaining the activity permit.
-    ///
-    /// The owner must keep this lease alive until any interrupt or other
-    /// completion notification has been published or suppressed.
-    pub fn restore_queue(&mut self) {
-        self.restore();
-    }
-
-    fn restore(&mut self) {
-        let Some(queue) = self.queue.take() else {
-            return;
-        };
-        let mut processing = self.state.queue_processing.lock_irqsave();
-        let mut queues = self.state.queues.lock_irqsave();
-        if let Some(slot) = queues.get_mut(self.index as usize) {
-            *slot = queue;
-        }
-        if let Some(in_progress) = processing.get_mut(self.index as usize) {
-            *in_progress = false;
-        }
-    }
-}
-
-impl<T: GuestMemoryAccessor + Clone> Drop for MmioQueueLease<'_, T> {
-    fn drop(&mut self) {
-        self.restore();
-    }
 }
 
 /// Shared VirtIO MMIO transport state plus the device's queues.
@@ -255,8 +63,6 @@ pub struct VirtioMmioState<T: GuestMemoryAccessor + Clone> {
     /// Serializes queue configuration register writes without blocking the data path.
     queue_config_transaction: Mutex<()>,
     queues: Mutex<Vec<VirtioQueue<T>>>,
-    queue_processing: Mutex<Vec<bool>>,
-    activity: Arc<QueueActivity>,
     interrupt_status: Mutex<InterruptState>,
     config_generation: Mutex<u32>,
 }
@@ -285,9 +91,7 @@ impl<T: GuestMemoryAccessor + Clone> VirtioMmioState<T> {
             driver_features_sel: Mutex::new(0),
             queue_sel: Mutex::new(0),
             queue_config_transaction: Mutex::new(()),
-            queue_processing: Mutex::new(vec![false; queues.len()]),
             queues: Mutex::new(queues),
-            activity: Arc::new(QueueActivity::new()),
             interrupt_status: Mutex::new(InterruptState::default()),
             config_generation: Mutex::new(0),
         }
@@ -300,70 +104,12 @@ impl<T: GuestMemoryAccessor + Clone> VirtioMmioState<T> {
 
     /// Number of queues.
     pub fn num_queues(&self) -> usize {
-        let _processing = self.queue_processing.lock_irqsave();
         self.queues.lock_irqsave().len()
     }
 
-    /// Returns the queue configuration lifetime currently admitted for work.
-    pub fn queue_generation(&self) -> VirtioQueueGeneration {
-        self.activity.current_generation()
-    }
-
-    /// Returns a queue's size and ready state as one configuration snapshot.
-    pub fn queue_configuration(&self, index: u16) -> Option<(u16, bool)> {
-        let _processing = self.queue_processing.lock_irqsave();
-        self.queues
-            .lock_irqsave()
-            .get(index as usize)
-            .map(|queue| (queue.size, queue.ready))
-    }
-
-    /// Returns whether one queue has latched a runtime fault.
-    pub fn is_queue_faulted(&self, index: usize) -> bool {
-        let _processing = self.queue_processing.lock_irqsave();
-        self.queues
-            .lock_irqsave()
-            .get(index)
-            .is_some_and(VirtioQueue::is_faulted)
-    }
-
-    /// Clones one queue for diagnostic or configuration inspection.
-    pub fn queue_snapshot(&self, index: u16) -> Option<VirtioQueue<T>> {
-        let _processing = self.queue_processing.lock_irqsave();
-        self.queues.lock_irqsave().get(index as usize).cloned()
-    }
-
-    /// Takes exclusive ownership of one queue without holding the state lock.
-    pub fn take_queue_for_processing(
-        &self,
-        index: u16,
-        generation: VirtioQueueGeneration,
-    ) -> Option<MmioQueueLease<'_, T>> {
-        let activity = self.activity.acquire(generation)?;
-        if !self.is_driver_ok() {
-            drop(activity);
-            return None;
-        }
-        let mut processing = self.queue_processing.lock_irqsave();
-        let in_progress = processing.get_mut(index as usize)?;
-        if *in_progress {
-            return None;
-        }
-        let mut queues = self.queues.lock_irqsave();
-        let queue = queues.get_mut(index as usize)?;
-        *in_progress = true;
-        // Keep a read-only configuration image visible while the real queue is
-        // owned by the lease. Configuration writes are rejected by the
-        // processing flag, while MMIO reads must not observe an empty queue.
-        let replacement = queue.clone();
-        let queue = core::mem::replace(queue, replacement);
-        Some(MmioQueueLease {
-            state: self,
-            index,
-            generation,
-            queue: Some(queue),
-            _activity: Some(activity),
-        })
+    /// Lock the queue vector for a device data path.
+    pub fn queues_lock(&self) -> MutexGuard<'_, Vec<VirtioQueue<T>>> {
+        self.queues.lock_irqsave()
     }
 
     /// Whether the driver has set `DRIVER_OK`.
@@ -424,53 +170,19 @@ impl<T: GuestMemoryAccessor + Clone> VirtioMmioState<T> {
 
     /// Full transport reset: clears driver features, selectors, interrupt
     /// status, status and every queue. Device identity and features are kept.
-    pub fn reset(&self) -> VirtioResult<()> {
-        self.begin_reset()?;
-        self.complete_reset()
-    }
-
-    /// Closes MMIO activity admission and drains all active queue operations.
-    ///
-    /// The caller must invoke [`complete_reset`](Self::complete_reset) after
-    /// resetting device-specific state. Until then the old non-zero status and
-    /// the closed activity gate remain visible.
-    pub fn begin_reset(&self) -> VirtioResult<()> {
-        if !self.activity.begin_reset() {
-            return Err(VirtioError::WouldBlock);
-        }
-        if !self.activity.close_and_drain() {
-            self.activity.abort_reset();
-            return Err(VirtioError::WouldBlock);
-        }
-        Ok(())
-    }
-
-    /// Publishes completion of a reset after device-specific cleanup.
-    pub fn complete_reset(&self) -> VirtioResult<()> {
-        if !self.activity.resetting.load(Ordering::Acquire) {
-            return Err(VirtioError::WouldBlock);
-        }
+    pub fn reset(&self) {
         let _queue_config_guard = self.queue_config_transaction.lock();
         let mut features_sealed = self.features_sealed.lock_irqsave();
         *self.driver_features.lock_irqsave() = 0;
         *self.driver_features_sel.lock_irqsave() = 0;
         *self.device_features_sel.lock_irqsave() = 0;
         *self.queue_sel.lock_irqsave() = 0;
-        {
-            let mut processing = self.queue_processing.lock_irqsave();
-            let mut queues = self.queues.lock_irqsave();
-            for (in_progress, queue) in processing.iter_mut().zip(queues.iter_mut()) {
-                *in_progress = false;
-                queue.reset();
-            }
-        }
         *self.interrupt_status.lock_irqsave() = InterruptState::default();
-        // Keep admission closed while status is still the pre-reset value.
-        // Status zero is the final guest-visible reset completion marker.
         *self.status.lock_irqsave() = 0;
+        for q in self.queues.lock_irqsave().iter_mut() {
+            q.reset();
+        }
         *features_sealed = false;
-        self.activity.reopen();
-        Ok(())
     }
 
     /// Handle a standard MMIO read. Out-of-range reads yield `Standard(0)`;
@@ -515,13 +227,17 @@ impl<T: GuestMemoryAccessor + Clone> VirtioMmioState<T> {
             vc::VIRTIO_MMIO_QUEUE_NUM_MAX => vc::DEFAULT_QUEUE_SIZE as u32,
             vc::VIRTIO_MMIO_QUEUE_NUM => {
                 let sel = *self.queue_sel.lock_irqsave();
-                self.queue_configuration(sel)
-                    .map_or(0, |(size, _)| size as u32)
+                self.queues
+                    .lock_irqsave()
+                    .get(sel as usize)
+                    .map_or(0, |q| q.size as u32)
             }
             vc::VIRTIO_MMIO_QUEUE_READY => {
                 let sel = *self.queue_sel.lock_irqsave();
-                self.queue_configuration(sel)
-                    .map_or(0, |(_, ready)| u32::from(ready))
+                self.queues
+                    .lock_irqsave()
+                    .get(sel as usize)
+                    .map_or(0, |q| if q.ready { 1 } else { 0 })
             }
             vc::VIRTIO_MMIO_INTERRUPT_STATUS => {
                 let mut interrupt = self.interrupt_status.lock_irqsave();
@@ -613,73 +329,59 @@ impl<T: GuestMemoryAccessor + Clone> VirtioMmioState<T> {
             }
             vc::VIRTIO_MMIO_QUEUE_SEL => {
                 let sel = val as u16;
-                let in_range = {
-                    let _processing = self.queue_processing.lock_irqsave();
-                    (sel as usize) < self.queues.lock_irqsave().len()
-                };
-                if in_range {
+                if (sel as usize) < self.queues.lock_irqsave().len() {
                     *self.queue_sel.lock_irqsave() = sel;
                 }
             }
             vc::VIRTIO_MMIO_QUEUE_NUM => {
                 let sel = *self.queue_sel.lock_irqsave();
-                let processing = self.queue_processing.lock_irqsave();
-                if let Some(q) = self.queues.lock_irqsave().get_mut(sel as usize)
-                    && !processing.get(sel as usize).copied().unwrap_or(true)
-                {
+                if let Some(q) = self.queues.lock_irqsave().get_mut(sel as usize) {
                     let _ = q.set_size(val as u16);
                 }
             }
             vc::VIRTIO_MMIO_QUEUE_READY => {
                 let sel = *self.queue_sel.lock_irqsave();
-                if let Some(mut validation) = self.snapshot_queue_ready_validation(sel) {
-                    let layout_ok = if val == 0 {
-                        true
-                    } else if validation.queue.is_configured() {
-                        match ready_memory {
-                            Some(memory) => validation
-                                .queue
-                                .validate_layout_with_memory(memory)
-                                .and_then(|()| {
-                                    validation.queue.set_ready(true);
-                                    validation
-                                        .queue
-                                        .rearm_available_event_with_memory(memory)
-                                        .map(|_| ())
-                                }),
-                            None => {
-                                let accessor = validation.queue.accessor().clone();
-                                let mut memory = crate::AddressSpaceMemory::new(&*accessor);
-                                validation
-                                    .queue
-                                    .validate_layout_with_memory(&mut memory)
-                                    .and_then(|()| {
-                                        validation.queue.set_ready(true);
-                                        validation
-                                            .queue
-                                            .rearm_available_event_with_memory(&mut memory)
-                                            .map(|_| ())
-                                    })
-                            }
-                        }
-                        .is_ok()
-                    } else {
-                        false
-                    };
-                    self.commit_queue_ready_validation(sel, val, validation.token, layout_ok);
-                }
-            }
-            vc::VIRTIO_MMIO_QUEUE_NOTIFY => {
-                let generation = self.activity.current_generation();
-                let status = *self.status.lock_irqsave();
-                if status & vc::VIRTIO_STATUS_DRIVER_OK == 0 || !self.activity.is_accepting() {
+                if val == 0 {
+                    if let Some(queue) = self.queues.lock_irqsave().get_mut(sel as usize) {
+                        queue.cancel_ready_preparation();
+                    }
                     return Ok(MmioWriteAction::None);
                 }
-                return Ok(MmioWriteAction::QueueNotified {
-                    index: val as u16,
-                    generation,
-                });
+                let mut candidate = self
+                    .queues
+                    .lock_irqsave()
+                    .get_mut(sel as usize)
+                    .and_then(VirtioQueue::begin_ready_preparation);
+                let prepared = if let Some(queue) = candidate.as_mut() {
+                    let result = match ready_memory {
+                        Some(memory) => queue.validate_layout_with_memory(memory).and_then(|()| {
+                            queue.set_ready(true);
+                            queue.rearm_available_event_with_memory(memory).map(|_| ())
+                        }),
+                        None => {
+                            let accessor = queue.accessor().clone();
+                            let mut memory = crate::AddressSpaceMemory::new(&*accessor);
+                            queue
+                                .validate_layout_with_memory(&mut memory)
+                                .and_then(|()| {
+                                    queue.set_ready(true);
+                                    queue
+                                        .rearm_available_event_with_memory(&mut memory)
+                                        .map(|_| ())
+                                })
+                        }
+                    };
+                    result.is_ok()
+                } else {
+                    false
+                };
+                if let Some(snapshot) = candidate.as_ref()
+                    && let Some(queue) = self.queues.lock_irqsave().get_mut(sel as usize)
+                {
+                    queue.finish_ready_preparation(snapshot, prepared);
+                }
             }
+            vc::VIRTIO_MMIO_QUEUE_NOTIFY => return Ok(MmioWriteAction::QueueNotified(val as u16)),
             vc::VIRTIO_MMIO_INTERRUPT_ACK => {
                 let mut interrupt = self.interrupt_status.lock_irqsave();
                 let raised_after_read = interrupt.raised_after_read & val;
@@ -700,61 +402,11 @@ impl<T: GuestMemoryAccessor + Clone> VirtioMmioState<T> {
         Ok(MmioWriteAction::None)
     }
 
-    fn snapshot_queue_ready_validation(
-        &self,
-        index: u16,
-    ) -> Option<QueueReadyValidationSnapshot<T>> {
-        let generation_before = self.activity.current_generation();
-        let accepting_before = self.activity.is_accepting();
-        let processing = self.queue_processing.lock_irqsave();
-        let queues = self.queues.lock_irqsave();
-        let generation_after = self.activity.current_generation();
-        let accepting_after = self.activity.is_accepting();
-        if !accepting_before
-            || !accepting_after
-            || generation_before != generation_after
-            || processing.get(index as usize).copied().unwrap_or(true)
-        {
-            return None;
-        }
-        queues
-            .get(index as usize)
-            .map(|queue| QueueReadyValidationSnapshot {
-                token: QueueReadyValidationToken {
-                    generation: generation_before,
-                    configuration: QueueConfigurationSnapshot::from_queue(queue),
-                },
-                queue: queue.clone(),
-            })
-    }
-
-    fn commit_queue_ready_validation(
-        &self,
-        index: u16,
-        value: u32,
-        validation: QueueReadyValidationToken,
-        layout_ok: bool,
-    ) {
-        let processing = self.queue_processing.lock_irqsave();
-        let mut queues = self.queues.lock_irqsave();
-        if self.activity.is_accepting()
-            && self.activity.current_generation() == validation.generation
-            && !processing.get(index as usize).copied().unwrap_or(true)
-            && let Some(queue) = queues.get_mut(index as usize)
-            && QueueConfigurationSnapshot::from_queue(queue) == validation.configuration
-        {
-            if value != 0 && queue.is_configured() && !layout_ok {
-                queue.report_layout_rejection();
-            }
-            queue.set_ready(value != 0 && layout_ok);
-        }
-    }
-
     /// Validate a status write. Writing 0 resets; sealing `FEATURES_OK` is
     /// rejected unless driver features are a subset of device features.
     fn handle_status_write(&self, val: u32) -> VirtioResult<MmioWriteAction> {
         if val == 0 {
-            self.begin_reset()?;
+            self.reset();
             return Ok(MmioWriteAction::Reset);
         }
         let mut features_sealed = self.features_sealed.lock_irqsave();
@@ -784,10 +436,6 @@ impl<T: GuestMemoryAccessor + Clone> VirtioMmioState<T> {
     /// Combine a 32-bit LOW/HIGH half into a queue address (overwrite semantics).
     fn write_queue_address(&self, reg: usize, val: u32) {
         let sel = *self.queue_sel.lock_irqsave();
-        let processing = self.queue_processing.lock_irqsave();
-        if processing.get(sel as usize).copied().unwrap_or(true) {
-            return;
-        }
         let mut queues = self.queues.lock_irqsave();
         let Some(q) = queues.get_mut(sel as usize) else {
             return;
@@ -865,4 +513,199 @@ fn combine_addr(current: usize, half: u32, low: bool) -> usize {
         (cur & 0x0000_0000_ffff_ffff) | (h << 32)
     };
     combined as usize
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::{sync::Arc, vec};
+    use core::sync::atomic::{AtomicBool, Ordering};
+
+    use axvm_types::{AccessWidth, GuestPhysAddr};
+
+    use super::*;
+    use crate::{GuestMemory, NoGuestMemoryAccessor, VirtioResult};
+
+    /// Guest-memory implementation that re-enters the MMIO queue state on its
+    /// first access, making the callback/transport interleaving deterministic.
+    struct ReentrantMemory {
+        on_access: Arc<dyn Fn() + Send + Sync>,
+    }
+
+    impl GuestMemory for ReentrantMemory {
+        fn read(&mut self, _guest_addr: GuestPhysAddr, data: &mut [u8]) -> VirtioResult<()> {
+            (self.on_access)();
+            data.fill(0);
+            Ok(())
+        }
+
+        fn write(&mut self, _guest_addr: GuestPhysAddr, _data: &[u8]) -> VirtioResult<()> {
+            (self.on_access)();
+            Ok(())
+        }
+    }
+
+    struct PanicMemory;
+
+    impl GuestMemory for PanicMemory {
+        fn read(&mut self, _guest_addr: GuestPhysAddr, _data: &mut [u8]) -> VirtioResult<()> {
+            panic!("QUEUE_READY=0 must not probe guest memory");
+        }
+
+        fn write(&mut self, _guest_addr: GuestPhysAddr, _data: &[u8]) -> VirtioResult<()> {
+            panic!("QUEUE_READY=0 must not write guest memory");
+        }
+    }
+
+    struct AcceptMemory;
+
+    impl GuestMemory for AcceptMemory {
+        fn read(&mut self, _guest_addr: GuestPhysAddr, data: &mut [u8]) -> VirtioResult<()> {
+            data.fill(0);
+            Ok(())
+        }
+
+        fn write(&mut self, _guest_addr: GuestPhysAddr, _data: &[u8]) -> VirtioResult<()> {
+            Ok(())
+        }
+    }
+
+    fn configured_state() -> Arc<VirtioMmioState<NoGuestMemoryAccessor>> {
+        const BASE: usize = 0x0a00_0000;
+        const LENGTH: usize = 0x200;
+
+        let queue = VirtioQueue::new(0, 4, Arc::new(NoGuestMemoryAccessor));
+        let state = Arc::new(VirtioMmioState::new(
+            GuestPhysAddr::from(BASE),
+            LENGTH,
+            2,
+            vc::VIRTIO_VENDOR_ID,
+            0,
+            vec![queue],
+        ));
+        for (register, value) in [
+            (vc::VIRTIO_MMIO_QUEUE_SEL, 0),
+            (vc::VIRTIO_MMIO_QUEUE_NUM, 4),
+            (vc::VIRTIO_MMIO_QUEUE_DESC_LOW, 0x1000),
+            (vc::VIRTIO_MMIO_QUEUE_AVAIL_LOW, 0x2000),
+            (vc::VIRTIO_MMIO_QUEUE_USED_LOW, 0x3000),
+        ] {
+            state
+                .mmio_write(
+                    GuestPhysAddr::from(BASE + register),
+                    AccessWidth::Dword,
+                    value,
+                )
+                .unwrap();
+        }
+        state
+    }
+
+    #[test]
+    fn queue_ready_zero_cancels_without_guest_memory_probe() {
+        const BASE: usize = 0x0a00_0000;
+
+        let state = configured_state();
+        assert!(
+            state.queues.lock_irqsave()[0]
+                .begin_ready_preparation()
+                .is_some()
+        );
+        let mut memory = PanicMemory;
+        state
+            .mmio_write_with_memory(
+                GuestPhysAddr::from(BASE + vc::VIRTIO_MMIO_QUEUE_READY),
+                AccessWidth::Dword,
+                0,
+                &mut memory,
+            )
+            .unwrap();
+
+        assert_eq!(
+            state
+                .mmio_read(
+                    GuestPhysAddr::from(BASE + vc::VIRTIO_MMIO_QUEUE_READY),
+                    AccessWidth::Dword,
+                )
+                .unwrap(),
+            MmioReadOutcome::Standard(0)
+        );
+
+        let mut memory = AcceptMemory;
+        state
+            .mmio_write_with_memory(
+                GuestPhysAddr::from(BASE + vc::VIRTIO_MMIO_QUEUE_READY),
+                AccessWidth::Dword,
+                1,
+                &mut memory,
+            )
+            .unwrap();
+        assert_eq!(
+            state
+                .mmio_read(
+                    GuestPhysAddr::from(BASE + vc::VIRTIO_MMIO_QUEUE_READY),
+                    AccessWidth::Dword,
+                )
+                .unwrap(),
+            MmioReadOutcome::Standard(1),
+            "QUEUE_READY=0 must release a prior preparation for retry"
+        );
+    }
+
+    #[test]
+    fn queue_ready_rejects_reentrant_configuration_changes() {
+        const BASE: usize = 0x0a00_0000;
+
+        let state = configured_state();
+
+        // The callback changes the live layout only when it can re-enter the
+        // queue lock. The old hold-the-lock implementation therefore leaves
+        // the original layout unchanged and incorrectly publishes READY.
+        let callback_attempted = Arc::new(AtomicBool::new(false));
+        let callback_reentered = Arc::new(AtomicBool::new(false));
+        let state_for_callback = Arc::clone(&state);
+        let attempted_for_callback = Arc::clone(&callback_attempted);
+        let reentered_for_callback = Arc::clone(&callback_reentered);
+        let mut memory = ReentrantMemory {
+            on_access: Arc::new(move || {
+                if attempted_for_callback.swap(true, Ordering::AcqRel) {
+                    return;
+                }
+                let Some(mut queues) = state_for_callback.queues.try_lock_irqsave() else {
+                    return;
+                };
+                queues[0]
+                    .set_used_ring_addr(GuestPhysAddr::from(0x4000))
+                    .unwrap();
+                reentered_for_callback.store(true, Ordering::Release);
+            }),
+        };
+
+        state
+            .mmio_write_with_memory(
+                GuestPhysAddr::from(BASE + vc::VIRTIO_MMIO_QUEUE_READY),
+                AccessWidth::Dword,
+                1,
+                &mut memory,
+            )
+            .unwrap();
+
+        assert!(
+            callback_reentered.load(Ordering::Acquire),
+            "guest-memory callback must run after the queue lock is released"
+        );
+        assert_eq!(
+            state
+                .mmio_read(
+                    GuestPhysAddr::from(BASE + vc::VIRTIO_MMIO_QUEUE_READY),
+                    AccessWidth::Dword,
+                )
+                .unwrap(),
+            MmioReadOutcome::Standard(0),
+            "a configuration change during validation must prevent stale ready publication"
+        );
+        assert_eq!(
+            state.queues_lock()[0].used_ring_addr,
+            GuestPhysAddr::from(0x4000)
+        );
+    }
 }

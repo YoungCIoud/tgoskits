@@ -3,8 +3,8 @@ use alloc::{sync::Arc, vec};
 use ax_sync::SpinLock;
 use axaddrspace::GuestMemoryAccessor;
 use axvirtio_common::{
-    AddressSpaceMemory, MmioReadOutcome, MmioWriteAction, VirtioDeviceID, VirtioMmioState,
-    VirtioQueue, VirtioQueueGeneration, VirtioResult, mmio::transport,
+    AddressSpaceMemory, MmioReadOutcome, MmioWriteAction, VirtioDeviceID, VirtioError,
+    VirtioMmioState, VirtioQueue, VirtioResult, mmio::transport,
 };
 use axvm_types::{AccessWidth, GuestPhysAddr};
 use log::trace;
@@ -23,17 +23,9 @@ pub enum BlockDeviceEvent {
     /// The used-ring interrupt bit became pending.
     InterruptPending,
     /// A blocking backend must process the notified queue from runtime poll.
-    QueuePending {
-        /// Queue whose deferred request remains pending.
-        index: u16,
-        /// Queue configuration lifetime that owns the pending request.
-        generation: VirtioQueueGeneration,
-    },
-    /// The guest reset the transport and reopened this queue generation.
-    Reset {
-        /// Queue configuration lifetime opened after reset cleanup.
-        generation: VirtioQueueGeneration,
-    },
+    QueuePending(u16),
+    /// The guest reset the transport.
+    Reset,
 }
 
 /// VirtIO MMIO Block Device
@@ -164,17 +156,14 @@ impl<B: BlockBackend, T: GuestMemoryAccessor + Clone> VirtioMmioBlockDevice<B, T
                 // A transport reset invalidates every in-flight descriptor,
                 // including a deferred request that was removed from avail.
                 self.clear_pending_head();
-                self.state.complete_reset()?;
-                Ok(BlockDeviceEvent::Reset {
-                    generation: self.state.queue_generation(),
-                })
+                Ok(BlockDeviceEvent::Reset)
             }
             MmioWriteAction::InterruptPending => Ok(BlockDeviceEvent::InterruptPending),
-            MmioWriteAction::QueueNotified { index, generation } => {
+            MmioWriteAction::QueueNotified(index) => {
                 if self.core.requires_deferred_processing() {
-                    Ok(BlockDeviceEvent::QueuePending { index, generation })
+                    Ok(BlockDeviceEvent::QueuePending(index))
                 } else {
-                    self.handle_queue_notify(index, generation, memory)
+                    self.handle_queue_notify(index, memory)
                 }
             }
         }
@@ -185,39 +174,30 @@ impl<B: BlockBackend, T: GuestMemoryAccessor + Clone> VirtioMmioBlockDevice<B, T
     pub fn process_pending_queue(
         &self,
         queue_index: u16,
-        generation: VirtioQueueGeneration,
         memory: &mut dyn axvirtio_common::GuestMemory,
     ) -> VirtioResult<BlockDeviceEvent> {
-        self.handle_queue_notify(queue_index, generation, memory)
+        self.handle_queue_notify(queue_index, memory)
     }
 
     /// Handle queue notification.
     fn handle_queue_notify(
         &self,
         queue_index: u16,
-        generation: VirtioQueueGeneration,
         memory: &mut dyn axvirtio_common::GuestMemory,
     ) -> VirtioResult<BlockDeviceEvent> {
-        let Some(mut queue_lease) = self
-            .state
-            .take_queue_for_processing(queue_index, generation)
-        else {
+        if !self.is_device_ready() {
             return Ok(BlockDeviceEvent::None);
-        };
-        let Some(queue) = queue_lease.queue() else {
-            return Ok(BlockDeviceEvent::None);
-        };
+        }
+        let mut queues = self.state.queues_lock();
+        let queue = queues
+            .get_mut(queue_index as usize)
+            .ok_or(VirtioError::InvalidQueue)?;
         if !queue.is_valid() {
             return Ok(BlockDeviceEvent::None);
         }
         let pending_head = self.take_pending_head();
-        let Some(queue) = queue_lease.queue_mut() else {
-            return Ok(BlockDeviceEvent::None);
-        };
         let outcome = self.core.process_queue(queue, memory, pending_head);
-        // Return the queue before publishing the interrupt, but retain the
-        // activity permit until the interrupt bit has been published.
-        queue_lease.restore_queue();
+        drop(queues);
         match outcome? {
             BlockQueueOutcome::Idle | BlockQueueOutcome::Completed { notify: false } => {
                 Ok(BlockDeviceEvent::None)
@@ -234,10 +214,7 @@ impl<B: BlockBackend, T: GuestMemoryAccessor + Clone> VirtioMmioBlockDevice<B, T
                 if notify {
                     self.trigger_interrupt();
                 }
-                Ok(BlockDeviceEvent::QueuePending {
-                    index: queue_index,
-                    generation,
-                })
+                Ok(BlockDeviceEvent::QueuePending(queue_index))
             }
         }
     }
@@ -267,7 +244,7 @@ impl<B: BlockBackend, T: GuestMemoryAccessor + Clone> VirtioMmioBlockDevice<B, T
 
     /// Get a clone of the queue at `index`, if it exists.
     pub fn get_queue(&self, index: u16) -> Option<VirtioQueue<T>> {
-        self.state.queue_snapshot(index)
+        self.state.queues_lock().get(index as usize).cloned()
     }
 
     /// Read from block device configuration space.
@@ -477,7 +454,7 @@ mod tests {
             &mut memory,
         );
 
-        assert!(matches!(event, Ok(BlockDeviceEvent::Reset { .. })));
+        assert_eq!(event, Ok(BlockDeviceEvent::Reset));
         assert_eq!(device.take_pending_head(), None);
     }
 
@@ -504,9 +481,8 @@ mod tests {
         }
         memory.0[AVAIL_RING + 2..AVAIL_RING + 4].copy_from_slice(&2u16.to_le_bytes());
 
-        let generation = device.state.queue_generation();
         assert_eq!(
-            device.handle_queue_notify(0, generation, &mut memory),
+            device.handle_queue_notify(0, &mut memory),
             Ok(BlockDeviceEvent::None)
         );
 

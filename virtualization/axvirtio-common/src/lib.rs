@@ -34,7 +34,7 @@ pub use constants::*;
 pub use device_type::VirtioDeviceID;
 pub use error::{VirtioError, VirtioResult, map_virtio_error};
 pub use memory::{AddressSpaceMemory, DeviceContextMemory, GuestMemory, NoGuestMemoryAccessor};
-pub use mmio::state::{MmioQueueLease, MmioReadOutcome, MmioWriteAction, VirtioMmioState};
+pub use mmio::state::{MmioReadOutcome, MmioWriteAction, VirtioMmioState};
 pub use pci::{
     ActivityPermit, InterruptPublicationRequest, InterruptTransitionRequest, QueueNotification,
     QueueNotifyOutcome, VirtioDeviceCore, VirtioPciTransport, VirtioPciWriteOutcome,

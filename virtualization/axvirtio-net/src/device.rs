@@ -5,8 +5,8 @@ use alloc::{sync::Arc, vec::Vec};
 use ax_sync::SpinLock as Mutex;
 use axaddrspace::GuestMemoryAccessor;
 use axvirtio_common::{
-    DescriptorChain, MmioReadOutcome, MmioWriteAction, VirtioMmioState, VirtioQueue,
-    VirtioQueueGeneration, VirtioResult, constants as vc,
+    DescriptorChain, MmioReadOutcome, MmioWriteAction, VirtioMmioState, VirtioQueue, VirtioResult,
+    constants as vc,
 };
 use axvm_types::{AccessWidth, GuestPhysAddr};
 use log::warn;
@@ -25,9 +25,6 @@ pub enum DeviceEvent {
     InterruptPending,
     /// The guest reset the device (wrote status 0).
     Reset,
-    /// A consumed TX descriptor could not be completed; the queue requires a
-    /// guest reset before it can make further progress.
-    QueueFaulted,
 }
 
 /// Result of a host-driven RX delivery (plan section 7.3).
@@ -109,7 +106,10 @@ impl<B: NetworkBackend, T: GuestMemoryAccessor + Clone> VirtioMmioNetDevice<B, T
     /// the guest resets the device; the VMM can poll this to surface the
     /// condition instead of silently dropping service.
     pub fn is_queue_faulted(&self, index: usize) -> bool {
-        self.state.is_queue_faulted(index)
+        self.state
+            .queues_lock()
+            .get(index)
+            .is_some_and(|q| q.is_faulted())
     }
 
     /// Current interrupt status bits.
@@ -187,15 +187,12 @@ impl<B: NetworkBackend, T: GuestMemoryAccessor + Clone> VirtioMmioNetDevice<B, T
             .mmio_write_with_memory(addr, width, val, memory)?
         {
             MmioWriteAction::None => Ok(DeviceEvent::None),
-            MmioWriteAction::Reset => {
-                self.state.complete_reset()?;
-                Ok(DeviceEvent::Reset)
-            }
+            MmioWriteAction::Reset => Ok(DeviceEvent::Reset),
             MmioWriteAction::InterruptPending => Ok(DeviceEvent::InterruptPending),
-            MmioWriteAction::QueueNotified { index, generation } => {
-                if index == TX_QUEUE_INDEX {
-                    Ok(self.handle_tx_notify(generation, memory))
-                } else if index == RX_QUEUE_INDEX {
+            MmioWriteAction::QueueNotified(idx) => {
+                if idx == TX_QUEUE_INDEX {
+                    Ok(self.handle_tx_notify(memory))
+                } else if idx == RX_QUEUE_INDEX {
                     self.backend.rx_queue_notified();
                     Ok(DeviceEvent::None)
                 } else {
@@ -206,28 +203,21 @@ impl<B: NetworkBackend, T: GuestMemoryAccessor + Clone> VirtioMmioNetDevice<B, T
     }
 
     /// Drain all currently-visible TX requests on queue 1.
-    fn handle_tx_notify(
-        &self,
-        generation: VirtioQueueGeneration,
-        memory: &mut dyn axvirtio_common::GuestMemory,
-    ) -> DeviceEvent {
-        let mut event = DeviceEvent::None;
-        let Some(mut queue_lease) = self
-            .state
-            .take_queue_for_processing(TX_QUEUE_INDEX, generation)
-        else {
-            return DeviceEvent::None;
-        };
-        let Some(queue) = queue_lease.queue() else {
-            return DeviceEvent::None;
-        };
-        if !queue.ready {
+    ///
+    /// Holds the per-device queue lock across the synchronous backend call; the
+    /// backend must not re-enter the device (plan section 16.7).
+    fn handle_tx_notify(&self, memory: &mut dyn axvirtio_common::GuestMemory) -> DeviceEvent {
+        if !self.state.is_driver_ok() {
             return DeviceEvent::None;
         }
-
-        let Some(tx) = queue_lease.queue_mut() else {
+        let mut event = DeviceEvent::None;
+        let mut queues = self.state.queues_lock();
+        let Some(tx) = queues.get_mut(TX_QUEUE_INDEX as usize) else {
             return DeviceEvent::None;
         };
+        if !tx.ready {
+            return DeviceEvent::None;
+        }
 
         // The available-index pre-read latches a fault on a configured queue
         // whose ring became unreadable; stop draining and let the guest reset
@@ -261,24 +251,13 @@ impl<B: NetworkBackend, T: GuestMemoryAccessor + Clone> VirtioMmioNetDevice<B, T
                 Ok(notify) => notify,
                 Err(error) => {
                     warn!("virtio-net failed to process TX descriptor {head}: {error:?}");
-                    match tx.complete_with_memory(head, 0, memory) {
-                        Ok(notify) => notify,
-                        Err(completion_error) => {
-                            warn!(
-                                "virtio-net failed to complete TX descriptor {head}: \
-                                 {completion_error:?}; guest reset is required"
-                            );
-                            event = DeviceEvent::QueueFaulted;
-                            break;
-                        }
-                    }
+                    tx.complete_with_memory(head, 0, memory).unwrap_or(false)
                 }
             };
             if notify {
                 event = DeviceEvent::InterruptPending;
             }
         }
-        queue_lease.restore_queue();
         if event == DeviceEvent::InterruptPending {
             self.state.set_interrupt(vc::VIRTIO_MMIO_INT_VRING);
         }
@@ -342,7 +321,6 @@ impl<B: NetworkBackend, T: GuestMemoryAccessor + Clone> VirtioMmioNetDevice<B, T
         frame: &[u8],
         memory: &mut dyn axvirtio_common::GuestMemory,
     ) -> Result<RxOutcome, NetError> {
-        let generation = self.state.queue_generation();
         if !self.state.is_driver_ok() {
             return Err(NetError::NotReady);
         }
@@ -355,22 +333,13 @@ impl<B: NetworkBackend, T: GuestMemoryAccessor + Clone> VirtioMmioNetDevice<B, T
 
         let header_len = self.header_len();
         let needed = header_len + frame.len();
-        let Some(mut queue_lease) = self
-            .state
-            .take_queue_for_processing(RX_QUEUE_INDEX, generation)
-        else {
+        let mut queues = self.state.queues_lock();
+        let Some(rx) = queues.get_mut(RX_QUEUE_INDEX as usize) else {
             return Err(NetError::NotReady);
         };
-        let Some(queue) = queue_lease.queue() else {
-            return Err(NetError::NotReady);
-        };
-        if !queue.ready {
+        if !rx.ready {
             return Err(NetError::NotReady);
         }
-
-        let Some(rx) = queue_lease.queue_mut() else {
-            return Err(NetError::NotReady);
-        };
 
         // Peek before consuming so capacity/chain problems leave the ring intact.
         let last = rx.get_last_avail_idx();
@@ -409,7 +378,6 @@ impl<B: NetworkBackend, T: GuestMemoryAccessor + Clone> VirtioMmioNetDevice<B, T
         let notify = rx
             .complete_with_memory(head, needed as u32, memory)
             .map_err(NetError::from)?;
-        queue_lease.restore_queue();
         if notify {
             self.state.set_interrupt(vc::VIRTIO_MMIO_INT_VRING);
         }
@@ -456,8 +424,8 @@ impl<B: NetworkBackend, T: GuestMemoryAccessor + Clone> VirtioMmioNetDevice<B, T
 
     /// Reset the device (clears transport state and queues; keeps MAC/MTU and
     /// advertised features).
-    pub fn reset(&self) -> VirtioResult<()> {
-        self.state.reset()
+    pub fn reset(&self) {
+        self.state.reset();
     }
 
     /// Change the link status. Bumps config generation and raises the

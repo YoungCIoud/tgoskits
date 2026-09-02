@@ -38,6 +38,8 @@ pub struct VirtioQueue<T: GuestMemoryAccessor + Clone> {
     pub max_size: u16,
     /// Queue ready flag
     pub ready: bool,
+    /// A lock-external queue-ready validation transaction is in progress.
+    preparing: bool,
     /// Descriptor table address (guest physical)
     pub desc_table_addr: GuestPhysAddr,
     /// Available ring address (guest physical)
@@ -88,6 +90,7 @@ impl<T: GuestMemoryAccessor + Clone> Clone for VirtioQueue<T> {
             accessor: self.accessor.clone(),
             max_size: self.max_size,
             ready: self.ready,
+            preparing: self.preparing,
             desc_table_addr: self.desc_table_addr,
             avail_ring_addr: self.avail_ring_addr,
             used_ring_addr: self.used_ring_addr,
@@ -115,6 +118,7 @@ impl<T: GuestMemoryAccessor + Clone> VirtioQueue<T> {
             accessor,
             max_size: size,
             ready: false,
+            preparing: false,
             desc_table_addr: GuestPhysAddr::from(0),
             avail_ring_addr: GuestPhysAddr::from(0),
             used_ring_addr: GuestPhysAddr::from(0),
@@ -200,6 +204,46 @@ impl<T: GuestMemoryAccessor + Clone> VirtioQueue<T> {
             && self.used_ring_addr.as_usize() != 0
     }
 
+    /// Whether two queue snapshots describe the same programmable layout.
+    pub(crate) fn has_same_configuration(&self, other: &Self) -> bool {
+        self.index == other.index
+            && self.size == other.size
+            && self.desc_table_addr == other.desc_table_addr
+            && self.avail_ring_addr == other.avail_ring_addr
+            && self.used_ring_addr == other.used_ring_addr
+            && self.event_idx_enabled == other.event_idx_enabled
+    }
+
+    /// Starts one queue-ready preparation transaction.
+    pub(crate) fn begin_ready_preparation(&mut self) -> Option<Self> {
+        if self.ready || self.preparing || !self.is_configured() {
+            return None;
+        }
+        self.preparing = true;
+        Some(self.clone())
+    }
+
+    /// Commits or rejects a completed queue-ready preparation transaction,
+    /// including any warning latch raised while validating its snapshot.
+    pub(crate) fn finish_ready_preparation(&mut self, snapshot: &Self, prepared: bool) {
+        if !self.preparing {
+            return;
+        }
+        if self.has_same_configuration(snapshot) {
+            if snapshot.layout_warn_emitted.load(Ordering::Acquire) {
+                self.layout_warn_emitted.store(true, Ordering::Release);
+            }
+            self.ready = prepared;
+        }
+        self.preparing = false;
+    }
+
+    /// Cancels any queue-ready preparation and makes the queue unavailable.
+    pub(crate) fn cancel_ready_preparation(&mut self) {
+        self.ready = false;
+        self.preparing = false;
+    }
+
     /// The guest-memory accessor used by the non-`_with_memory` operations.
     pub fn accessor(&self) -> &Arc<T> {
         &self.accessor
@@ -278,16 +322,15 @@ impl<T: GuestMemoryAccessor + Clone> VirtioQueue<T> {
     /// An accessor that cannot translate any guest address (such as
     /// [`NoGuestMemoryAccessor`](crate::memory::NoGuestMemoryAccessor), whose
     /// `translate_and_get_limit` always returns `None`) fails every probe and
-    /// therefore cannot satisfy this check; such layouts are rejected, so the
-    /// MMIO transport requires an accessor backed by real guest memory.
-    /// Memory-screening failures are reported as
+    /// therefore cannot satisfy this check; such layouts are rejected (the
+    /// first rejection per configuration cycle is warned, later ones only
+    /// traced), so the MMIO transport requires an accessor backed by real
+    /// guest memory. Memory-screening failures are reported as
     /// [`VirtioError::InvalidRingLayout`], while pure layout errors keep their
     /// specific variants ([`RingMisaligned`](VirtioError::RingMisaligned),
     /// [`RingOverlap`](VirtioError::RingOverlap)); any `Err` means the layout
     /// was rejected, so the caller only needs to distinguish "layout rejected"
-    /// from "queue ready". This method does not modify the queue or emit
-    /// diagnostics; the transport records a rejected configuration only after
-    /// it has confirmed that the validated snapshot is still current.
+    /// from "queue ready".
     pub fn validate_layout_with_memory(
         &self,
         memory: &mut dyn crate::GuestMemory,
@@ -300,27 +343,29 @@ impl<T: GuestMemoryAccessor + Clone> VirtioQueue<T> {
                     .read(GuestPhysAddr::from(end - 1), &mut [0u8; 1])
                     .is_err()
             {
+                // A guest can write QUEUE_READY unboundedly, so warn only once
+                // per configuration cycle; later rejections are traced.
+                if self.layout_warn_emitted.swap(true, Ordering::AcqRel) {
+                    trace!(
+                        "virtqueue {}: ring region 0x{:x}..0x{:x} is still not fully mapped; \
+                         rejecting layout again",
+                        self.index,
+                        region.base.as_usize(),
+                        end,
+                    );
+                } else {
+                    warn!(
+                        "virtqueue {}: ring region 0x{:x}..0x{:x} is not fully mapped in guest \
+                         memory; rejecting layout",
+                        self.index,
+                        region.base.as_usize(),
+                        end,
+                    );
+                }
                 return Err(VirtioError::InvalidRingLayout);
             }
         }
         Ok(())
-    }
-
-    /// Records and reports a rejected ready configuration once per reset
-    /// cycle. The caller must invoke this on the live queue after validating a
-    /// configuration snapshot, never on a temporary queue clone.
-    pub(crate) fn report_layout_rejection(&self) {
-        if self.layout_warn_emitted.swap(true, Ordering::AcqRel) {
-            trace!(
-                "virtqueue {}: ring layout is still invalid; rejecting QUEUE_READY again",
-                self.index,
-            );
-        } else {
-            warn!(
-                "virtqueue {}: ring layout is invalid; rejecting QUEUE_READY",
-                self.index,
-            );
-        }
     }
 
     /// The three ring regions derived from the current layout.
@@ -382,6 +427,7 @@ impl<T: GuestMemoryAccessor + Clone> VirtioQueue<T> {
     /// usable; `reset` is the only operation that clears the fault.
     pub fn reset(&mut self) {
         self.ready = false;
+        self.preparing = false;
         self.desc_table_addr = GuestPhysAddr::from(0);
         self.avail_ring_addr = GuestPhysAddr::from(0);
         self.used_ring_addr = GuestPhysAddr::from(0);
@@ -939,34 +985,46 @@ impl RingRegion {
 }
 
 #[cfg(test)]
-mod tests {
-    use alloc::sync::Arc;
+mod ready_preparation_tests {
+    use super::*;
+    use crate::{GuestMemory, NoGuestMemoryAccessor};
 
-    use super::VirtioQueue;
-    use crate::NoGuestMemoryAccessor;
+    struct UnmappedMemory;
+
+    impl GuestMemory for UnmappedMemory {
+        fn read(&mut self, _guest_addr: GuestPhysAddr, _data: &mut [u8]) -> VirtioResult<()> {
+            Err(VirtioError::InvalidAddress)
+        }
+
+        fn write(&mut self, _guest_addr: GuestPhysAddr, _data: &[u8]) -> VirtioResult<()> {
+            Err(VirtioError::InvalidAddress)
+        }
+    }
 
     #[test]
-    fn layout_rejection_warning_is_latched_until_reset() {
-        let mut queue = VirtioQueue::new(0, 8, Arc::new(NoGuestMemoryAccessor));
+    fn rejected_ready_preparation_preserves_layout_warning_latch() {
+        let mut queue = VirtioQueue::new(0, 4, Arc::new(NoGuestMemoryAccessor));
+        queue
+            .set_desc_table_addr(GuestPhysAddr::from(0x1000))
+            .unwrap();
+        queue
+            .set_avail_ring_addr(GuestPhysAddr::from(0x2000))
+            .unwrap();
+        queue
+            .set_used_ring_addr(GuestPhysAddr::from(0x3000))
+            .unwrap();
 
-        assert!(
-            !queue
-                .layout_warn_emitted
-                .load(core::sync::atomic::Ordering::Acquire)
+        let first_snapshot = queue.begin_ready_preparation().unwrap();
+        assert_eq!(
+            first_snapshot.validate_layout_with_memory(&mut UnmappedMemory),
+            Err(VirtioError::InvalidRingLayout)
         );
-        queue.report_layout_rejection();
-        queue.report_layout_rejection();
-        assert!(
-            queue
-                .layout_warn_emitted
-                .load(core::sync::atomic::Ordering::Acquire)
-        );
+        queue.finish_ready_preparation(&first_snapshot, false);
 
-        queue.reset();
+        let second_snapshot = queue.begin_ready_preparation().unwrap();
         assert!(
-            !queue
-                .layout_warn_emitted
-                .load(core::sync::atomic::Ordering::Acquire)
+            second_snapshot.layout_warn_emitted.load(Ordering::Acquire),
+            "a repeated QUEUE_READY attempt must inherit the warning latch"
         );
     }
 }

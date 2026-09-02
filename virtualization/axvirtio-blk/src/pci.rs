@@ -133,7 +133,7 @@ mod tests {
     use axvirtio_common::{
         GuestMemory, NoGuestMemoryAccessor, VIRTIO_STATUS_DEVICE_NEEDS_RESET, VirtioError,
         VirtioQueue,
-        pci::{InterruptPublication, VirtioPciTransport, VirtioPciWriteOutcome},
+        pci::{VirtioPciTransport, VirtioPciWriteOutcome},
     };
 
     use super::*;
@@ -512,10 +512,12 @@ mod tests {
 
         let published = Arc::new(AtomicBool::new(false));
         let published_callback = Arc::clone(&published);
-        notification.publish(|_| {
-            published_callback.store(true, Ordering::Release);
-            InterruptPublication::Published
-        });
+        notification
+            .publish(|_| {
+                published_callback.store(true, Ordering::Release);
+                Ok(())
+            })
+            .unwrap();
         assert!(published.load(Ordering::Acquire));
         reset
             .join()
