@@ -119,6 +119,53 @@ fn invalidation_closes_new_irq_permits_but_does_not_revoke_an_acquired_one() {
 }
 
 #[test]
+fn acquired_route_lease_keeps_grant_admitted_after_admission_close() {
+    let router = router();
+    let function: Arc<dyn PciFunction> = Arc::new(StubFunction {
+        fail_command: false,
+    });
+    let token = router
+        .activate(DeviceId::new(4), function)
+        .expect("test route activation succeeds");
+    let lease = router
+        .lease(&token, true)
+        .expect("route lease is admitted before reset");
+    let retained = lease.grant.clone();
+
+    assert!(router.invalidate(&token).is_some());
+
+    assert!(lease.grant.admission_is_open());
+    drop(lease);
+    assert!(!retained.admission_is_open());
+}
+
+#[test]
+fn acquired_route_lease_enters_nested_context_after_admission_close() {
+    let router = router();
+    let function: Arc<dyn PciFunction> = Arc::new(StubFunction {
+        fail_command: false,
+    });
+    let token = router
+        .activate(DeviceId::new(4), function)
+        .expect("test route activation succeeds");
+    let lease = router
+        .lease(&token, true)
+        .expect("route lease is admitted before reset");
+    let grant = lease.grant.clone();
+    let mut runtime = crate::DeviceRuntime::empty();
+
+    assert!(router.invalidate(&token).is_some());
+
+    runtime.with_routed_grant_for_test(0, grant, |context| {
+        let mut callback = |_nested: &mut dyn DeviceContext| Ok(());
+        context
+            .with_routed_device(&lease.grant, &mut callback)
+            .expect("an admitted route lease must survive admission close");
+    });
+    drop(lease);
+}
+
+#[test]
 fn irq_permit_drain_has_a_bounded_failure_path() {
     let router = router();
     let function: Arc<dyn PciFunction> = Arc::new(StubFunction {
