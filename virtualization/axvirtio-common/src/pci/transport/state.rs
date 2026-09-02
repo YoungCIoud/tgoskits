@@ -192,35 +192,24 @@ impl TransportState {
             });
         }
 
-        let current_phase = current_driver & DRIVER_PHASE_BITS;
-        let requested_phase = requested_driver & DRIVER_PHASE_BITS;
-        let added_phase = requested_phase & !current_phase;
-        let expected_bit = next_driver_status_bit(current_phase)?;
-        let adds_failed = requested_driver & VIRTIO_STATUS_FAILED as u8 != 0
-            && current_driver & VIRTIO_STATUS_FAILED as u8 == 0;
-        if added_phase != 0 && (added_phase != expected_bit || adds_failed) {
-            return Err(DeviceError::InvalidState {
-                operation: "update virtio-pci status",
-                detail: format!(
-                    "driver status phase is out of order: {current_phase:#x} -> \
-                     {requested_phase:#x}"
-                ),
-            });
-        }
+        validate_driver_status_phase(requested_driver)?;
 
         let device_status = if self.device_needs_reset {
             VIRTIO_STATUS_DEVICE_NEEDS_RESET as u8
         } else {
             0
         };
-        if added_phase == VIRTIO_STATUS_FEATURES_OK as u8
+        let mut accepted_driver = requested_driver;
+        if current_driver & VIRTIO_STATUS_FEATURES_OK as u8 == 0
+            && requested_driver & VIRTIO_STATUS_FEATURES_OK as u8 != 0
             && self.driver_features & !device_features != 0
         {
-            self.status = current_phase | VIRTIO_STATUS_FAILED as u8 | device_status;
-            return Ok(());
+            // The device reports rejected feature negotiation by withholding
+            // FEATURES_OK. FAILED remains owned by the driver.
+            accepted_driver &= !(VIRTIO_STATUS_FEATURES_OK | VIRTIO_STATUS_DRIVER_OK) as u8;
         }
 
-        self.status = requested_driver | device_status;
+        self.status = accepted_driver | device_status;
         Ok(())
     }
 
@@ -236,24 +225,22 @@ impl TransportState {
     }
 }
 
-fn next_driver_status_bit(current: u8) -> DeviceResult<u8> {
-    match current {
-        0 => Ok(VIRTIO_STATUS_ACKNOWLEDGE as u8),
-        value if value == VIRTIO_STATUS_ACKNOWLEDGE as u8 => Ok(VIRTIO_STATUS_DRIVER as u8),
-        value if value == (VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER) as u8 => {
-            Ok(VIRTIO_STATUS_FEATURES_OK as u8)
-        }
-        value
-            if value
-                == (VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER | VIRTIO_STATUS_FEATURES_OK)
-                    as u8 =>
-        {
-            Ok(VIRTIO_STATUS_DRIVER_OK as u8)
-        }
-        value if value == DRIVER_PHASE_BITS => Ok(0),
-        invalid => Err(DeviceError::InvalidState {
+fn validate_driver_status_phase(status: u8) -> DeviceResult {
+    let acknowledge = VIRTIO_STATUS_ACKNOWLEDGE as u8;
+    let driver = VIRTIO_STATUS_DRIVER as u8;
+    let features_ok = VIRTIO_STATUS_FEATURES_OK as u8;
+    let driver_ok = VIRTIO_STATUS_DRIVER_OK as u8;
+    let valid = status & driver == 0 || status & acknowledge != 0;
+    let features_valid =
+        status & features_ok == 0 || status & (acknowledge | driver) == acknowledge | driver;
+    let driver_ok_valid = status & driver_ok == 0
+        || status & (acknowledge | driver | features_ok) == acknowledge | driver | features_ok;
+    if valid && features_valid && driver_ok_valid {
+        Ok(())
+    } else {
+        Err(DeviceError::InvalidState {
             operation: "update virtio-pci status",
-            detail: format!("current driver status is invalid: {invalid:#x}"),
-        }),
+            detail: format!("driver status phase is out of order: {status:#x}"),
+        })
     }
 }

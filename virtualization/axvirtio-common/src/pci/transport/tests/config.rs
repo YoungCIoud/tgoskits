@@ -5,29 +5,30 @@ use axdevice_base::{AccessWidth, DeviceError};
 use super::{super::*, fixtures::*};
 use crate::constants::{
     VIRTIO_F_VERSION_1, VIRTIO_STATUS_ACKNOWLEDGE, VIRTIO_STATUS_DEVICE_NEEDS_RESET,
-    VIRTIO_STATUS_DRIVER, VIRTIO_STATUS_DRIVER_OK, VIRTIO_STATUS_FAILED, VIRTIO_STATUS_FEATURES_OK,
+    VIRTIO_STATUS_DRIVER, VIRTIO_STATUS_DRIVER_OK, VIRTIO_STATUS_FEATURES_OK,
 };
 
 #[test]
-fn device_status_rejects_skipped_and_cleared_driver_phases() {
+fn device_status_accepts_cumulative_phases_but_rejects_clearing_bits() {
     let transport = VirtioPciTransport::try_new(TestCore).expect("valid test transport");
     let mut memory = TestMemory {
         reads: Cell::new(0),
     };
 
-    assert!(matches!(
-        transport.write_mmio_with_dma(DEVICE_STATUS, AccessWidth::Byte, 0x0b, true, &mut memory,),
-        Err(DeviceError::InvalidState { .. })
-    ));
-    assert_eq!(transport.status(), 0);
+    write(
+        &transport,
+        DEVICE_STATUS,
+        AccessWidth::Byte,
+        (VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER | VIRTIO_STATUS_FEATURES_OK) as u64,
+        &mut memory,
+    );
+    assert_eq!(transport.status(), 0x0b);
 
-    write(&transport, DEVICE_STATUS, AccessWidth::Byte, 1, &mut memory);
-    write(&transport, DEVICE_STATUS, AccessWidth::Byte, 3, &mut memory);
     assert!(matches!(
-        transport.write_mmio_with_dma(DEVICE_STATUS, AccessWidth::Byte, 1, true, &mut memory,),
+        transport.write_mmio_with_dma(DEVICE_STATUS, AccessWidth::Byte, 3, true, &mut memory,),
         Err(DeviceError::InvalidState { .. })
     ));
-    assert_eq!(transport.status(), 3);
+    assert_eq!(transport.status(), 0x0b);
 }
 
 #[test]
@@ -116,7 +117,7 @@ fn unsupported_driver_features_fail_negotiation_without_driver_ok() {
     let status = transport.status();
     assert_eq!(
         status,
-        (VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER | VIRTIO_STATUS_FAILED) as u8
+        (VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER) as u8
     );
     assert_eq!(
         status & (VIRTIO_STATUS_FEATURES_OK | VIRTIO_STATUS_DRIVER_OK) as u8,
