@@ -1,4 +1,5 @@
 use super::*;
+use crate::{PciBarIndex, PciMemoryBar, ResourceRequest};
 
 #[test]
 fn withdrawal_operation_reports_busy_lifecycle_without_spinning() {
@@ -31,12 +32,13 @@ fn withdrawal_operation_reports_busy_lifecycle_without_spinning() {
     drop(lease);
     assert_eq!(
         binding
-            .pending_binding_withdrawals
+            .lifecycle
             .lock_irqsave()
+            .pending_withdrawals
             .as_slice(),
         &[DeviceId::new(5)]
     );
-    reset.finish(BindingLifecycleState::Running);
+    reset.finish_reset().unwrap();
 }
 
 #[test]
@@ -106,8 +108,9 @@ fn reset_reclaims_lease_dropped_during_completion_handoff() {
     drop_thread.join().unwrap();
     assert!(
         binding
-            .pending_binding_withdrawals
+            .lifecycle
             .lock_irqsave()
+            .pending_withdrawals
             .is_empty()
     );
     assert!(
@@ -284,7 +287,7 @@ fn full_lifecycle_reset_failure_keeps_endpoint_admission_closed() {
     assert_eq!(*recording.withdrawals.lock_irqsave(), 1);
     assert!(!sink.asserted.load(Ordering::Relaxed));
     assert_eq!(
-        *binding.lifecycle.lock_irqsave(),
+        binding.lifecycle.lock_irqsave().state,
         BindingLifecycleState::ResetFailed
     );
     let token = binding
@@ -362,7 +365,7 @@ fn reset_irq_cleanup_failure_stays_closed_until_teardown_retries_withdrawal() {
         Err(DeviceManagerError::Device(DeviceError::Backend { .. }))
     ));
     assert_eq!(
-        *binding.lifecycle.lock_irqsave(),
+        binding.lifecycle.lock_irqsave().state,
         BindingLifecycleState::ResetFailed
     );
     assert!(
@@ -413,7 +416,7 @@ fn binding_callback_can_reenter_lifecycle_without_holding_its_lock() {
 }
 
 #[test]
-fn endpoint_binding_waits_for_the_lifecycle_owner_gate() {
+fn endpoint_binding_rejects_a_busy_lifecycle_owner_gate() {
     let function_id = DeviceNodeId::new("gated-endpoint").unwrap();
     let mut builder = PciTopologyBuilder::new();
     builder
@@ -427,7 +430,7 @@ fn endpoint_binding_waits_for_the_lifecycle_owner_gate() {
         DeviceNodeId::new("host").unwrap(),
         Arc::new(PciRootState::new(topology)),
     ));
-    let gate = binding.lifecycle.lock_irqsave();
+    let gate = binding.begin_binding_operation().unwrap();
     let (sender, receiver) = std::sync::mpsc::channel();
     let bind_binding = Arc::clone(&binding);
     std::thread::spawn(move || {
@@ -443,9 +446,12 @@ fn endpoint_binding_waits_for_the_lifecycle_owner_gate() {
         sender.send(result.is_ok()).unwrap();
     });
 
-    assert!(receiver.try_recv().is_err());
-    drop(gate);
-    assert!(receiver.recv().unwrap());
+    assert!(
+        !receiver
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap()
+    );
+    gate.finish_restore().unwrap();
 }
 
 #[test]
@@ -481,7 +487,7 @@ fn root_rejects_a_second_binding_for_the_same_function() {
 
     // Unbind invalidates the route; the same token never revives.
     drop(router.invalidate(&first));
-    root.unbind_device(first.device_id());
+    root.unbind_route_for_binding(&first);
     assert_eq!(root.resolve_bound_bar(0xc000_0000, AccessWidth::Byte), None);
     let second = router
         .activate(DeviceId::new(1), Arc::clone(&function))
@@ -490,4 +496,559 @@ fn root_rejects_a_second_binding_for_the_same_function() {
         .unwrap()
         .commit(second)
         .unwrap();
+}
+
+#[test]
+fn reset_completion_cannot_open_a_second_reset_epoch() {
+    let function_id = DeviceNodeId::new("reset-owner-race-endpoint").unwrap();
+    let mut builder = PciTopologyBuilder::new();
+    builder
+        .add_function(PciFunctionSpec::new(
+            function_id.clone(),
+            PciEndpointIdentity::new(0x1af4, 0x1042, PciClass::new(0xff, 0, 0)),
+        ))
+        .unwrap();
+    let topology = Arc::new(builder.resolve(0xc000_0000..0xc100_0000).unwrap());
+    let binding = Arc::new(PciRootBinding::new(
+        DeviceNodeId::new("host").unwrap(),
+        Arc::new(PciRootState::new(topology)),
+    ));
+    let mut grants = Vec::new();
+    let lease = binding
+        .bind_registered(
+            &function_id,
+            DeviceId::new(17),
+            Arc::new(StubFunction {
+                fail_command: false,
+            }),
+            &mut grants,
+        )
+        .unwrap();
+
+    let entered = Arc::new(std::sync::Barrier::new(2));
+    let release = Arc::new(std::sync::Barrier::new(2));
+    binding.set_admission_open_hook({
+        let entered = Arc::clone(&entered);
+        let release = Arc::clone(&release);
+        Arc::new(move || {
+            entered.wait();
+            release.wait();
+        })
+    });
+
+    let first_binding = Arc::clone(&binding);
+    let first = std::thread::spawn(move || {
+        first_binding
+            .begin_reset_operation()
+            .unwrap()
+            .finish_reset()
+    });
+    entered.wait();
+
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let second_binding = Arc::clone(&binding);
+    std::thread::spawn(move || {
+        sender.send(second_binding.reset_lifecycle()).unwrap();
+    });
+    let second_result = receiver
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .expect("second reset reaches the old completion window");
+    assert!(second_result.is_err());
+
+    release.wait();
+    assert!(first.join().unwrap().is_ok());
+    assert_eq!(
+        binding.lifecycle.lock_irqsave().state,
+        BindingLifecycleState::Running
+    );
+    let token = binding
+        .router
+        .state
+        .lock_irqsave()
+        .endpoints
+        .get(&DeviceId::new(17))
+        .unwrap()
+        .token
+        .clone();
+    assert_eq!(token.admission_epoch(), 1);
+    assert!(token.grant(false).admission_is_open());
+    drop(lease);
+}
+
+#[test]
+fn stop_request_does_not_overwrite_an_active_lifecycle_owner() {
+    let binding = PciRootBinding::new(
+        DeviceNodeId::new("host").unwrap(),
+        Arc::new(PciRootState::new(Arc::new(
+            PciTopologyBuilder::new()
+                .resolve(0xc000_0000..0xc100_0000)
+                .unwrap(),
+        ))),
+    );
+    let reset = binding.begin_reset_operation().unwrap();
+    let stop = binding.begin_stop_operation();
+
+    // Keep the operations alive while checking the handoff metadata. The
+    // fixed implementation returns an unclaimed successor stop operation;
+    // dropping either operation here would otherwise complete it out of order.
+    core::mem::forget(reset);
+    core::mem::forget(stop);
+    let owner_is_reset = binding.lifecycle_owner_is_reset();
+    let stop_requested = binding.stop_requested();
+    core::mem::forget(binding);
+    assert!(owner_is_reset);
+    assert!(stop_requested);
+}
+
+#[test]
+fn stop_request_supersedes_reset_before_admission_publication() {
+    let binding = Arc::new(PciRootBinding::new(
+        DeviceNodeId::new("host").unwrap(),
+        Arc::new(PciRootState::new(Arc::new(
+            PciTopologyBuilder::new()
+                .resolve(0xc000_0000..0xc100_0000)
+                .unwrap(),
+        ))),
+    ));
+    binding.set_completion_closing_hook({
+        let binding = Arc::clone(&binding);
+        Arc::new(move || {
+            // The stop request is made after reset has sealed its owner but
+            // before publication is reserved. It must become a successor,
+            // rather than replacing the reset owner in place.
+            core::mem::forget(binding.begin_stop_operation());
+        })
+    });
+
+    assert!(matches!(
+        binding.reset_lifecycle(),
+        Err(DeviceManagerError::InvalidState { .. })
+    ));
+    assert_eq!(
+        binding.lifecycle.lock_irqsave().state,
+        BindingLifecycleState::Stopping
+    );
+
+    binding.begin_stop_operation().finish_stop().unwrap();
+    assert_eq!(
+        binding.lifecycle.lock_irqsave().state,
+        BindingLifecycleState::Dead
+    );
+}
+
+#[test]
+fn stop_successor_claims_a_withdrawal_queued_after_reset_completion() {
+    let function_id = DeviceNodeId::new("stop-successor-endpoint").unwrap();
+    let mut builder = PciTopologyBuilder::new();
+    builder
+        .add_function(PciFunctionSpec::new(
+            function_id.clone(),
+            PciEndpointIdentity::new(0x1af4, 0x1042, PciClass::new(0xff, 0, 0)),
+        ))
+        .unwrap();
+    let topology = Arc::new(builder.resolve(0xc000_0000..0xc100_0000).unwrap());
+    let binding = Arc::new(PciRootBinding::new(
+        DeviceNodeId::new("host").unwrap(),
+        Arc::new(PciRootState::new(topology)),
+    ));
+    let mut grants = Vec::new();
+    let lease = binding
+        .bind_registered(
+            &function_id,
+            DeviceId::new(25),
+            Arc::new(StubFunction {
+                fail_command: false,
+            }),
+            &mut grants,
+        )
+        .unwrap();
+    binding.set_completion_closing_hook({
+        let binding = Arc::clone(&binding);
+        Arc::new(move || {
+            core::mem::forget(binding.begin_stop_operation());
+        })
+    });
+
+    assert!(binding.reset_lifecycle().is_err());
+    // The reset has handed off to a pending stop, but no stop owner has
+    // claimed the slot yet. A lease may still drop in this final window.
+    drop(lease);
+
+    binding.begin_stop_operation().finish_stop().unwrap();
+    assert_eq!(
+        binding.lifecycle.lock_irqsave().state,
+        BindingLifecycleState::Dead
+    );
+    assert!(
+        !binding
+            .router
+            .state
+            .lock_irqsave()
+            .endpoints
+            .contains_key(&DeviceId::new(25))
+    );
+}
+
+#[test]
+fn binding_completion_drains_a_concurrent_lease_drop() {
+    let first_id = DeviceNodeId::new("binding-owner-endpoint").unwrap();
+    let second_id = DeviceNodeId::new("binding-drop-endpoint").unwrap();
+    let mut builder = PciTopologyBuilder::new();
+    for function_id in [&first_id, &second_id] {
+        builder
+            .add_function(PciFunctionSpec::new(
+                function_id.clone(),
+                PciEndpointIdentity::new(0x1af4, 0x1042, PciClass::new(0xff, 0, 0)),
+            ))
+            .unwrap();
+    }
+    let topology = Arc::new(builder.resolve(0xc000_0000..0xc100_0000).unwrap());
+    let binding = Arc::new(PciRootBinding::new(
+        DeviceNodeId::new("host").unwrap(),
+        Arc::new(PciRootState::new(topology)),
+    ));
+    let mut grants = Vec::new();
+    let dropped = binding
+        .bind_registered(
+            &second_id,
+            DeviceId::new(18),
+            Arc::new(StubFunction {
+                fail_command: false,
+            }),
+            &mut grants,
+        )
+        .unwrap();
+    let dropped_grant = dropped.token.grant(false);
+
+    let dropped_lease = Arc::new(SpinLock::new(Some(dropped)));
+    binding.set_completion_closing_hook({
+        let dropped_lease = Arc::clone(&dropped_lease);
+        Arc::new(move || {
+            drop(dropped_lease.lock_irqsave().take());
+        })
+    });
+    let operation = binding.begin_binding_operation().unwrap();
+    operation.finish_restore().unwrap();
+
+    assert!(
+        binding
+            .lifecycle
+            .lock_irqsave()
+            .pending_withdrawals
+            .is_empty()
+    );
+    assert!(
+        !binding
+            .router
+            .state
+            .lock_irqsave()
+            .endpoints
+            .contains_key(&DeviceId::new(18))
+    );
+    assert!(!dropped_grant.admission_is_open());
+    assert_eq!(
+        binding.lifecycle.lock_irqsave().state,
+        BindingLifecycleState::Running
+    );
+    let _ = first_id;
+}
+
+#[test]
+fn withdrawal_completion_drains_a_last_window_lease_drop() {
+    let first_id = DeviceNodeId::new("withdraw-owner-endpoint").unwrap();
+    let second_id = DeviceNodeId::new("withdraw-drop-endpoint").unwrap();
+    let mut builder = PciTopologyBuilder::new();
+    for function_id in [&first_id, &second_id] {
+        builder
+            .add_function(PciFunctionSpec::new(
+                function_id.clone(),
+                PciEndpointIdentity::new(0x1af4, 0x1042, PciClass::new(0xff, 0, 0)),
+            ))
+            .unwrap();
+    }
+    let topology = Arc::new(builder.resolve(0xc000_0000..0xc100_0000).unwrap());
+    let binding = Arc::new(PciRootBinding::new(
+        DeviceNodeId::new("host").unwrap(),
+        Arc::new(PciRootState::new(topology)),
+    ));
+    let mut grants = Vec::new();
+    let first = binding
+        .bind_registered(
+            &first_id,
+            DeviceId::new(19),
+            Arc::new(StubFunction {
+                fail_command: false,
+            }),
+            &mut grants,
+        )
+        .unwrap();
+    let second = binding
+        .bind_registered(
+            &second_id,
+            DeviceId::new(20),
+            Arc::new(StubFunction {
+                fail_command: false,
+            }),
+            &mut grants,
+        )
+        .unwrap();
+    let second_grant = second.token.grant(false);
+
+    let second_lease = Arc::new(SpinLock::new(Some(second)));
+    binding.set_completion_closing_hook({
+        let second_lease = Arc::clone(&second_lease);
+        Arc::new(move || {
+            drop(second_lease.lock_irqsave().take());
+        })
+    });
+    let operation = binding.begin_withdrawal_operation().unwrap();
+    binding.withdraw_endpoint(DeviceId::new(19)).unwrap();
+    operation.finish_restore().unwrap();
+
+    assert!(
+        binding
+            .lifecycle
+            .lock_irqsave()
+            .pending_withdrawals
+            .is_empty()
+    );
+    assert!(
+        !binding
+            .router
+            .state
+            .lock_irqsave()
+            .endpoints
+            .contains_key(&DeviceId::new(19))
+    );
+    assert!(
+        !binding
+            .router
+            .state
+            .lock_irqsave()
+            .endpoints
+            .contains_key(&DeviceId::new(20))
+    );
+    assert!(!second_grant.admission_is_open());
+    assert_eq!(
+        binding.lifecycle.lock_irqsave().state,
+        BindingLifecycleState::Running
+    );
+    drop(first);
+}
+
+#[test]
+fn lease_drop_withdraws_root_route_before_lifecycle_owner_is_available() {
+    let function_id = DeviceNodeId::new("route-first-endpoint").unwrap();
+    let mut builder = PciTopologyBuilder::new();
+    builder
+        .add_function(
+            PciFunctionSpec::new(
+                function_id.clone(),
+                PciEndpointIdentity::new(0x1af4, 0x1042, PciClass::new(0xff, 0, 0)),
+            )
+            .with_bar(
+                PciMemoryBar::new(PciBarIndex::new(0).unwrap(), 0x1000)
+                    .unwrap()
+                    .with_address(ResourceRequest::Fixed(0xc000_0000)),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let topology = Arc::new(builder.resolve(0xc000_0000..0xc100_0000).unwrap());
+    let root = Arc::new(PciRootState::new(Arc::clone(&topology)));
+    let binding = Arc::new(PciRootBinding::new(
+        DeviceNodeId::new("host").unwrap(),
+        Arc::clone(&root),
+    ));
+    let mut grants = Vec::new();
+    let lease = binding
+        .bind_registered(
+            &function_id,
+            DeviceId::new(21),
+            Arc::new(StubFunction {
+                fail_command: false,
+            }),
+            &mut grants,
+        )
+        .unwrap();
+    root.write_config(
+        topology.function(&function_id).unwrap().bdf(),
+        ConfigOffset::new(4).unwrap(),
+        AccessWidth::Word,
+        0x0406,
+    )
+    .unwrap();
+    let bar_address = topology
+        .function(&function_id)
+        .unwrap()
+        .bar(PciBarIndex::new(0).unwrap())
+        .unwrap()
+        .address();
+    assert_eq!(
+        root.read_config(
+            topology.function(&function_id).unwrap().bdf(),
+            ConfigOffset::new(4).unwrap(),
+            AccessWidth::Word,
+        )
+        .unwrap(),
+        0x0406
+    );
+    let operation = binding.begin_binding_operation().unwrap();
+
+    assert!(
+        root.resolve_bound_bar(bar_address, AccessWidth::Byte)
+            .is_some()
+    );
+    drop(lease);
+    assert!(
+        root.resolve_bound_bar(bar_address, AccessWidth::Byte)
+            .is_none()
+    );
+
+    operation.finish_restore().unwrap();
+}
+
+#[test]
+fn late_withdrawal_failure_does_not_rollback_published_reset() {
+    let function_id = DeviceNodeId::new("late-withdrawal-failure-endpoint").unwrap();
+    let mut builder = PciTopologyBuilder::new();
+    builder
+        .add_function(
+            PciFunctionSpec::new(
+                function_id.clone(),
+                PciEndpointIdentity::new(0x1af4, 0x1042, PciClass::new(0xff, 0, 0)),
+            )
+            .with_bar(
+                PciMemoryBar::new(PciBarIndex::new(0).unwrap(), 0x1000)
+                    .unwrap()
+                    .with_address(ResourceRequest::Fixed(0xc000_0000)),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let topology = Arc::new(builder.resolve(0xc000_0000..0xc100_0000).unwrap());
+    let root = Arc::new(PciRootState::new(Arc::clone(&topology)));
+    let binding = Arc::new(PciRootBinding::new(
+        DeviceNodeId::new("host").unwrap(),
+        Arc::clone(&root),
+    ));
+    let recording = Arc::new(RecordingFunction {
+        root: Arc::clone(&root),
+        bdf: topology.function(&function_id).unwrap().bdf(),
+        reads: SpinLock::new(Vec::new()),
+        writes: SpinLock::new(Vec::new()),
+        commands: SpinLock::new(Vec::new()),
+        resets: SpinLock::new(Vec::new()),
+        reset_failures: SpinLock::new(0),
+        withdrawals: SpinLock::new(0),
+        withdraw_failures: SpinLock::new(0),
+        irq_line: None,
+        supports_effects: false,
+        pending: false,
+    });
+    let mut grants = Vec::new();
+    let lease = binding
+        .bind_registered(
+            &function_id,
+            DeviceId::new(23),
+            recording.clone(),
+            &mut grants,
+        )
+        .unwrap();
+    let lease = Arc::new(SpinLock::new(Some(lease)));
+    binding.set_admission_open_hook({
+        let lease = Arc::clone(&lease);
+        let recording = Arc::clone(&recording);
+        Arc::new(move || {
+            *recording.withdraw_failures.lock_irqsave() = 1;
+            drop(lease.lock_irqsave().take());
+        })
+    });
+
+    assert!(binding.reset_lifecycle().is_ok());
+    assert_eq!(
+        binding.lifecycle.lock_irqsave().state,
+        BindingLifecycleState::Running
+    );
+    assert!(root.resolve_bar(0xc000_0000, AccessWidth::Byte).is_none());
+    assert_eq!(*recording.withdrawals.lock_irqsave(), 1);
+
+    binding.retry_irq_withdrawals().unwrap();
+    assert_eq!(*recording.withdrawals.lock_irqsave(), 2);
+}
+
+#[test]
+fn old_lease_retracts_the_current_root_route_after_epoch_replacement() {
+    let function_id = DeviceNodeId::new("epoch-route-endpoint").unwrap();
+    let mut builder = PciTopologyBuilder::new();
+    builder
+        .add_function(
+            PciFunctionSpec::new(
+                function_id.clone(),
+                PciEndpointIdentity::new(0x1af4, 0x1042, PciClass::new(0xff, 0, 0)),
+            )
+            .with_bar(
+                PciMemoryBar::new(PciBarIndex::new(0).unwrap(), 0x1000)
+                    .unwrap()
+                    .with_address(ResourceRequest::Fixed(0xc000_0000)),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let topology = Arc::new(builder.resolve(0xc000_0000..0xc100_0000).unwrap());
+    let root = Arc::new(PciRootState::new(Arc::clone(&topology)));
+    let binding = Arc::new(PciRootBinding::new(
+        DeviceNodeId::new("host").unwrap(),
+        Arc::clone(&root),
+    ));
+    let bdf = topology.function(&function_id).unwrap().bdf();
+    let bar_address = topology
+        .function(&function_id)
+        .unwrap()
+        .bar(PciBarIndex::new(0).unwrap())
+        .unwrap()
+        .address();
+    let recording = Arc::new(RecordingFunction {
+        root: Arc::clone(&root),
+        bdf,
+        reads: SpinLock::new(Vec::new()),
+        writes: SpinLock::new(Vec::new()),
+        commands: SpinLock::new(Vec::new()),
+        resets: SpinLock::new(Vec::new()),
+        reset_failures: SpinLock::new(0),
+        withdrawals: SpinLock::new(0),
+        withdraw_failures: SpinLock::new(0),
+        irq_line: None,
+        supports_effects: false,
+        pending: false,
+    });
+    let mut grants = Vec::new();
+    let lease = binding
+        .bind_registered(&function_id, DeviceId::new(24), recording, &mut grants)
+        .unwrap();
+    root.write_config(
+        bdf,
+        ConfigOffset::new(4).unwrap(),
+        AccessWidth::Word,
+        0x0406,
+    )
+    .unwrap();
+    binding.reset_lifecycle().unwrap();
+    root.write_config(
+        bdf,
+        ConfigOffset::new(4).unwrap(),
+        AccessWidth::Word,
+        0x0002,
+    )
+    .unwrap();
+    assert!(
+        root.resolve_bound_bar(bar_address, AccessWidth::Byte)
+            .is_some()
+    );
+
+    drop(lease);
+    assert!(
+        root.resolve_bound_bar(bar_address, AccessWidth::Byte)
+            .is_none()
+    );
 }
