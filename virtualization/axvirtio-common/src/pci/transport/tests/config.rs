@@ -54,6 +54,56 @@ fn queue_programming_does_not_probe_guest_memory() {
 }
 
 #[test]
+fn queue_addresses_accept_linux_split_dword_accesses() {
+    let transport = VirtioPciTransport::try_new(TestCore).expect("valid test transport");
+    let mut memory = TestMemory {
+        reads: Cell::new(0),
+    };
+
+    for (offset, address) in [
+        (QUEUE_DESC, 0x0000_0001_0000_1000_u64),
+        (QUEUE_DRIVER, 0x0000_0002_0000_2000_u64),
+        (QUEUE_DEVICE, 0x0000_0003_0000_3000_u64),
+    ] {
+        write(
+            &transport,
+            offset,
+            AccessWidth::Dword,
+            address & u32::MAX as u64,
+            &mut memory,
+        );
+        write(
+            &transport,
+            offset + 4,
+            AccessWidth::Dword,
+            address >> 32,
+            &mut memory,
+        );
+
+        assert_eq!(
+            transport
+                .read_mmio(offset, AccessWidth::Dword)
+                .expect("queue address low dword should be readable"),
+            address & u32::MAX as u64
+        );
+        assert_eq!(
+            transport
+                .read_mmio(offset + 4, AccessWidth::Dword)
+                .expect("queue address high dword should be readable"),
+            address >> 32
+        );
+        assert_eq!(
+            transport
+                .read_mmio(offset, AccessWidth::Qword)
+                .expect("queue address should retain qword compatibility"),
+            address
+        );
+    }
+
+    assert_eq!(memory.reads.get(), 0);
+}
+
+#[test]
 fn queue_enable_rejects_an_unconfigured_layout() {
     let transport = VirtioPciTransport::try_new(TestCore).expect("valid test transport");
     let mut memory = TestMemory {

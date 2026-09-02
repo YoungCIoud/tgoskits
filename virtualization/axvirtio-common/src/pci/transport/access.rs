@@ -138,6 +138,15 @@ impl<D: super::VirtioDeviceCore> VirtioPciTransport<D> {
         let state = self.state.lock();
         let queue_index = state.queue_select as usize;
         let queue = state.queues.get(queue_index);
+        if let Some(access) = QueueAddressAccess::decode(offset, width)? {
+            let queue = queue.ok_or_else(|| invalid_queue(state.queue_select))?;
+            let address = match access.register {
+                QueueAddressRegister::Descriptor => queue.queue.desc_table_addr,
+                QueueAddressRegister::Driver => queue.queue.avail_ring_addr,
+                QueueAddressRegister::Device => queue.queue.used_ring_addr,
+            };
+            return Ok(access.read(address.as_usize() as u64));
+        }
         match offset {
             DEVICE_FEATURE_SELECT => {
                 require_width(width, AccessWidth::Dword)?;
@@ -191,17 +200,6 @@ impl<D: super::VirtioDeviceCore> VirtioPciTransport<D> {
                 require_width(width, AccessWidth::Word)?;
                 Ok(queue_index as u64)
             }
-            QUEUE_DESC | QUEUE_DRIVER | QUEUE_DEVICE => {
-                require_width(width, AccessWidth::Qword)?;
-                let queue = queue.ok_or_else(|| invalid_queue(state.queue_select))?;
-                let address = match offset {
-                    QUEUE_DESC => queue.queue.desc_table_addr,
-                    QUEUE_DRIVER => queue.queue.avail_ring_addr,
-                    QUEUE_DEVICE => queue.queue.used_ring_addr,
-                    _ => unreachable!(),
-                };
-                Ok(address.as_usize() as u64)
-            }
             _ => Err(DeviceError::OutOfRange { addr: offset }),
         }
     }
@@ -224,6 +222,27 @@ impl<D: super::VirtioDeviceCore> VirtioPciTransport<D> {
         let mut state = self.state.lock();
         let selected_queue = state.queue_select as usize;
         let selected_queue_id = state.queue_select;
+        if let Some(access) = QueueAddressAccess::decode(offset, width)? {
+            let queue = state
+                .queues
+                .get_mut(selected_queue)
+                .ok_or_else(|| invalid_queue(selected_queue_id))?;
+            reject_processing_queue(queue)?;
+            let current = match access.register {
+                QueueAddressRegister::Descriptor => queue.queue.desc_table_addr,
+                QueueAddressRegister::Driver => queue.queue.avail_ring_addr,
+                QueueAddressRegister::Device => queue.queue.used_ring_addr,
+            };
+            let address =
+                GuestPhysAddr::from(access.merge(current.as_usize() as u64, value) as usize);
+            match access.register {
+                QueueAddressRegister::Descriptor => queue.queue.set_desc_table_addr(address),
+                QueueAddressRegister::Driver => queue.queue.set_avail_ring_addr(address),
+                QueueAddressRegister::Device => queue.queue.set_used_ring_addr(address),
+            }
+            .map_err(map_pci_error)?;
+            return Ok(VirtioPciWriteOutcome::None);
+        }
         match offset {
             DEVICE_FEATURE_SELECT => {
                 require_width(width, AccessWidth::Dword)?;
@@ -303,22 +322,6 @@ impl<D: super::VirtioDeviceCore> VirtioPciTransport<D> {
                     queue.queue.set_ready(false);
                 }
             }
-            QUEUE_DESC | QUEUE_DRIVER | QUEUE_DEVICE => {
-                require_width(width, AccessWidth::Qword)?;
-                let queue = state
-                    .queues
-                    .get_mut(selected_queue)
-                    .ok_or_else(|| invalid_queue(selected_queue_id))?;
-                reject_processing_queue(queue)?;
-                let address = GuestPhysAddr::from(value as usize);
-                match offset {
-                    QUEUE_DESC => queue.queue.set_desc_table_addr(address),
-                    QUEUE_DRIVER => queue.queue.set_avail_ring_addr(address),
-                    QUEUE_DEVICE => queue.queue.set_used_ring_addr(address),
-                    _ => unreachable!(),
-                }
-                .map_err(map_pci_error)?;
-            }
             MSIX_CONFIG => {
                 require_width(width, AccessWidth::Word)?;
                 state.msix_config = value as u16;
@@ -332,5 +335,70 @@ impl<D: super::VirtioDeviceCore> VirtioPciTransport<D> {
             _ => return Err(DeviceError::OutOfRange { addr: offset }),
         }
         Ok(VirtioPciWriteOutcome::None)
+    }
+}
+
+#[derive(Clone, Copy)]
+enum QueueAddressRegister {
+    Descriptor,
+    Driver,
+    Device,
+}
+
+#[derive(Clone, Copy)]
+enum QueueAddressLane {
+    Low,
+    High,
+    Full,
+}
+
+#[derive(Clone, Copy)]
+struct QueueAddressAccess {
+    register: QueueAddressRegister,
+    lane: QueueAddressLane,
+}
+
+impl QueueAddressAccess {
+    fn decode(offset: u64, width: AccessWidth) -> DeviceResult<Option<Self>> {
+        let (register, high_lane) = if offset == QUEUE_DESC || offset == QUEUE_DESC + 4 {
+            (QueueAddressRegister::Descriptor, offset == QUEUE_DESC + 4)
+        } else if offset == QUEUE_DRIVER || offset == QUEUE_DRIVER + 4 {
+            (QueueAddressRegister::Driver, offset == QUEUE_DRIVER + 4)
+        } else if offset == QUEUE_DEVICE || offset == QUEUE_DEVICE + 4 {
+            (QueueAddressRegister::Device, offset == QUEUE_DEVICE + 4)
+        } else {
+            return Ok(None);
+        };
+
+        let lane = match (high_lane, width) {
+            (false, AccessWidth::Dword) => QueueAddressLane::Low,
+            (false, AccessWidth::Qword) => QueueAddressLane::Full,
+            (true, AccessWidth::Dword) => QueueAddressLane::High,
+            _ => {
+                return Err(DeviceError::InvalidWidth {
+                    expected: AccessWidth::Dword,
+                    actual: width,
+                });
+            }
+        };
+        Ok(Some(Self { register, lane }))
+    }
+
+    const fn read(self, address: u64) -> u64 {
+        match self.lane {
+            QueueAddressLane::Low => address & u32::MAX as u64,
+            QueueAddressLane::High => address >> 32,
+            QueueAddressLane::Full => address,
+        }
+    }
+
+    const fn merge(self, current: u64, value: u64) -> u64 {
+        match self.lane {
+            QueueAddressLane::Low => (current & !u32::MAX as u64) | (value & u32::MAX as u64),
+            QueueAddressLane::High => {
+                (current & u32::MAX as u64) | ((value & u32::MAX as u64) << 32)
+            }
+            QueueAddressLane::Full => value,
+        }
     }
 }
