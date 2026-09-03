@@ -23,6 +23,8 @@ pub(super) struct EndpointAdmission {
     generation: EndpointBindingGeneration,
     epoch: RoutedAdmissionEpoch,
     state: SpinLock<AdmissionState>,
+    #[cfg(test)]
+    drain_observed_hook: SpinLock<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 impl EndpointAdmission {
@@ -35,6 +37,21 @@ impl EndpointAdmission {
                 leases: 0,
                 permits: 0,
             }),
+            #[cfg(test)]
+            drain_observed_hook: SpinLock::new(None),
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_drain_observed_hook(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+        *self.drain_observed_hook.lock_irqsave() = Some(hook);
+    }
+
+    #[cfg(test)]
+    fn notify_drain_observed(&self) {
+        let hook = self.drain_observed_hook.lock_irqsave().take();
+        if let Some(hook) = hook {
+            hook();
         }
     }
 
@@ -168,6 +185,8 @@ impl EndpointAdmission {
             if idle {
                 return Ok(());
             }
+            #[cfg(test)]
+            self.notify_drain_observed();
             core::hint::spin_loop();
         }
         Err(DeviceManagerError::InvalidState {
@@ -296,12 +315,29 @@ pub(super) struct EndpointRouterState {
 
 pub(super) struct EndpointRouter {
     pub(super) state: SpinLock<EndpointRouterState>,
+    #[cfg(test)]
+    reset_admission_hook: SpinLock<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 impl EndpointRouter {
     pub(super) fn new() -> Self {
         Self {
             state: SpinLock::new(EndpointRouterState::default()),
+            #[cfg(test)]
+            reset_admission_hook: SpinLock::new(None),
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_reset_admission_hook(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+        *self.reset_admission_hook.lock_irqsave() = Some(hook);
+    }
+
+    #[cfg(test)]
+    fn notify_reset_admission(&self) {
+        let hook = self.reset_admission_hook.lock_irqsave().take();
+        if let Some(hook) = hook {
+            hook();
         }
     }
 
@@ -495,6 +531,8 @@ impl EndpointRouter {
             }
             (replacements, old_admissions)
         };
+        #[cfg(test)]
+        self.notify_reset_admission();
         for admission in old_admissions {
             admission.wait_for_idle()?;
         }

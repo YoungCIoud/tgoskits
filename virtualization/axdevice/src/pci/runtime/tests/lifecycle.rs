@@ -151,6 +151,241 @@ fn lifecycle_reset_advances_only_the_admission_epoch() {
 }
 
 #[test]
+fn full_reset_rejects_config_snapshot_after_admission_close() {
+    let ConfigEffectRouteFixture {
+        binding,
+        root,
+        bdf,
+        effect_offset,
+        recording: _,
+        lease,
+    } = config_effect_route_fixture(0);
+    let closed = Arc::new(std::sync::Barrier::new(2));
+    let release = Arc::new(std::sync::Barrier::new(2));
+    binding.router.set_reset_admission_hook({
+        let closed = Arc::clone(&closed);
+        let release = Arc::clone(&release);
+        Arc::new(move || {
+            closed.wait();
+            release.wait();
+        })
+    });
+
+    let reset_binding = Arc::clone(&binding);
+    let reset_thread = std::thread::spawn(move || reset_binding.reset_lifecycle());
+    closed.wait();
+
+    assert!(matches!(
+        root.prepare_read_config(bdf, effect_offset, AccessWidth::Dword),
+        Err(PciError::ConfigEffectUnavailable { .. })
+    ));
+
+    release.wait();
+    assert!(reset_thread.join().unwrap().is_ok());
+
+    let (fresh, _, effect) = config_effect_snapshot(&root, bdf, effect_offset);
+    assert_eq!(fresh.admission_epoch(), 2);
+    assert_eq!(effect.effect(), PciConfigEffectId::new(7));
+    let fresh_lease = binding.router.lease(&fresh, false).unwrap();
+    drop(fresh_lease);
+    drop(lease);
+}
+
+#[test]
+fn full_reset_stales_a_route_snapshot_captured_before_close() {
+    let ConfigEffectRouteFixture {
+        binding,
+        root,
+        bdf,
+        effect_offset,
+        recording: _,
+        lease,
+    } = config_effect_route_fixture(0);
+    let reset_closed = Arc::new(std::sync::Barrier::new(2));
+    let reset_release = Arc::new(std::sync::Barrier::new(2));
+    binding.router.set_reset_admission_hook({
+        let reset_closed = Arc::clone(&reset_closed);
+        let reset_release = Arc::clone(&reset_release);
+        Arc::new(move || {
+            reset_closed.wait();
+            reset_release.wait();
+        })
+    });
+
+    let snapshot_ready = Arc::new(std::sync::Barrier::new(2));
+    let snapshot_release = Arc::new(std::sync::Barrier::new(2));
+    let snapshot_root = Arc::clone(&root);
+    let snapshot_ready_thread = Arc::clone(&snapshot_ready);
+    let snapshot_release_thread = Arc::clone(&snapshot_release);
+    let snapshot_thread = std::thread::spawn(move || {
+        let snapshot = config_effect_snapshot(&snapshot_root, bdf, effect_offset);
+        snapshot_ready_thread.wait();
+        snapshot_release_thread.wait();
+        snapshot
+    });
+    snapshot_ready.wait();
+
+    let reset_binding = Arc::clone(&binding);
+    let reset_thread = std::thread::spawn(move || reset_binding.reset_lifecycle());
+    reset_closed.wait();
+    snapshot_release.wait();
+    reset_release.wait();
+
+    let (old, old_command, old_effect) = snapshot_thread.join().unwrap();
+    assert!(reset_thread.join().unwrap().is_ok());
+    assert_eq!(old.binding_generation(), 1);
+    assert_eq!(old.admission_epoch(), 1);
+    assert_eq!(old_effect.effect(), PciConfigEffectId::new(7));
+    assert_eq!(old_effect.command(), old_command);
+    assert_eq!(old_effect.capability_snapshot().bytes()[2], 0x11);
+    assert!(matches!(
+        binding.router.endpoint(&old),
+        Err(DeviceError::InvalidState { .. })
+    ));
+    assert!(matches!(
+        old.admission.clone().acquire(&old),
+        Err(DeviceError::InvalidState { .. })
+    ));
+    assert!(!old.grant(false).admission_is_open());
+
+    let (fresh, ..) = config_effect_snapshot(&root, bdf, effect_offset);
+    assert_eq!(fresh.binding_generation(), old.binding_generation());
+    assert_eq!(fresh.admission_epoch(), old.admission_epoch() + 1);
+    let fresh_lease = binding.router.lease(&fresh, false).unwrap();
+    drop(fresh_lease);
+    drop(lease);
+}
+
+#[test]
+fn full_reset_drains_an_admitted_route_lease_before_endpoint_reset() {
+    let ConfigEffectRouteFixture {
+        binding,
+        root,
+        bdf,
+        effect_offset,
+        recording,
+        lease,
+    } = config_effect_route_fixture(0);
+    let (old, ..) = config_effect_snapshot(&root, bdf, effect_offset);
+    let scoped = binding.router.lease(&old, false).unwrap();
+    let scoped_grant = scoped.grant.clone();
+    let drain_observed = Arc::new(std::sync::Barrier::new(2));
+    let drain_release = Arc::new(std::sync::Barrier::new(2));
+    old.admission.set_drain_observed_hook({
+        let drain_observed = Arc::clone(&drain_observed);
+        let drain_release = Arc::clone(&drain_release);
+        Arc::new(move || {
+            drain_observed.wait();
+            drain_release.wait();
+        })
+    });
+
+    let reset_binding = Arc::clone(&binding);
+    let reset_thread = std::thread::spawn(move || reset_binding.reset_lifecycle());
+    drain_observed.wait();
+
+    assert!(matches!(
+        root.prepare_read_config(bdf, effect_offset, AccessWidth::Dword),
+        Err(PciError::ConfigEffectUnavailable { .. })
+    ));
+    assert!(recording.resets.lock_irqsave().is_empty());
+
+    let mut runtime = crate::DeviceRuntime::empty();
+    runtime.with_routed_grant_for_test(0, scoped_grant.clone(), |context| {
+        let mut callback = |_nested: &mut dyn DeviceContext| Ok(());
+        context
+            .with_routed_device(&scoped_grant, &mut callback)
+            .unwrap();
+    });
+    drop(scoped);
+    drain_release.wait();
+
+    assert!(reset_thread.join().unwrap().is_ok());
+    assert_eq!(recording.resets.lock_irqsave().len(), 1);
+    assert!(matches!(
+        old.admission.clone().acquire(&old),
+        Err(DeviceError::InvalidState { .. })
+    ));
+    let (fresh, ..) = config_effect_snapshot(&root, bdf, effect_offset);
+    let fresh_lease = binding.router.lease(&fresh, false).unwrap();
+    drop(fresh_lease);
+    drop(lease);
+}
+
+#[test]
+fn full_reset_failure_after_admission_barrier_stays_fail_closed() {
+    let ConfigEffectRouteFixture {
+        binding,
+        root,
+        bdf,
+        effect_offset,
+        recording,
+        lease,
+    } = config_effect_route_fixture(1);
+    let (old, ..) = config_effect_snapshot(&root, bdf, effect_offset);
+    let closed = Arc::new(std::sync::Barrier::new(2));
+    let release = Arc::new(std::sync::Barrier::new(2));
+    binding.router.set_reset_admission_hook({
+        let closed = Arc::clone(&closed);
+        let release = Arc::clone(&release);
+        Arc::new(move || {
+            closed.wait();
+            release.wait();
+        })
+    });
+
+    let reset_binding = Arc::clone(&binding);
+    let reset_thread = std::thread::spawn(move || reset_binding.reset_lifecycle());
+    closed.wait();
+    assert!(matches!(
+        root.prepare_read_config(bdf, effect_offset, AccessWidth::Dword),
+        Err(PciError::ConfigEffectUnavailable { .. })
+    ));
+    release.wait();
+
+    assert!(matches!(
+        reset_thread.join().unwrap(),
+        Err(DeviceManagerError::Device(DeviceError::Backend { .. }))
+    ));
+    assert_eq!(
+        binding.lifecycle.lock_irqsave().state,
+        BindingLifecycleState::ResetFailed
+    );
+    assert!(matches!(
+        binding.router.endpoint(&old),
+        Err(DeviceError::InvalidState { .. })
+    ));
+    assert!(matches!(
+        old.admission.clone().acquire(&old),
+        Err(DeviceError::InvalidState { .. })
+    ));
+    let current = binding
+        .router
+        .state
+        .lock_irqsave()
+        .endpoints
+        .get(&DeviceId::new(27))
+        .unwrap()
+        .token
+        .clone();
+    assert_eq!(current.binding_generation(), old.binding_generation());
+    assert_eq!(current.admission_epoch(), old.admission_epoch() + 1);
+    assert!(!current.grant(false).admission_is_open());
+    assert!(binding.router.lease(&current, false).is_err());
+    assert_eq!(recording.resets.lock_irqsave().len(), 1);
+
+    drop(lease);
+    binding
+        .begin_stop_operation()
+        .finish_stop()
+        .expect("teardown remains available from ResetFailed");
+    assert_eq!(
+        binding.lifecycle.lock_irqsave().state,
+        BindingLifecycleState::Dead
+    );
+}
+
+#[test]
 fn full_lifecycle_reset_resets_endpoint_before_reopening_admission() {
     let function_id = DeviceNodeId::new("resettable-endpoint").unwrap();
     let mut builder = PciTopologyBuilder::new();
