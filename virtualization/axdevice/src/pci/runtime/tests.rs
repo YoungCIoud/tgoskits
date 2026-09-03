@@ -7,11 +7,11 @@ use axdevice_base::{
     InterruptTrigger, IrqError, IrqResult, Resource, WiredIrqInput, WiredIrqSink,
 };
 
-use super::{routing::EndpointRouterState, *};
+use super::*;
 use crate::{
     ConfigOffset, PciCapabilityEffectAccess, PciCapabilityEffectRegion, PciCapabilityId,
     PciCapabilitySpec, PciClass, PciConfigEffectId, PciEndpointIdentity, PciError, PciFunctionSpec,
-    PciTopologyBuilder,
+    PciIntxPin, PciIntxRequirement, PciIntxRouter, PciTopologyBuilder, ResourceSlot,
 };
 
 static ORPHAN_QUEUE_TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -457,8 +457,131 @@ impl PciFunction for RecordingFunction {
 }
 
 fn router() -> EndpointRouter {
-    EndpointRouter {
-        state: SpinLock::new(EndpointRouterState::default()),
+    EndpointRouter::new()
+}
+
+struct ConfigEffectRouteFixture {
+    binding: Arc<PciRootBinding>,
+    root: Arc<PciRootState>,
+    bdf: PciBdf,
+    effect_offset: ConfigOffset,
+    recording: Arc<RecordingFunction>,
+    lease: PciBindingLease,
+}
+
+fn config_effect_route_fixture(reset_failures: usize) -> ConfigEffectRouteFixture {
+    let effect = PciCapabilityEffectRegion::new(
+        PciConfigEffectId::new(7),
+        8,
+        6,
+        PciCapabilityEffectAccess::ReadWrite,
+    )
+    .unwrap();
+    let capability = PciCapabilitySpec::new(
+        PciCapabilityId::new(9),
+        vec![0, 0, 0x11, 0x22, 0x33, 0x44, 0, 0, 0, 0, 0, 0, 0, 0],
+        vec![0, 0, 0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0, 0, 0, 0, 0],
+    )
+    .unwrap()
+    .with_effect(effect)
+    .unwrap();
+    let function_id = DeviceNodeId::new("reset-route-effect-endpoint").unwrap();
+    let mut builder = PciTopologyBuilder::new();
+    builder
+        .add_function(
+            PciFunctionSpec::new(
+                function_id.clone(),
+                PciEndpointIdentity::new(0x1af4, 0x1041, PciClass::new(0xff, 0, 0)),
+            )
+            .with_capability(capability)
+            .with_intx(PciIntxRequirement::new(
+                PciIntxPin::A,
+                ResourceSlot::new("reset-route-intx").unwrap(),
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+    let route = PciIntxRouter::new(
+        InterruptControllerId::new(0),
+        [
+            ControllerInputId::new(16),
+            ControllerInputId::new(17),
+            ControllerInputId::new(18),
+            ControllerInputId::new(19),
+        ],
+        [16, 17, 18, 19],
+        InterruptTrigger::LevelTriggered,
+        InterruptSharing::Shared,
+    )
+    .resolve(&function_id, PciBdf::bus_zero(0), PciIntxPin::A)
+    .unwrap();
+    builder.set_intx_route(&function_id, route).unwrap();
+
+    let topology = Arc::new(builder.resolve(0xc000_0000..0xc100_0000).unwrap());
+    let root = Arc::new(PciRootState::new(Arc::clone(&topology)));
+    let bdf = topology.function(&function_id).unwrap().bdf();
+    let binding = Arc::new(PciRootBinding::new(
+        DeviceNodeId::new("reset-route-effect-host").unwrap(),
+        Arc::clone(&root),
+    ));
+    let recording = Arc::new(RecordingFunction {
+        root: Arc::clone(&root),
+        bdf,
+        reads: SpinLock::new(Vec::new()),
+        writes: SpinLock::new(Vec::new()),
+        commands: SpinLock::new(Vec::new()),
+        resets: SpinLock::new(Vec::new()),
+        reset_failures: SpinLock::new(reset_failures),
+        withdrawals: SpinLock::new(0),
+        withdraw_failures: SpinLock::new(0),
+        irq_line: None,
+        supports_effects: true,
+        pending: false,
+    });
+    let mut grants = Vec::new();
+    let lease = binding
+        .bind_registered(
+            &function_id,
+            DeviceId::new(27),
+            recording.clone(),
+            &mut grants,
+        )
+        .unwrap();
+    let capability_offset = topology
+        .function(&function_id)
+        .unwrap()
+        .capabilities()
+        .next()
+        .unwrap()
+        .offset()
+        .value();
+    let effect_offset = ConfigOffset::new(capability_offset + 8).unwrap();
+
+    ConfigEffectRouteFixture {
+        binding,
+        root,
+        bdf,
+        effect_offset,
+        recording,
+        lease,
+    }
+}
+
+fn config_effect_snapshot(
+    root: &PciRootState,
+    bdf: PciBdf,
+    effect_offset: ConfigOffset,
+) -> (EndpointRouteToken, PciCommandState, PciConfigReadEffect) {
+    match root
+        .prepare_read_config(bdf, effect_offset, AccessWidth::Dword)
+        .unwrap()
+    {
+        crate::pci::root::PciConfigReadOutcome::Effect {
+            token,
+            command,
+            effect,
+        } => (token, command, *effect),
+        _ => panic!("expected an admitted PCI config-effect snapshot"),
     }
 }
 
