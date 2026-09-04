@@ -1,7 +1,7 @@
 //! Configured VirtIO block device with MMIO and modern PCI transports.
 //!
-//! MMIO devices may use memory or file-backed storage; the current PCI
-//! configuration accepts the synchronous ramdisk backend.
+//! MMIO devices may use memory or file-backed storage; PCI devices use a
+//! synchronous ramdisk, optionally preloaded from a disk image.
 
 #[cfg(feature = "fs")]
 use core::sync::atomic::AtomicUsize;
@@ -77,7 +77,10 @@ fn create_device_node(
         }
     };
     if matches!(&transport, VirtioBlkTransport::Pci)
-        && !matches!(&backend_config, BackendConfig::RamDisk)
+        && !matches!(
+            &backend_config,
+            BackendConfig::RamDisk | BackendConfig::RamDiskImage { .. }
+        )
     {
         return Err(invalid_options(
             request,
@@ -120,7 +123,13 @@ fn validate_known_options(request: &VirtualDeviceRequest) -> Result<(), Configur
     for key in request.options.keys() {
         if !matches!(
             key.as_str(),
-            "transport" | "backend" | "capacity" | "capacity_sectors" | "path" | "read_only"
+            "transport"
+                | "backend"
+                | "capacity"
+                | "capacity_sectors"
+                | "path"
+                | "image_path"
+                | "read_only"
         ) {
             return Err(invalid_options(
                 request,
@@ -245,11 +254,30 @@ fn parse_backend(request: &VirtualDeviceRequest) -> Result<BackendConfig, Config
             .filter(|path| !path.is_empty())
             .ok_or_else(|| invalid_options(request, "`path` must be a non-empty string"))
     });
+    let image_path = request.options.get("image_path").map(|value| {
+        value
+            .as_str()
+            .filter(|path| !path.is_empty())
+            .ok_or_else(|| invalid_options(request, "`image_path` must be a non-empty string"))
+    });
     match backend {
-        "ramdisk" if path.is_none() => Ok(BackendConfig::RamDisk),
-        "ramdisk" => Err(invalid_options(
+        "ramdisk" => match (path, image_path) {
+            (None, None) => Ok(BackendConfig::RamDisk),
+            (None, Some(image_path)) => Ok(BackendConfig::RamDiskImage {
+                path: image_path?.to_owned(),
+            }),
+            (Some(_), None) => Err(invalid_options(
+                request,
+                "`path` is only valid for the file backend",
+            )),
+            (Some(_), Some(_)) => Err(invalid_options(
+                request,
+                "specify only one of `path` and `image_path`",
+            )),
+        },
+        "file" if image_path.is_some() => Err(invalid_options(
             request,
-            "`path` is only valid for the file backend",
+            "`image_path` is only valid for the ramdisk backend",
         )),
         "file" => Ok(BackendConfig::File {
             path: path
@@ -308,6 +336,7 @@ enum VirtioBlkTransport {
 
 enum BackendConfig {
     RamDisk,
+    RamDiskImage { path: String },
     File { path: String },
 }
 
@@ -470,6 +499,7 @@ impl VirtioBlkBackend {
                 let capacity = capacity_bytes.unwrap_or(DEFAULT_CAPACITY_BYTES);
                 Ok(Self::RamDisk(RamDiskBackend::new(capacity)?))
             }
+            BackendConfig::RamDiskImage { path } => open_ramdisk_image(path, capacity_bytes),
             BackendConfig::File { path } => open_file_backend(path, capacity_bytes),
         }
     }
@@ -481,6 +511,54 @@ impl VirtioBlkBackend {
             Self::File(backend) => backend.capacity_sectors,
         }
     }
+}
+
+#[cfg(feature = "fs")]
+fn open_ramdisk_image(
+    path: &str,
+    configured_capacity: Option<u64>,
+) -> DeviceManagerResult<VirtioBlkBackend> {
+    let mut options = ax_api::fs::AxOpenOptions::new();
+    options.read(true);
+    let file = ax_api::fs::ax_open_file(path, &options).map_err(|error| {
+        invalid_device_config(
+            "open virtio-blk ramdisk image",
+            &format!("failed to open `{path}`: {error}"),
+        )
+    })?;
+    let image_size = ax_api::fs::ax_file_attr(&file)
+        .map_err(|error| {
+            invalid_device_config(
+                "inspect virtio-blk ramdisk image",
+                &format!("failed to inspect `{path}`: {error}"),
+            )
+        })?
+        .size;
+    let mut image = allocate_zeroed_backend_buffer(image_size, "load virtio-blk ramdisk image")?;
+    let read = ax_api::fs::ax_read_file_at(&file, 0, &mut image).map_err(|error| {
+        invalid_device_config(
+            "load virtio-blk ramdisk image",
+            &format!("failed to read `{path}`: {error}"),
+        )
+    })?;
+    if read != image.len() {
+        return Err(invalid_device_config(
+            "load virtio-blk ramdisk image",
+            "backing image returned a short read",
+        ));
+    }
+    RamDiskBackend::from_bytes(image, configured_capacity).map(VirtioBlkBackend::RamDisk)
+}
+
+#[cfg(not(feature = "fs"))]
+fn open_ramdisk_image(
+    path: &str,
+    _configured_capacity: Option<u64>,
+) -> DeviceManagerResult<VirtioBlkBackend> {
+    Err(invalid_device_config(
+        "open virtio-blk ramdisk image",
+        &format!("ramdisk image `{path}` requires the AxVM `fs` feature"),
+    ))
 }
 
 #[cfg(feature = "fs")]
@@ -1108,6 +1186,28 @@ mod tests {
             result,
             Err(ConfiguredDeviceError::InvalidOptions { .. })
         ));
+    }
+
+    #[test]
+    fn parses_ramdisk_image_backend() {
+        let request = request(&[
+            ("backend", toml::Value::String("ramdisk".into())),
+            ("image_path", toml::Value::String("/disk.img".into())),
+        ]);
+        assert!(matches!(
+            parse_backend(&request),
+            Ok(BackendConfig::RamDiskImage { path }) if path == "/disk.img"
+        ));
+    }
+
+    #[test]
+    fn rejects_conflicting_ramdisk_image_paths() {
+        let request = request(&[
+            ("backend", toml::Value::String("ramdisk".into())),
+            ("path", toml::Value::String("/disk.img".into())),
+            ("image_path", toml::Value::String("/other.img".into())),
+        ]);
+        assert!(parse_backend(&request).is_err());
     }
 
     #[test]
