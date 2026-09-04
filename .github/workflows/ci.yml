@@ -1,48 +1,9 @@
-name: CI
+name: UEFI Guest CI
 
 on:
   push:
-    paths-ignore:
-      - "**/*.md"
-      - "**/*.rst"
-      - "**/*.adoc"
-      - "docs/**"
-      - "**/docs/**"
-      - "**/doc/**"
   pull_request:
-    paths:
-      - ".cargo/**"
-      - ".github/actions/publish-container/action.yml"
-      - ".github/ci/**"
-      - ".github/workflows/container-publish.yml"
-      - ".github/workflows/ci.yml"
-      - ".github/workflows/reusable-check-matrix.yml"
-      - ".github/workflows/starry-apps.yml"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - "rust-toolchain.toml"
-      - "apps/**"
-      - "bootloader/**"
-      - "components/**"
-      - "drivers/**"
-      - "fs/**"
-      - "memory/**"
-      - "net/**"
-      - "os/**"
-      - "platforms/**"
-      - "scripts/**"
-      - "test-suit/**"
-      - "tools/**"
-      - "virtualization/**"
-      - "xtask/**"
-      - "!**/*.md"
   workflow_dispatch:
-    inputs:
-      since_sha:
-        description: Base commit for incremental CI checks.
-        required: false
-        default: ""
-        type: string
 
 permissions:
   contents: read
@@ -53,415 +14,56 @@ env:
 
 concurrency:
   group: >-
-    ${{
-      github.event_name != 'pull_request'
-      && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev')
-      && format('ci-{0}-{1}', github.workflow, github.ref)
-      || format('ci-{0}-{1}', github.workflow, github.run_id)
-    }}
-  queue: max
+    uefi-guest-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  plan_ci:
-    name: Plan CI
-    runs-on: ubuntu-latest
-    permissions:
-      actions: write
-      contents: read
-      pull-requests: read
-    outputs:
-      should_run: ${{ steps.route.outputs.should_run }}
-      since_ref: ${{ steps.since.outputs.since_ref }}
-      static_matrix: ${{ steps.matrix.outputs.static_matrix }}
-      static_required: ${{ steps.matrix.outputs.static_required }}
-      workspace_matrix: ${{ steps.matrix.outputs.workspace_matrix }}
-      workspace_required: ${{ steps.matrix.outputs.workspace_required }}
-      arceos_matrix: ${{ steps.matrix.outputs.arceos_matrix }}
-      arceos_required: ${{ steps.matrix.outputs.arceos_required }}
-      starry_matrix: ${{ steps.matrix.outputs.starry_matrix }}
-      starry_required: ${{ steps.matrix.outputs.starry_required }}
-      axvisor_matrix: ${{ steps.matrix.outputs.axvisor_matrix }}
-      axvisor_required: ${{ steps.matrix.outputs.axvisor_required }}
+  uefi_guest:
+    name: ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: UEFI guest · VMX
+            case: uefi-disk-vmx
+            runs_on: [self-hosted, linux, intel, kvm]
+          - name: UEFI guest · SVM
+            case: uefi-disk-svm
+            runs_on: [self-hosted, linux, amd, kvm]
+    runs-on: ${{ matrix.runs_on }}
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
     steps:
-      - name: Route duplicate events
-        id: route
-        env:
-          GH_TOKEN: ${{ github.token }}
-          EVENT_NAME: ${{ github.event_name }}
-          HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name || '' }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
-          PR_HEAD_REF: ${{ github.event.pull_request.head.ref || '' }}
-        run: |
-          set -euo pipefail
-
-          should_run=true
-          if [ "$EVENT_NAME" = "pull_request" ] \
-            && [ "$HEAD_REPOSITORY" = "$GITHUB_REPOSITORY" ]; then
-            for ((attempt = 1; attempt <= 10; attempt++)); do
-              push_runs=""
-              if ! push_runs="$(
-                gh api \
-                  --method GET \
-                  --paginate \
-                  "repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs" \
-                  -f event=push \
-                  -f branch="$PR_HEAD_REF" \
-                  -f head_sha="$HEAD_SHA" \
-                  -f per_page=100 \
-                  --jq '.workflow_runs[] | select(
-                    .event == "push"
-                    and .head_sha == env.HEAD_SHA
-                    and .head_branch == env.PR_HEAD_REF
-                    and .conclusion != "cancelled"
-                  ) | [.id, .run_number, .html_url] | @tsv' 2>&1
-              )"; then
-                echo "::warning::Failed to query matching branch push runs: ${push_runs}"
-                break
-              fi
-
-              if [ -z "$push_runs" ]; then
-                # The pull_request record can become visible before its sibling push run.
-                if [ "$attempt" -lt 10 ]; then
-                  sleep 2
-                  continue
-                fi
-                break
-              fi
-
-              reusable_push_runs=""
-              route_query_failed=false
-              while IFS=$'\t' read -r run_id run_number run_url; do
-                if [ -z "$run_id" ]; then
-                  continue
-                fi
-                if ! push_run_state="$(
-                  gh api \
-                    --method GET \
-                    "repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}" \
-                    --jq '[.status, (.conclusion != "cancelled")] | @tsv' 2>&1
-                )"; then
-                  echo "::warning::Failed to recheck branch push run #${run_number}: ${push_run_state}"
-                  route_query_failed=true
-                  continue
-                fi
-                IFS=$'\t' read -r current_status push_run_is_usable <<< "$push_run_state"
-                if [ "$push_run_is_usable" != "true" ]; then
-                  continue
-                fi
-
-                # Push routing is canonical, so an unfinished matching run owns
-                # validation before GitHub materializes its matrix jobs.
-                case "$current_status" in
-                  queued|in_progress|waiting|requested)
-                    ;;
-                  completed)
-                    if ! active_matrix_jobs="$(
-                      gh api \
-                        --method GET \
-                        --paginate \
-                        "repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}/jobs" \
-                        -f filter=latest \
-                        -f per_page=100 \
-                        --jq '.jobs[] | select(
-                          .name != "Plan CI"
-                          and .conclusion != "skipped"
-                          and .conclusion != "cancelled"
-                        ) | .id' 2>&1
-                    )"; then
-                      echo "::warning::Failed to inspect branch push run #${run_number}: ${active_matrix_jobs}"
-                      route_query_failed=true
-                      continue
-                    fi
-                    if [ -z "$active_matrix_jobs" ]; then
-                      continue
-                    fi
-                    ;;
-                  *)
-                    continue
-                    ;;
-                esac
-
-                if [ -n "$reusable_push_runs" ]; then
-                  reusable_push_runs+=$'\n'
-                fi
-                reusable_push_runs+="- #${run_number} (${current_status}): ${run_url}"
-              done <<< "$push_runs"
-
-              if [ "$route_query_failed" = "true" ]; then
-                break
-              fi
-              if [ -n "$reusable_push_runs" ]; then
-                should_run=false
-                {
-                  echo "## Duplicate pull request CI skipped"
-                  echo ""
-                  echo "A branch push run already owns validation for this pull request head commit."
-                  echo ""
-                  echo "$reusable_push_runs"
-                } >> "$GITHUB_STEP_SUMMARY"
-              fi
-              break
-            done
-          fi
-          echo "should_run=${should_run}" >> "$GITHUB_OUTPUT"
-
-      - name: Cancel older queued or running runs
-        if: >-
-          (github.event_name == 'pull_request' &&
-           github.event.pull_request.head.repo.full_name == github.repository) ||
-          (github.event_name != 'pull_request' &&
-           github.ref != 'refs/heads/main' && github.ref != 'refs/heads/dev')
-        env:
-          GH_TOKEN: ${{ github.token }}
-          CURRENT_RUN_NUMBER: ${{ github.run_number }}
-          EVENT_NAME: ${{ github.event_name }}
-          PR_HEAD_REF: ${{ github.event.pull_request.head.ref || '' }}
-          PR_HEAD_REPOSITORY_ID: ${{ github.event.pull_request.head.repo.id || '' }}
-          REF_NAME: ${{ github.ref_name }}
-          PR_NUMBER: ${{ github.event.pull_request.number || '' }}
-        run: |
-          set -uo pipefail
-
-          statuses=(queued in_progress waiting requested)
-
-          if [ "$EVENT_NAME" = "pull_request" ]; then
-            selector='select(
-              .run_number < (env.CURRENT_RUN_NUMBER | tonumber)
-              and .event == "pull_request"
-              and (
-                any(.pull_requests[]?; .number == (env.PR_NUMBER | tonumber))
-                or (
-                  (.pull_requests | length) == 0
-                  and env.PR_HEAD_REF != ""
-                  and env.PR_HEAD_REPOSITORY_ID != ""
-                  and .head_branch == env.PR_HEAD_REF
-                  and .head_repository.id == (env.PR_HEAD_REPOSITORY_ID | tonumber)
-                )
-              )
-            )'
-          else
-            selector='select(
-              .run_number < (env.CURRENT_RUN_NUMBER | tonumber)
-              and .head_branch == env.REF_NAME
-              and .event == env.EVENT_NAME
-            )'
-          fi
-
-          for status in "${statuses[@]}"; do
-            if ! runs="$(
-              gh api \
-                --paginate \
-                "repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs?status=${status}&per_page=100" \
-                --jq ".workflow_runs[] | ${selector} | [.id, .run_number, .html_url] | @tsv" 2>&1
-            )"; then
-              echo "::warning::Failed to query stale CI runs with status '${status}': ${runs}"
-              continue
-            fi
-
-            while IFS=$'\t' read -r run_id run_number run_url; do
-              if [ -z "$run_id" ]; then
-                continue
-              fi
-              if ! gh api \
-                --method POST \
-                "repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}/cancel" >/dev/null; then
-                echo "::warning::Failed to cancel stale CI run #${run_number}: ${run_url}"
-              fi
-              sleep 2
-              if ! run_status="$(
-                gh api \
-                  --method GET \
-                  "repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}" \
-                  --jq '.status' 2>&1
-              )"; then
-                echo "::warning::Failed to recheck stale CI run #${run_number}: ${run_status}"
-                continue
-              fi
-              if [ "$run_status" != "completed" ] && ! gh api \
-                --method POST \
-                "repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}/force-cancel" >/dev/null; then
-                echo "::warning::Failed to force-cancel stale CI run #${run_number}: ${run_url}"
-              fi
-            done <<< "$runs"
-          done
-
       - name: Checkout code
-        if: steps.route.outputs.should_run == 'true'
         uses: actions/checkout@v6
-        with:
-          fetch-depth: 2
 
-      - name: Validate CI configuration
-        if: steps.route.outputs.should_run == 'true'
+      - name: Prepare KVM and UEFI inputs
         run: |
           set -euo pipefail
-          python3 scripts/test/check_ci_routing.py
-          python3 -m unittest \
-            scripts/test/test_ci_impact.py \
-            scripts/test/test_ci_plan.py \
-            scripts/test/test_ci_routing.py
+          command -v rustc
+          command -v cargo
+          command -v gzip
+          rustc -vV
+          cargo -V
+          test -r /dev/kvm && test -w /dev/kvm
 
-      - name: Resolve incremental base revision
-        id: since
-        if: steps.route.outputs.should_run == 'true'
-        env:
-          EVENT_NAME: ${{ github.event_name }}
-          SINCE_SHA: ${{ inputs.since_sha || '' }}
-          PUSH_BEFORE_SHA: ${{ github.event.before || '' }}
-          PR_BASE_SHA: ${{ github.event.pull_request.base.sha || '' }}
-        run: |
-          set -euo pipefail
+          disk_asset=test-suit/axvisor/experimental/qemu-uefi-disk/assets/uefi-guest.img.gz
+          disk_image=/tmp/uefi-guest.img
+          test -s "${disk_asset}"
+          gzip -dc "${disk_asset}" > "${disk_image}"
+          disk_size=$(stat -c '%s' "${disk_image}")
+          test $((disk_size % 512)) -eq 0
+          echo "Prepared UEFI guest disk: ${disk_image} (${disk_size} bytes)"
 
-          is_empty_or_zero_sha() {
-            local value="$1"
-            [ -z "$value" ] || [ "$value" = "0000000000000000000000000000000000000000" ]
-          }
+          test -r /usr/share/OVMF/OVMF_CODE_4M.fd
+          test -r /usr/share/OVMF/OVMF_VARS_4M.fd
 
-          if [ "$EVENT_NAME" = "pull_request" ]; then
-            since_ref="$PR_BASE_SHA"
-            if ! git rev-parse --verify "${since_ref}^{commit}" >/dev/null 2>&1; then
-              git fetch --no-tags --depth=1 origin "$since_ref" >/dev/null 2>&1 || true
-            fi
-          elif [ "$EVENT_NAME" = "push" ] && ! is_empty_or_zero_sha "$PUSH_BEFORE_SHA"; then
-            since_ref="$PUSH_BEFORE_SHA"
-          elif [ "$EVENT_NAME" = "workflow_dispatch" ] && ! is_empty_or_zero_sha "$SINCE_SHA"; then
-            since_ref="$SINCE_SHA"
-          elif git rev-parse --verify HEAD~1 >/dev/null 2>&1; then
-            since_ref="$(git rev-parse HEAD~1)"
-          else
-            git fetch --no-tags --depth=1 origin dev:refs/remotes/origin/dev >/dev/null 2>&1 || true
-            since_ref="$(git merge-base HEAD origin/dev 2>/dev/null || git rev-parse HEAD)"
-          fi
+      - name: Pull Linux guest image
+        run: cargo xtask image pull qemu-x86_64 --extract-dir tmp/axbuild/images
 
-          echo "since_ref=${since_ref}" >> "$GITHUB_OUTPUT"
-
-      - name: Plan check matrices
-        id: matrix
-        if: steps.route.outputs.should_run == 'true'
-        env:
-          EVENT_NAME: ${{ github.event_name }}
-          BASE_REF: ${{ github.base_ref }}
-          REPOSITORY_OWNER: ${{ github.repository_owner }}
-          SINCE_REF: ${{ steps.since.outputs.since_ref }}
-        run: |
-          set -euo pipefail
-          python3 scripts/test/ci_plan.py \
-            --mode main \
-            --repository "$GITHUB_REPOSITORY" \
-            --repository-owner "$REPOSITORY_OWNER" \
-            --event-name "$EVENT_NAME" \
-            --base-ref "$BASE_REF" \
-            --since-ref "$SINCE_REF" \
-            --summary-file "$GITHUB_STEP_SUMMARY" \
-            --output-file "$GITHUB_OUTPUT"
-
-  static_checks:
-    name: Preflight
-    needs: plan_ci
-    if: >-
-      needs.plan_ci.outputs.should_run == 'true' &&
-      needs.plan_ci.outputs.static_required == 'true'
-    uses: ./.github/workflows/reusable-check-matrix.yml
-    with:
-      matrix_json: ${{ needs.plan_ci.outputs.static_matrix }}
-      fail_fast: true
-      save_cache: >-
-        ${{ github.event_name == 'push' &&
-            (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev') }}
-      since_ref: ${{ needs.plan_ci.outputs.since_ref }}
-    secrets:
-      CLAW_API_KEY: ${{ secrets.CLAW_API_KEY }}
-
-  workspace_checks:
-    name: Workspace
-    needs:
-      - plan_ci
-      - static_checks
-    if: >-
-      always() &&
-      needs.plan_ci.result == 'success' &&
-      needs.plan_ci.outputs.should_run == 'true' &&
-      needs.plan_ci.outputs.workspace_required == 'true' &&
-      (needs.static_checks.result == 'success' ||
-       needs.static_checks.result == 'skipped')
-    uses: ./.github/workflows/reusable-check-matrix.yml
-    with:
-      matrix_json: ${{ needs.plan_ci.outputs.workspace_matrix }}
-      fail_fast: true
-      save_cache: >-
-        ${{ github.event_name == 'push' &&
-            (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev') }}
-      since_ref: ${{ needs.plan_ci.outputs.since_ref }}
-    secrets:
-      CLAW_API_KEY: ${{ secrets.CLAW_API_KEY }}
-
-  arceos_checks:
-    name: ArceOS
-    needs:
-      - plan_ci
-      - static_checks
-    if: >-
-      always() &&
-      needs.plan_ci.result == 'success' &&
-      needs.plan_ci.outputs.should_run == 'true' &&
-      needs.plan_ci.outputs.arceos_required == 'true' &&
-      (needs.static_checks.result == 'success' ||
-       needs.static_checks.result == 'skipped')
-    uses: ./.github/workflows/reusable-check-matrix.yml
-    with:
-      matrix_json: ${{ needs.plan_ci.outputs.arceos_matrix }}
-      fail_fast: true
-      save_cache: >-
-        ${{ github.event_name == 'push' &&
-            (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev') }}
-      since_ref: ${{ needs.plan_ci.outputs.since_ref }}
-    secrets:
-      CLAW_API_KEY: ${{ secrets.CLAW_API_KEY }}
-
-  starry_checks:
-    name: Starry
-    needs:
-      - plan_ci
-      - static_checks
-    if: >-
-      always() &&
-      needs.plan_ci.result == 'success' &&
-      needs.plan_ci.outputs.should_run == 'true' &&
-      needs.plan_ci.outputs.starry_required == 'true' &&
-      (needs.static_checks.result == 'success' ||
-       needs.static_checks.result == 'skipped')
-    uses: ./.github/workflows/reusable-check-matrix.yml
-    with:
-      matrix_json: ${{ needs.plan_ci.outputs.starry_matrix }}
-      fail_fast: true
-      save_cache: >-
-        ${{ github.event_name == 'push' &&
-            (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev') }}
-      since_ref: ${{ needs.plan_ci.outputs.since_ref }}
-    secrets:
-      CLAW_API_KEY: ${{ secrets.CLAW_API_KEY }}
-      STARRY_WIFI_SSID: ${{ secrets.STARRY_WIFI_SSID }}
-      STARRY_WIFI_PASSWORD: ${{ secrets.STARRY_WIFI_PASSWORD }}
-
-  axvisor_checks:
-    name: AxVisor
-    needs:
-      - plan_ci
-      - static_checks
-    if: >-
-      always() &&
-      needs.plan_ci.result == 'success' &&
-      needs.plan_ci.outputs.should_run == 'true' &&
-      needs.plan_ci.outputs.axvisor_required == 'true' &&
-      (needs.static_checks.result == 'success' ||
-       needs.static_checks.result == 'skipped')
-    uses: ./.github/workflows/reusable-check-matrix.yml
-    with:
-      matrix_json: ${{ needs.plan_ci.outputs.axvisor_matrix }}
-      fail_fast: true
-      save_cache: >-
-        ${{ github.event_name == 'push' &&
-            (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev') }}
-      since_ref: ${{ needs.plan_ci.outputs.since_ref }}
-    secrets:
-      CLAW_API_KEY: ${{ secrets.CLAW_API_KEY }}
+      - name: Run UEFI guest test
+        run: >-
+          cargo xtask axvisor test qemu --arch x86_64
+          --test-group experimental --test-case ${{ matrix.case }}
