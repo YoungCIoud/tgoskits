@@ -57,8 +57,9 @@ jobs:
           test $((disk_size % 512)) -eq 0
           echo "Prepared UEFI guest disk: ${disk_image} (${disk_size} bytes)"
 
-          test -r /usr/share/OVMF/OVMF_CODE_4M.fd
-          test -r /usr/share/OVMF/OVMF_VARS_4M.fd
+          ovmf_dir=test-suit/axvisor/experimental/qemu-uefi-disk/assets
+          test -r "${ovmf_dir}/OVMF_CODE_4M.fd"
+          test -r "${ovmf_dir}/OVMF_VARS_4M.fd"
 
       - name: Pull Linux guest image
         run: cargo xtask image pull qemu-x86_64 --extract-dir tmp/axbuild/images

@@ -4,3 +4,4 @@
 *.bin binary
 *.img binary
 *.img.gz binary
+*.fd binary

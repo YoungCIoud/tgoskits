@@ -7,9 +7,9 @@ vm_configs = ["test-suit/axvisor/experimental/qemu-uefi-disk/x86-linux-uefi-disk
 AXVISOR_TEST_BUSYBOX_INITRAMFS = "tmp/axbuild/axvisor/qemu-uefi-disk/initramfs-x86_64.cpio.gz"
 AXVISOR_TEST_X86_OVMF_OUTPUT = "tmp/axbuild/axvisor/qemu-uefi-disk/OVMF_CODE_4M.fd"
 # The pinned ostool OVMF image does not include a usable VirtIO block UEFI
-# driver. Use the host's OVMF CODE/VARS pair for this local test.
-AXVISOR_TEST_X86_OVMF_INPUT = "/usr/share/OVMF/OVMF_CODE_4M.fd"
-AXVISOR_TEST_X86_OVMF_VARS_INPUT = "/usr/share/OVMF/OVMF_VARS_4M.fd"
+# driver. Use the repository's known-good OVMF CODE/VARS pair.
+AXVISOR_TEST_X86_OVMF_INPUT = "test-suit/axvisor/experimental/qemu-uefi-disk/assets/OVMF_CODE_4M.fd"
+AXVISOR_TEST_X86_OVMF_VARS_INPUT = "test-suit/axvisor/experimental/qemu-uefi-disk/assets/OVMF_VARS_4M.fd"
 # Local experiment input. The test runner copies this host file into the
 # outer Axvisor rootfs at /uefi/uefi-guest.img before QEMU starts.
 AXVISOR_TEST_X86_UEFI_DISK_IMAGE = "/tmp/uefi-guest.img"
