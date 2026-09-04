@@ -600,12 +600,62 @@ struct RamDiskBackend {
 
 impl RamDiskBackend {
     fn new(capacity_bytes: u64) -> DeviceManagerResult<Self> {
-        Ok(Self {
-            bytes: Mutex::new(allocate_zeroed_backend_buffer(
-                capacity_bytes,
+        let image = allocate_zeroed_backend_buffer(capacity_bytes, "allocate virtio-blk ramdisk")?;
+        Self::from_bytes(image, Some(capacity_bytes))
+    }
+
+    fn from_bytes(
+        mut image: Vec<u8>,
+        configured_capacity: Option<u64>,
+    ) -> DeviceManagerResult<Self> {
+        let image_capacity = u64::try_from(image.len()).map_err(|_| {
+            invalid_device_config(
+                "initialize virtio-blk ramdisk from image",
+                "disk image size does not fit the host address space",
+            )
+        })?;
+        if image_capacity == 0 || !image_capacity.is_multiple_of(SECTOR_SIZE as u64) {
+            return Err(invalid_device_config(
+                "validate virtio-blk ramdisk image",
+                "disk image size must be a positive multiple of 512 bytes",
+            ));
+        }
+
+        let capacity = configured_capacity.unwrap_or(image_capacity);
+        if capacity == 0 || !capacity.is_multiple_of(SECTOR_SIZE as u64) {
+            return Err(invalid_device_config(
+                "validate virtio-blk ramdisk capacity",
+                "ramdisk capacity must be a positive multiple of 512 bytes",
+            ));
+        }
+        if image_capacity > capacity {
+            return Err(invalid_device_config(
+                "validate virtio-blk ramdisk image",
+                "disk image is larger than the configured ramdisk capacity",
+            ));
+        }
+
+        let capacity_len = usize::try_from(capacity).map_err(|_| {
+            invalid_device_config(
                 "allocate virtio-blk ramdisk",
-            )?),
-            capacity_sectors: capacity_bytes / SECTOR_SIZE as u64,
+                "capacity does not fit the host address space",
+            )
+        })?;
+        if capacity_len > image.len() {
+            image
+                .try_reserve_exact(capacity_len - image.len())
+                .map_err(|_| {
+                    invalid_device_config(
+                        "allocate virtio-blk ramdisk",
+                        "capacity cannot be allocated in the host address space",
+                    )
+                })?;
+            image.resize(capacity_len, 0);
+        }
+
+        Ok(Self {
+            bytes: Mutex::new(image),
+            capacity_sectors: capacity / SECTOR_SIZE as u64,
         })
     }
 
@@ -1005,6 +1055,29 @@ mod tests {
     #[test]
     fn oversized_backend_capacity_returns_configuration_error() {
         assert!(allocate_zeroed_backend_buffer(u64::MAX, "test virtio-blk allocation").is_err());
+    }
+
+    #[test]
+    fn ramdisk_from_image_preserves_contents_and_pads_capacity() {
+        let image = vec![0x5a; SECTOR_SIZE];
+        let backend = RamDiskBackend::from_bytes(image, Some((2 * SECTOR_SIZE) as u64)).unwrap();
+        let mut first_sector = vec![0; SECTOR_SIZE];
+        let mut second_sector = vec![0xff; SECTOR_SIZE];
+
+        assert_eq!(backend.read(0, &mut first_sector), Ok(SECTOR_SIZE));
+        assert_eq!(backend.read(1, &mut second_sector), Ok(SECTOR_SIZE));
+        assert_eq!(first_sector, vec![0x5a; SECTOR_SIZE]);
+        assert_eq!(second_sector, vec![0; SECTOR_SIZE]);
+        assert_eq!(backend.capacity_sectors, 2);
+    }
+
+    #[test]
+    fn ramdisk_from_image_rejects_invalid_capacity_and_image_size() {
+        assert!(RamDiskBackend::from_bytes(vec![0; SECTOR_SIZE - 1], None).is_err());
+        assert!(RamDiskBackend::from_bytes(vec![0; SECTOR_SIZE], Some(0)).is_err());
+        assert!(
+            RamDiskBackend::from_bytes(vec![0; 2 * SECTOR_SIZE], Some(SECTOR_SIZE as u64)).is_err()
+        );
     }
 
     #[test]
