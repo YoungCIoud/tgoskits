@@ -2,7 +2,7 @@
 
 use std::{format, sync::Arc, vec::Vec};
 
-use axdevice::{FwCfgKernelPayload, FwCfgPlatformConfig, FwCfgRamRegion};
+use axdevice::{FwCfgAcpiBlobs, FwCfgKernelPayload, FwCfgPlatformConfig, FwCfgRamRegion};
 use axvm_types::GuestPhysAddr;
 use axvmconfig::{VMBootProtocol, VmMemMappingType};
 
@@ -38,6 +38,7 @@ impl BootImagePlatform for X86_64Arch {
         let fw_cfg_payload = x86_fw_cfg_payload(&loader.config, images.kernel, images.ramdisk)?;
         let firmware = prepare_x86_firmware(loader, fw_cfg_payload)?;
         if loader.config.kernel.boots_from_pci_disk() {
+            load_direct_acpi(loader, &firmware)?;
             return load_boot_image_from_memory(loader, images.bios);
         }
         if should_direct_boot_linux(&loader.config)
@@ -64,6 +65,7 @@ impl BootImagePlatform for X86_64Arch {
         let fw_cfg_payload = read_x86_fw_cfg_payload(loader)?;
         let firmware = prepare_x86_firmware(loader, fw_cfg_payload)?;
         if loader.config.kernel.boots_from_pci_disk() {
+            load_direct_acpi(loader, &firmware)?;
             return load_boot_image_from_filesystem(loader);
         }
         if should_direct_boot_linux(&loader.config) {
@@ -403,7 +405,11 @@ fn prepare_x86_firmware(
         direct_acpi.tables().iter().count(),
         direct_acpi.load_gpa()
     );
-    let acpi = acpi::build_fw_cfg_blobs(&plan).map_err(acpi_build_error)?;
+    let acpi = if loader.config.kernel.boots_from_pci_disk() {
+        FwCfgAcpiBlobs::default()
+    } else {
+        acpi::build_fw_cfg_blobs(&plan).map_err(acpi_build_error)?
+    };
     let (fw_cfg_base, fw_cfg_size) = plan.fw_cfg_range().map_err(|error| {
         AxVmError::invalid_config(format!("invalid resolved x86 fw_cfg resources: {error}"))
     })?;
@@ -488,15 +494,7 @@ fn load_linux_layout(
     kernel: &[u8],
     firmware: &PreparedX86Firmware,
 ) -> AxVmResult {
-    loader.vm.set_guest_acpi_tables(
-        GuestPhysAddr::from(firmware.direct_acpi.rsdp_gpa() as usize),
-        firmware.direct_acpi.bytes().to_vec(),
-    )?;
-    load_vm_image_from_memory(
-        firmware.direct_acpi.bytes(),
-        GuestPhysAddr::from(firmware.direct_acpi.load_gpa() as usize),
-        loader.vm.clone(),
-    )?;
+    load_direct_acpi(loader, firmware)?;
     let boot_params = build_boot_params(loader, header, layout, kernel, firmware)?;
     let boot_stub = linux_boot::build_boot_image(&layout).map_err(|err| {
         ax_err_type!(
@@ -526,6 +524,18 @@ fn load_linux_layout(
         config.cpu_config.ap_entry = entry;
     });
     Ok(())
+}
+
+fn load_direct_acpi(loader: &ImageLoaderCore<'_>, firmware: &PreparedX86Firmware) -> AxVmResult {
+    loader.vm.set_guest_acpi_tables(
+        GuestPhysAddr::from(firmware.direct_acpi.rsdp_gpa() as usize),
+        firmware.direct_acpi.bytes().to_vec(),
+    )?;
+    load_vm_image_from_memory(
+        firmware.direct_acpi.bytes(),
+        GuestPhysAddr::from(firmware.direct_acpi.load_gpa() as usize),
+        loader.vm.clone(),
+    )
 }
 
 fn build_boot_params(

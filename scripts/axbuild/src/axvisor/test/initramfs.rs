@@ -14,12 +14,16 @@ use std::{
 use anyhow::{Context, bail, ensure};
 use flate2::{Compression, write::GzEncoder};
 use ostool::build::config::Cargo;
-use tempfile::NamedTempFile;
+use tempfile::{NamedTempFile, tempdir};
 
 use crate::{axvisor::rootfs, context::ResolvedAxvisorRequest, rootfs::inject::read_binary_file};
 
 const OUTPUT_ENV: &str = "AXVISOR_TEST_BUSYBOX_INITRAMFS";
 const OVMF_OUTPUT_ENV: &str = "AXVISOR_TEST_X86_OVMF_OUTPUT";
+const OVMF_INPUT_ENV: &str = "AXVISOR_TEST_X86_OVMF_INPUT";
+const OVMF_VARS_INPUT_ENV: &str = "AXVISOR_TEST_X86_OVMF_VARS_INPUT";
+const UEFI_DISK_IMAGE_ENV: &str = "AXVISOR_TEST_X86_UEFI_DISK_IMAGE";
+const UEFI_DISK_GUEST_PATH: &str = "/uefi/uefi-guest.img";
 const BUSYBOX_PATH: &str = "/bin/busybox";
 // These bounds are the fixed Q35 guest aperture used by the x86 AxVM provider;
 // the end bound is exclusive.
@@ -627,9 +631,96 @@ pub(super) async fn prepare_configured_busybox_initramfs(
             "{OVMF_OUTPUT_ENV} is only valid for x86_64 Axvisor tests"
         );
         let output_path = resolve_output_path(workspace_root, configured_output, OVMF_OUTPUT_ENV)?;
-        let evidence = super::ovmf::prepare_x86_ovmf(&output_path).await?;
+        let evidence = if let Some(configured_input) = cargo.env.get(OVMF_INPUT_ENV) {
+            let input_path = resolve_input_path(workspace_root, configured_input, OVMF_INPUT_ENV)?;
+            if let Some(configured_vars) = cargo.env.get(OVMF_VARS_INPUT_ENV) {
+                let vars_path =
+                    resolve_input_path(workspace_root, configured_vars, OVMF_VARS_INPUT_ENV)?;
+                super::ovmf::prepare_x86_ovmf_from_split_paths(
+                    &output_path,
+                    &input_path,
+                    &vars_path,
+                )?
+            } else {
+                super::ovmf::prepare_x86_ovmf_from_monolithic_path(&output_path, &input_path)?
+            }
+        } else {
+            super::ovmf::prepare_x86_ovmf(&output_path).await?
+        };
         println!("{evidence}");
     }
+    ensure!(
+        !cargo.env.contains_key(OVMF_INPUT_ENV) || cargo.env.contains_key(OVMF_OUTPUT_ENV),
+        "{OVMF_INPUT_ENV} requires {OVMF_OUTPUT_ENV}"
+    );
+    ensure!(
+        !cargo.env.contains_key(OVMF_VARS_INPUT_ENV) || cargo.env.contains_key(OVMF_INPUT_ENV),
+        "{OVMF_VARS_INPUT_ENV} requires {OVMF_INPUT_ENV}"
+    );
+    prepare_configured_uefi_disk_image(request, cargo, workspace_root)?;
+    Ok(())
+}
+
+/// Copies a host-side UEFI disk image into the Axvisor runtime rootfs.
+///
+/// The `image_path` consumed by `ax_api::fs` is a path in the outer Axvisor
+/// rootfs, not a path on the machine running `axbuild`. Keep the image out of
+/// the guest initramfs and seed it into the rootfs before QEMU starts.
+fn prepare_configured_uefi_disk_image(
+    request: &ResolvedAxvisorRequest,
+    cargo: &Cargo,
+    workspace_root: &Path,
+) -> anyhow::Result<()> {
+    let Some(configured_image) = cargo.env.get(UEFI_DISK_IMAGE_ENV) else {
+        return Ok(());
+    };
+    ensure!(
+        request.arch == "x86_64",
+        "{UEFI_DISK_IMAGE_ENV} is only valid for x86_64 Axvisor tests"
+    );
+
+    let source_path = resolve_input_path(workspace_root, configured_image, UEFI_DISK_IMAGE_ENV)?;
+    validate_uefi_disk_image_size(&source_path)?;
+
+    let rootfs_path = rootfs::qemu_rootfs_path(request, workspace_root, None)?;
+    let staging = tempdir().context("failed to create UEFI disk rootfs staging directory")?;
+    let staged_image = staging
+        .path()
+        .join(UEFI_DISK_GUEST_PATH.trim_start_matches('/'));
+    fs::create_dir_all(
+        staged_image
+            .parent()
+            .context("UEFI disk guest path has no parent")?,
+    )
+    .context("failed to create UEFI disk rootfs staging directory")?;
+    fs::copy(&source_path, &staged_image)
+        .with_context(|| format!("failed to stage UEFI disk image {}", source_path.display()))?;
+    crate::rootfs::inject::inject_overlay(&rootfs_path, staging.path()).with_context(|| {
+        format!(
+            "failed to inject UEFI disk image {} into Axvisor rootfs {}",
+            source_path.display(),
+            rootfs_path.display()
+        )
+    })?;
+    println!(
+        "prepared Axvisor UEFI disk image: {} -> {}:{}",
+        source_path.display(),
+        rootfs_path.display(),
+        UEFI_DISK_GUEST_PATH
+    );
+    Ok(())
+}
+
+fn validate_uefi_disk_image_size(source_path: &Path) -> anyhow::Result<()> {
+    let image_size = fs::metadata(source_path)
+        .with_context(|| format!("failed to stat UEFI disk image {}", source_path.display()))?
+        .len();
+    ensure!(
+        image_size > 0 && image_size.is_multiple_of(512),
+        "{UEFI_DISK_IMAGE_ENV} must name a non-empty image whose size is a multiple of 512 bytes: \
+         {} ({image_size} bytes)",
+        source_path.display()
+    );
     Ok(())
 }
 
@@ -647,6 +738,32 @@ fn resolve_output_path(
         "{variable} must be a workspace-relative path without parent traversal"
     );
     Ok(workspace_root.join(configured_output))
+}
+
+fn resolve_input_path(
+    workspace_root: &Path,
+    configured_input: &str,
+    variable: &str,
+) -> anyhow::Result<PathBuf> {
+    let configured_input = Path::new(configured_input);
+    let input_path = if configured_input.is_absolute() {
+        configured_input.to_path_buf()
+    } else {
+        ensure!(
+            configured_input
+                .components()
+                .all(|component| matches!(component, Component::CurDir | Component::Normal(_))),
+            "{variable} must be a workspace-relative path without parent traversal or an absolute \
+             host path"
+        );
+        workspace_root.join(configured_input)
+    };
+    ensure!(
+        input_path.is_file(),
+        "{variable} does not point to a regular file: {}",
+        input_path.display()
+    );
+    Ok(input_path)
 }
 
 fn prepare_busybox_initramfs(
@@ -861,6 +978,41 @@ mod tests {
         );
         assert!(resolve_output_path(root.path(), "../outside", OUTPUT_ENV).is_err());
         assert!(resolve_output_path(root.path(), "/tmp/outside", OUTPUT_ENV).is_err());
+    }
+
+    #[test]
+    fn configured_uefi_disk_image_accepts_workspace_and_absolute_inputs() {
+        let root = tempdir().unwrap();
+        let workspace_image = root.path().join("tmp/uefi-guest.img");
+        fs::create_dir_all(workspace_image.parent().unwrap()).unwrap();
+        fs::write(&workspace_image, [0u8; 512]).unwrap();
+
+        assert_eq!(
+            resolve_input_path(root.path(), "tmp/uefi-guest.img", UEFI_DISK_IMAGE_ENV).unwrap(),
+            workspace_image
+        );
+        assert_eq!(
+            resolve_input_path(
+                root.path(),
+                workspace_image.to_str().unwrap(),
+                UEFI_DISK_IMAGE_ENV
+            )
+            .unwrap(),
+            workspace_image
+        );
+    }
+
+    #[test]
+    fn configured_uefi_disk_image_rejects_traversal_missing_and_unaligned_inputs() {
+        let root = tempdir().unwrap();
+        let unaligned = root.path().join("uefi-guest.img");
+        fs::write(&unaligned, [0u8; 513]).unwrap();
+
+        assert!(resolve_input_path(root.path(), "../uefi-guest.img", UEFI_DISK_IMAGE_ENV).is_err());
+        assert!(resolve_input_path(root.path(), "missing.img", UEFI_DISK_IMAGE_ENV).is_err());
+
+        let error = validate_uefi_disk_image_size(&unaligned).unwrap_err();
+        assert!(error.to_string().contains("multiple of 512 bytes"));
     }
 
     #[test]

@@ -1,0 +1,41 @@
+args = [
+  "-no-user-config",
+  "-display",
+  "none",
+  "-serial",
+  "stdio",
+  "-monitor",
+  "none",
+  "-cpu",
+  "host,-la57,+svm,+npt,+nrip-save",
+  "-machine",
+  "q35,smbus=off,usb=off,graphics=off",
+  "-smp",
+  "2",
+  "-accel",
+  "kvm",
+  "-device",
+  "nvme,drive=disk0,serial=tgoskits,max_ioqpairs=64,msix_qsize=65,addr=03.0",
+  "-drive",
+  "id=disk0,if=none,format=raw,file=${workspace}/tmp/axbuild/rootfs/rootfs-x86_64-alpine.img",
+  "-m",
+  "2G",
+  "-net",
+  "none",
+  "-vga",
+  "none",
+]
+timeout = 600
+fail_regex = [
+  "(?i)\\bpanic(?:ked)?\\b",
+  "(?i)kernel panic",
+  "(?i)page fault",
+  "(?i)vm exit failure",
+  "(?i)failed to initialize guest VM",
+  "(?m)^AXVISOR_X86_UEFI_DISK_FAILED\\s*$",
+]
+success_regex = ["(?m)^AXVISOR_X86_UEFI_DISK_PASSED\\s*$"]
+shell_prefix = "~ #"
+shell_init_cmd = "if [ -b /dev/vda ] && [ \"$(cat /sys/class/block/vda/ro 2>/dev/null)\" = \"1\" ]; then echo AXVISOR_X86_UEFI_DISK_PASSED; else echo AXVISOR_X86_UEFI_DISK_FAILED; fi"
+to_bin = true
+uefi = true

@@ -173,22 +173,28 @@ impl FwCfg {
                 selector: FW_CFG_SMBIOS_TABLES,
                 size: smbios_tables.len() as u32,
             },
-            FwCfgFile {
+        ];
+        if !acpi.tables.is_empty() {
+            files.push(FwCfgFile {
                 name: ACPI_TABLE_FILE,
                 selector: FW_CFG_ACPI_TABLES,
                 size: acpi.tables.len() as u32,
-            },
-            FwCfgFile {
+            });
+        }
+        if !acpi.rsdp.is_empty() {
+            files.push(FwCfgFile {
                 name: ACPI_RSDP_FILE,
                 selector: FW_CFG_ACPI_RSDP,
                 size: acpi.rsdp.len() as u32,
-            },
-            FwCfgFile {
+            });
+        }
+        if !acpi.loader.is_empty() {
+            files.push(FwCfgFile {
                 name: ACPI_LOADER_FILE,
                 selector: FW_CFG_ACPI_LOADER,
                 size: acpi.loader.len() as u32,
-            },
-        ];
+            });
+        }
         if !boot_kernel.is_empty() {
             files.push(FwCfgFile {
                 name: BOOT_KERNEL_FILE,

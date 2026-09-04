@@ -1,0 +1,38 @@
+# Linux guest booted by OVMF from a GPT/FAT UEFI disk image.
+[base]
+id = 1
+name = "linux-x86-uefi-disk"
+guest_type = "passthrough"
+cpu_num = 1
+phys_cpu_ids = [1]
+
+[kernel]
+entry_point = 0xffff_fff0
+image_location = "memory"
+# Axvisor still requires the configured kernel image for the VM config shape,
+# but pci-disk boot does not publish it through fw_cfg or load it as a direct
+# guest entry point.
+kernel_path = "${workspace}/tmp/axbuild/images/qemu-x86_64/linux/linux-qemu"
+kernel_load_addr = 0x20_0000
+enable_bios = true
+boot_protocol = "uefi"
+boot_source = "pci-disk"
+uefi_firmware_path = "${workspace}/tmp/axbuild/axvisor/qemu-uefi-disk/OVMF_CODE_4M.fd"
+bios_load_addr = 0xffc0_0000
+cmdline = "console=ttyS0 rdinit=/init loglevel=7 nox2apic no_timer_check"
+memory_regions = [
+  [0x0000_0000, 0x2000_0000, 0x7, 0],
+  [0xffc0_0000, 0x0040_0000, 0x7, 0],
+]
+
+[devices]
+passthrough = []
+disabled = []
+
+[[devices.virtual]]
+id = "uefi-boot-disk"
+model = "virtio-blk"
+transport = "pci"
+backend = "ramdisk"
+image_path = "/uefi/uefi-guest.img"
+read_only = true

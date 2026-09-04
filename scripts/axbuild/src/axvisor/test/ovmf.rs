@@ -65,8 +65,8 @@ impl fmt::Display for OvmfEvidence {
         };
         write!(
             formatter,
-            "Axvisor x86 OVMF firmware evidence:\nlayout: {}\nOstool CODE: path={} size={} \
-             sha256={}\nOstool VARS: path={} size={} sha256={} usage={}\nguest image: path={} \
+            "Axvisor x86 OVMF firmware evidence:\nlayout: {}\nOVMF CODE: path={} size={} \
+             sha256={}\nOVMF VARS: path={} size={} sha256={} usage={}\nguest image: path={} \
              size={} sha256={}",
             self.layout,
             self.code.path.display(),
@@ -85,6 +85,39 @@ impl fmt::Display for OvmfEvidence {
 
 pub(super) async fn prepare_x86_ovmf(output_path: &Path) -> anyhow::Result<OvmfEvidence> {
     let firmware = OvmfFirmware::fetch(Arch::X64).await?;
+    prepare_x86_ovmf_from_firmware(output_path, &firmware)
+}
+
+pub(super) fn prepare_x86_ovmf_from_monolithic_path(
+    output_path: &Path,
+    source_path: &Path,
+) -> anyhow::Result<OvmfEvidence> {
+    let source = FirmwareFileEvidence::collect(source_path)?;
+    ensure!(
+        source.size > 0 && source.size <= OVMF_SIZE as u64,
+        "monolithic OVMF image {} must be between 1 byte and 4 MiB ({} bytes)",
+        source_path.display(),
+        source.size
+    );
+    let source_image = fs::read(source_path)
+        .with_context(|| format!("failed to read OVMF image {}", source_path.display()))?;
+    let mut image = vec![0; OVMF_SIZE - source_image.len()];
+    image.extend_from_slice(&source_image);
+    install_ovmf_image(output_path, &image)?;
+    Ok(OvmfEvidence {
+        layout: OvmfLayout::MonolithicCode,
+        code: source,
+        vars: FirmwareFileEvidence::collect(source_path)?,
+        guest: FirmwareFileEvidence::collect(output_path)?,
+    })
+}
+
+pub(super) fn prepare_x86_ovmf_from_split_paths(
+    output_path: &Path,
+    code_path: &Path,
+    vars_path: &Path,
+) -> anyhow::Result<OvmfEvidence> {
+    let firmware = OvmfFirmware::from_paths(code_path.to_path_buf(), vars_path.to_path_buf());
     prepare_x86_ovmf_from_firmware(output_path, &firmware)
 }
 
@@ -116,6 +149,17 @@ fn prepare_x86_ovmf_from_firmware(
     };
     let image = assemble_ovmf_image(&code, vars.as_deref())?;
 
+    install_ovmf_image(output_path, &image)?;
+
+    Ok(OvmfEvidence {
+        layout,
+        code: FirmwareFileEvidence::collect(code_path)?,
+        vars: FirmwareFileEvidence::collect(firmware.vars())?,
+        guest: FirmwareFileEvidence::collect(output_path)?,
+    })
+}
+
+fn install_ovmf_image(output_path: &Path, image: &[u8]) -> anyhow::Result<()> {
     let parent = output_path
         .parent()
         .with_context(|| format!("OVMF output path has no parent: {}", output_path.display()))?;
@@ -132,19 +176,13 @@ fn prepare_x86_ovmf_from_firmware(
         )
     })?;
     temporary
-        .write_all(&image)
+        .write_all(image)
         .with_context(|| format!("failed to write {}", output_path.display()))?;
     temporary
         .persist(output_path)
         .map_err(|error| error.error)
         .with_context(|| format!("failed to install {}", output_path.display()))?;
-
-    Ok(OvmfEvidence {
-        layout,
-        code: FirmwareFileEvidence::collect(code_path)?,
-        vars: FirmwareFileEvidence::collect(firmware.vars())?,
-        guest: FirmwareFileEvidence::collect(output_path)?,
-    })
+    Ok(())
 }
 
 fn assemble_ovmf_image(code: &[u8], vars: Option<&[u8]>) -> anyhow::Result<Vec<u8>> {
@@ -215,8 +253,8 @@ mod tests {
 
         let text = evidence.to_string();
         assert!(text.contains("layout: split CODE/VARS"));
-        assert!(text.contains(&format!("Ostool CODE: path={}", code_path.display())));
-        assert!(text.contains(&format!("Ostool VARS: path={}", vars_path.display())));
+        assert!(text.contains(&format!("OVMF CODE: path={}", code_path.display())));
+        assert!(text.contains(&format!("OVMF VARS: path={}", vars_path.display())));
         assert!(text.contains("usage=prefix"));
         assert!(text.contains(&format!("guest image: path={}", output_path.display())));
     }
@@ -236,5 +274,22 @@ mod tests {
         assert_eq!(evidence.layout, OvmfLayout::MonolithicCode);
         assert!(evidence.to_string().contains("usage=unused"));
         assert_eq!(fs::metadata(output_path).unwrap().len(), OVMF_SIZE as u64);
+    }
+
+    #[test]
+    fn external_monolithic_firmware_is_copied_to_the_guest_image() {
+        let root = tempdir().unwrap();
+        let source_path = root.path().join("OVMF.fd");
+        let output_path = root.path().join("guest/OVMF_CODE_4M.fd");
+        fs::write(&source_path, vec![0x5a; 2 * 1024 * 1024]).unwrap();
+
+        let evidence = prepare_x86_ovmf_from_monolithic_path(&output_path, &source_path).unwrap();
+
+        assert_eq!(evidence.layout, OvmfLayout::MonolithicCode);
+        let image = fs::read(&output_path).unwrap();
+        assert_eq!(image.len(), OVMF_SIZE);
+        assert!(image[..2 * 1024 * 1024].iter().all(|byte| *byte == 0));
+        assert_eq!(&image[2 * 1024 * 1024..], &fs::read(&source_path).unwrap());
+        assert!(evidence.to_string().contains("usage=unused"));
     }
 }

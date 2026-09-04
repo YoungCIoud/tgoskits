@@ -87,6 +87,78 @@ fn dma_descriptor_fault_is_propagated_when_status_cannot_be_written() {
     assert_eq!(status_writes.get(), 1);
 }
 
+#[test]
+fn empty_acpi_blobs_are_not_advertised_in_the_file_directory() {
+    let fw_cfg = FwCfg::new(
+        GuestPhysAddr::from_usize(0),
+        0x20,
+        FwCfgKernelPayload::unsplit(Arc::from(&b"kernel"[..])),
+        None,
+        None,
+        1,
+        FwCfgPlatformConfig::default(),
+    );
+
+    assert!(
+        !fw_cfg
+            .file_dir
+            .windows(ACPI_TABLE_FILE.len())
+            .any(|window| window == ACPI_TABLE_FILE.as_bytes())
+    );
+    assert!(
+        !fw_cfg
+            .file_dir
+            .windows(ACPI_RSDP_FILE.len())
+            .any(|window| window == ACPI_RSDP_FILE.as_bytes())
+    );
+    assert!(
+        !fw_cfg
+            .file_dir
+            .windows(ACPI_LOADER_FILE.len())
+            .any(|window| window == ACPI_LOADER_FILE.as_bytes())
+    );
+}
+
+#[test]
+fn populated_acpi_blobs_are_advertised_in_the_file_directory() {
+    let platform = FwCfgPlatformConfig {
+        acpi: FwCfgAcpiBlobs {
+            tables: alloc::vec![1],
+            rsdp: alloc::vec![2],
+            loader: alloc::vec![3],
+        },
+        ..FwCfgPlatformConfig::default()
+    };
+    let fw_cfg = FwCfg::new(
+        GuestPhysAddr::from_usize(0),
+        0x20,
+        FwCfgKernelPayload::unsplit(Arc::from(&b"kernel"[..])),
+        None,
+        None,
+        1,
+        platform,
+    );
+
+    assert!(
+        fw_cfg
+            .file_dir
+            .windows(ACPI_TABLE_FILE.len())
+            .any(|window| window == ACPI_TABLE_FILE.as_bytes())
+    );
+    assert!(
+        fw_cfg
+            .file_dir
+            .windows(ACPI_RSDP_FILE.len())
+            .any(|window| window == ACPI_RSDP_FILE.as_bytes())
+    );
+    assert!(
+        fw_cfg
+            .file_dir
+            .windows(ACPI_LOADER_FILE.len())
+            .any(|window| window == ACPI_LOADER_FILE.as_bytes())
+    );
+}
+
 #[cfg(target_pointer_width = "64")]
 #[test]
 fn dma_address_register_preserves_high_half_and_resets_after_commit() {
