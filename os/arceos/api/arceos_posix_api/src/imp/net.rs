@@ -233,7 +233,8 @@ fn poll_state(events: IoEvents) -> PollState {
     PollState {
         readable: events.intersects(IoEvents::IN | IoEvents::RDHUP | IoEvents::HUP),
         writable: events.contains(IoEvents::OUT),
-        readiness_version: 0,
+        read_readiness_version: 0,
+        write_readiness_version: 0,
     }
 }
 

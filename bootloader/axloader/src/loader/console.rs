@@ -36,10 +36,26 @@ pub fn serial_println(args: fmt::Arguments<'_>) {
 }
 
 pub fn serial_read_byte() -> Option<u8> {
-    if let Some(byte) = read_serial_byte() {
-        return Some(byte);
-    }
+    crate::control_input::next_serial_control_byte(
+        firmware_input_available(),
+        read_firmware_byte,
+        read_serial_byte,
+    )
+}
 
+fn firmware_input_available() -> bool {
+    let Some(system_table) = uefi::table::system_table_raw() else {
+        return false;
+    };
+
+    // SAFETY: `uefi::entry` initializes this pointer from the firmware system
+    // table, which remains valid while boot services are active. We only read
+    // the stable protocol pointers before invoking either protocol.
+    let system_table = unsafe { system_table.as_ref() };
+    !system_table.boot_services.is_null() && !system_table.stdin.is_null()
+}
+
+fn read_firmware_byte() -> Option<u8> {
     uefi::system::with_stdin(|stdin| match stdin.read_key() {
         Ok(Some(Key::Printable(ch))) => {
             let ch = char::from(ch);
