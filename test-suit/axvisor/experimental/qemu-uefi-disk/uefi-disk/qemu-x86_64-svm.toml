@@ -25,7 +25,7 @@ args = [
   "-vga",
   "none",
 ]
-timeout = 600
+timeout = 1800
 fail_regex = [
   "(?i)\\bpanic(?:ked)?\\b",
   "(?i)kernel panic",

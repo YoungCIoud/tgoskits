@@ -48,7 +48,10 @@ QEMU 或 Axvisor 日志。
 - VMX 实验能完成外层 Axvisor 启动、guest 创建和 vCPU 启动，但在 600 秒
   内没有出现 Linux shell 或 `AXVISOR_X86_UEFI_DISK_PASSED`，最终结果为
   `QEMU timed out after 600s`；日志中没有 Axvisor panic、page fault 或 VM
-  exit failure。
+  exit failure；
+- 考虑 WSL 嵌套虚拟化性能后，门限已提高到 1800 秒。再次运行约 10 分钟时
+  仍停在同一个 LAPIC 初始化 warning，没有新的 guest 输出，随后手动停止，
+  因此尚未等到 1800 秒自然超时，也没有证据表明单纯延长门限可以解决问题。
 
 因此这个目录目前记录的是可复现的实验入口和失败证据，不能把当前 VMX/SVM
 用例标记为已通过。下一步应继续定位 guest vCPU 在 OVMF 初始化阶段停住的
