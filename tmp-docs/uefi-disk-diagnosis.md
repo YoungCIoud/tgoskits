@@ -1021,6 +1021,14 @@ base 与 `tracing` 两个检查均通过。当前工作环境的 `/dev/kvm` 不�
 
 本轮还只读检查了远端 fork 的 CI 状态：`YoungCIoud/tgoskits` 的 `exp/uefi` 当前指向 `1f318780`，该分支没有 GitHub Actions run，也没有 check run。工作区本轮新增的 VMX/SVM NPF 采样尚未提交到远端，因此当前没有可供分析的远端 guest 日志；不能把远端“无运行记录”解释成测试通过或没有 NPF。
 
+### 3.40 远端 CI 暴露出诊断代码自身的 secondary CPU 复位
+
+提交 `f7a9324ca` 推送到上游 PR #2275 后，VMX（Intel/KVM）和 SVM（AMD/KVM）两个 job 的镜像准备阶段均通过，并进入 `Run UEFI guest test`。用户提供的运行日志在外层 Axvisor 启动过程中只出现了一次 `SMP secondary 1: entered rust_main_secondary`，没有出现 `per-CPU state initialized`、`early platform init complete`、`Starting virtualization`、`Creating VM[1]` 或 guest 级 EPT/NPF 日志；重复的 ArceOS 启动画面说明该阶段发生了重新启动，而不是 guest 已经进入 `TlsDxe` 循环。
+
+对照提交差异后确认，`log_secondary_percpu_binding()` 是该提交新增的诊断函数，并且在 `rust_main_secondary()` 中位于 `ax_hal::percpu::init_secondary(cpu_id)` 之前。函数内部调用了 `unsafe { ax_percpu::with_cpu_pin(ax_percpu::current_area) }`。`cpu-local` 的契约要求当前 CPU area 已安装后才能创建 `CpuPin`；x86_64 的实现会从 GS 基址读取 CPU-local 状态，而这个基址正是在后续的 secondary CPU 初始化阶段安装的。因此这段 precheck 的调用时机不满足其 unsafe 前置条件，足以解释 secondary 入口后的早期复位，并不能作为 guest 卡死证据。
+
+本轮已撤掉该 precheck 和调用点，保留 `entered rust_main_secondary`、`per-CPU state initialized`、`early platform init complete` 三个不读取未安装 CPU-local 状态的边界日志。修正后的下一轮 CI 必须先证明外层 SMP 初始化完成并出现 `Starting virtualization`，之后获得的 vPIC、PCI、EPT/NPF 和 VirtIO 统计才可用于继续分析 guest 启动问题。
+
 ## 4. 当前结论
 
 ### 4.1 已证实内容
@@ -1050,6 +1058,8 @@ Axvisor 已经把 VirtIO endpoint 放入 PCI 拓扑，且 CF8/CFC frontend 支�
 关闭 `guest_image_signatures` 扫描后，page fault 消失而 `vpic wire mode change to LAPIC, unimplemented` 仍出现，说明前者是诊断代码造成的假故障，后者虽是待补齐的兼容性缺口，却不是当前唯一或直接的退出原因。PM timer 已确认在 `0x608` 正常递增；当前 guest 实际长时间执行的是 `RIP=0x1e9b1e98` 上对未映射端口 `0x8` 的读取/忙等，并持续触发 PIT IRQ0、legacy PIC EOI 和 vLAPIC 中断接收。下一轮应围绕 `0x8` 的运行时来源及其与 PCI/ACPI 初始化返回值的关系继续取证，暂不实现 vPIC wire mode，也不把 page fault 修复方向放在 rootfs 或 ECAM 上。
 
 变量页写监视实验没有产生 guest 级证据，反而暴露出 nested paging 权限修改会错误地把 guest GPA 交给宿主 `INVLPG`；该实验引起的外层复位与 guest 的 `0x8` 循环无关，不能混入基线结论。最新 NPF 详细采样轮次同样在 guest 创建前复位，所以没有改变这一边界。
+
+远端 CI 的首轮诊断提交又发现了一个独立的外层问题：secondary CPU 在 `init_secondary()` 前被诊断代码提前读取 CPU-local GS 状态，导致测试可能在 guest 创建前反复复位。该段代码已从后续诊断提交中撤销；在修正后的 CI 运行完成前，不能把“没有 guest NPF”解释成没有 Q35 PCIe 配置窗口，也不能把重复启动归因于 PM timer、vPIC wire mode 或 VirtIO。
 
 ## 5. 后续实验
 

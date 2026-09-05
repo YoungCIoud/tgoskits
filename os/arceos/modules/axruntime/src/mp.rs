@@ -29,36 +29,6 @@ fn prepare_secondary_boot_stack(slot: usize, cpu_id: usize) {
     SECONDARY_CPUID_BY_SLOT[slot].store(cpu_id, Ordering::Release);
 }
 
-fn log_secondary_percpu_binding(cpu_id: usize) {
-    info!("[HV] SMP secondary {cpu_id}: per-CPU precheck begin");
-    let cpu_index = match ax_percpu::CpuIndex::try_from(cpu_id) {
-        Ok(cpu_index) => cpu_index,
-        Err(error) => {
-            info!(
-                "[HV] SMP secondary {cpu_id}: per-CPU precheck rejected logical index: {error:?}"
-            );
-            return;
-        }
-    };
-    info!("[HV] SMP secondary {cpu_id}: per-CPU precheck logical index={cpu_index:?}");
-    let expected = ax_percpu::area(cpu_index);
-    info!("[HV] SMP secondary {cpu_id}: per-CPU precheck expected area={expected:?}");
-    info!("[HV] SMP secondary {cpu_id}: per-CPU precheck pin begin");
-    let actual = unsafe { ax_percpu::with_cpu_pin(ax_percpu::current_area) };
-    info!("[HV] SMP secondary {cpu_id}: per-CPU precheck actual area={actual:?}");
-    let layout = ax_percpu::layout();
-    info!("[HV] SMP secondary {cpu_id}: per-CPU precheck layout={layout:?}");
-    let (stack_bottom, stack_size) = secondary_boot_stack_bounds(cpu_id);
-    info!(
-        "[HV] SMP secondary {cpu_id}: per-CPU precheck stack bottom={stack_bottom:?} \
-         size={stack_size:#x}"
-    );
-    info!(
-        "[HV] SMP secondary {cpu_id}: per-CPU precheck complete layout={layout:?} \
-         expected={expected:?} actual={actual:?}"
-    );
-}
-
 #[allow(clippy::absurd_extreme_comparisons)]
 pub fn start_secondary_cpus(primary_cpu_id: usize) {
     let mut slot = 0;
@@ -105,7 +75,6 @@ pub fn rust_main_secondary(cpu_id: usize) -> ! {
             ax_hal::asm::wait_for_irqs();
         }
     }
-    log_secondary_percpu_binding(cpu_id);
     ax_hal::percpu::init_secondary(cpu_id);
     info!("[HV] SMP secondary {cpu_id}: per-CPU state initialized");
     // After per-CPU init, before scheduler/IPI/IRQ paths can allocate.
