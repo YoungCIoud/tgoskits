@@ -110,8 +110,8 @@ pub fn start_secondary_cpus(primary_cpu_id: usize) {
 /// It is called from the bootstrapping code in the specific platform crate.
 #[ax_plat::secondary_main]
 pub fn rust_main_secondary(cpu_id: usize) -> ! {
-    info!("[HV] SMP secondary {cpu_id}: entered rust_main_secondary");
     set_secondary_stage(cpu_id, SECONDARY_STAGE_ENTERED);
+    info!("[HV] SMP secondary {cpu_id}: entered rust_main_secondary");
     // Park harts whose logical index is beyond the compile-time CPU count: QEMU
     // may start more harts (`-smp M`) than the kernel was built for
     // (`CPU_CAPACITY == N`). Mirror Linux — run on the first N CPUs and park the
