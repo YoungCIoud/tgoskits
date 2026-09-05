@@ -1029,6 +1029,12 @@ base 与 `tracing` 两个检查均通过。当前工作环境的 `/dev/kvm` 不�
 
 本轮已撤掉该 precheck 和调用点，保留 `entered rust_main_secondary`、`per-CPU state initialized`、`early platform init complete` 三个不读取未安装 CPU-local 状态的边界日志。修正后的下一轮 CI 必须先证明外层 SMP 初始化完成并出现 `Starting virtualization`，之后获得的 vPIC、PCI、EPT/NPF 和 VirtIO 统计才可用于继续分析 guest 启动问题。
 
+### 3.41 为外层复位增加单次运行保护
+
+上一轮远端运行会在 QEMU 内部重复执行完整的外层 UEFI 启动流程，导致 case 一直占用 runner，且同一份启动前日志被重复输出。为了让下一轮证据对应第一次故障，在实验 VMX/SVM 的 QEMU 配置中加入 `-no-reboot`，并启用 `-d cpu_reset,guest_errors`。前者使第一次 guest 或 host reset 后 QEMU 退出，后者把 QEMU 观察到的 CPU reset 和非法 guest 访问写入测试输出；两者都不改变 Axvisor 的 guest 设备模型。
+
+配置入口为 `test-suit/axvisor/experimental/qemu-uefi-disk/uefi-disk/qemu-x86_64-vmx.toml` 和 `qemu-x86_64-svm.toml`。这项保护的判定是：若仍发生外层复位，CI 应在一次启动后结束并保留 reset 证据；若能够进入 guest，则应继续观察 `Creating VM[1]`、`VM[1] boot success`、PCI/EPT 或 NPF 样本以及最终 guest marker。`cargo xtask axvisor test qemu --list --arch x86_64 --test-group experimental` 已确认两个实验 case 仍能被发现。
+
 ## 4. 当前结论
 
 ### 4.1 已证实内容

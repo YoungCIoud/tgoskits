@@ -2,6 +2,10 @@ args = [
   "-no-user-config",
   "-display",
   "none",
+  # Stop after the first outer reset and retain QEMU reset/invalid-access evidence.
+  "-no-reboot",
+  "-d",
+  "cpu_reset,guest_errors",
   "-serial",
   "stdio",
   "-monitor",
