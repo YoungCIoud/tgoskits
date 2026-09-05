@@ -9,7 +9,7 @@ use std::{
     collections::BTreeMap,
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -55,6 +55,73 @@ pub(crate) use vm::X86VmPlan;
 use crate::architecture::sysreg::{self, SysRegReadExit, SysRegWriteExit};
 
 const RFLAGS_INTERRUPT_FLAG: u64 = 1 << 9;
+
+// These counters are diagnostic-only. They show whether PIT edges are claimed
+// by the legacy PIC, published to the vCPU, or falling back to the IOAPIC path.
+static PIT_IRQ_ATTEMPT_COUNT: AtomicU64 = AtomicU64::new(0);
+static PIT_IRQ_PIC_CLAIM_COUNT: AtomicU64 = AtomicU64::new(0);
+static PIT_IRQ_PIC_NO_CLAIM_COUNT: AtomicU64 = AtomicU64::new(0);
+static PIT_IRQ_PIC_INJECT_COUNT: AtomicU64 = AtomicU64::new(0);
+static PIT_IRQ_PIC_DISPATCH_FAILURE_COUNT: AtomicU64 = AtomicU64::new(0);
+static PIT_IRQ_IOAPIC_ASSERT_COUNT: AtomicU64 = AtomicU64::new(0);
+static PIT_IRQ_IOAPIC_INJECT_COUNT: AtomicU64 = AtomicU64::new(0);
+static PIT_IRQ_IOAPIC_DISPATCH_FAILURE_COUNT: AtomicU64 = AtomicU64::new(0);
+static PIT_IRQ_NO_ROUTE_COUNT: AtomicU64 = AtomicU64::new(0);
+static PIC_AFTER_WRITE_DISPATCH_COUNT: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Copy)]
+enum PitIrqRoute {
+    Pic,
+    IoApic,
+    NoRoute,
+}
+
+fn record_pit_irq_attempt(route: PitIrqRoute, pic_claimed: bool, dispatched: bool) {
+    let attempts = PIT_IRQ_ATTEMPT_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    if pic_claimed {
+        PIT_IRQ_PIC_CLAIM_COUNT.fetch_add(1, Ordering::Relaxed);
+    } else {
+        PIT_IRQ_PIC_NO_CLAIM_COUNT.fetch_add(1, Ordering::Relaxed);
+    }
+
+    match route {
+        PitIrqRoute::Pic => {
+            if dispatched {
+                PIT_IRQ_PIC_INJECT_COUNT.fetch_add(1, Ordering::Relaxed);
+            } else {
+                PIT_IRQ_PIC_DISPATCH_FAILURE_COUNT.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        PitIrqRoute::IoApic => {
+            PIT_IRQ_IOAPIC_ASSERT_COUNT.fetch_add(1, Ordering::Relaxed);
+            if dispatched {
+                PIT_IRQ_IOAPIC_INJECT_COUNT.fetch_add(1, Ordering::Relaxed);
+            } else {
+                PIT_IRQ_IOAPIC_DISPATCH_FAILURE_COUNT.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        PitIrqRoute::NoRoute => {
+            PIT_IRQ_NO_ROUTE_COUNT.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    if attempts == 1 || attempts.is_power_of_two() {
+        info!(
+            "[HV] PIT IRQ sample: attempts={} pic_claim={} pic_no_claim={} pic_injected={} \
+             pic_dispatch_failure={} ioapic_assert={} ioapic_injected={} \
+             ioapic_dispatch_failure={} no_route={}",
+            attempts,
+            PIT_IRQ_PIC_CLAIM_COUNT.load(Ordering::Relaxed),
+            PIT_IRQ_PIC_NO_CLAIM_COUNT.load(Ordering::Relaxed),
+            PIT_IRQ_PIC_INJECT_COUNT.load(Ordering::Relaxed),
+            PIT_IRQ_PIC_DISPATCH_FAILURE_COUNT.load(Ordering::Relaxed),
+            PIT_IRQ_IOAPIC_ASSERT_COUNT.load(Ordering::Relaxed),
+            PIT_IRQ_IOAPIC_INJECT_COUNT.load(Ordering::Relaxed),
+            PIT_IRQ_IOAPIC_DISPATCH_FAILURE_COUNT.load(Ordering::Relaxed),
+            PIT_IRQ_NO_ROUTE_COUNT.load(Ordering::Relaxed),
+        );
+    }
+}
 
 pub(crate) struct X86_64Arch;
 
@@ -105,21 +172,32 @@ impl ArchOps for X86_64Arch {
                 HypercallExit { nr, args },
                 crate::runtime::hvc::HyperCallAbi::Generic,
             ),
-            X86VmExit::PortIoRead { port, width } => exit::handle_io_read(
+            X86VmExit::PortIoRead {
+                port,
+                width,
+                guest_rip,
+            } => exit::handle_io_read(
                 vm,
                 vcpu,
                 IoReadExit {
                     port: x86_port_to_ax(port),
                     width: x86_access_width_to_ax(width),
+                    guest_rip,
                 },
             ),
-            X86VmExit::PortIoWrite { port, width, data } => exit::handle_io_write(
+            X86VmExit::PortIoWrite {
+                port,
+                width,
+                data,
+                guest_rip,
+            } => exit::handle_io_write(
                 vm,
                 vcpu,
                 IoWriteExit {
                     port: x86_port_to_ax(port),
                     width: x86_access_width_to_ax(width),
                     data,
+                    guest_rip,
                 },
             ),
             X86VmExit::PortIoString(exit) => exit::handle_io_string(vm, vcpu, exit),
@@ -276,7 +354,12 @@ fn pit_ioapic_pending(interrupt: IoApicInterrupt) -> PendingVcpuInterrupt {
     }
 }
 
-pub(crate) fn publish_pic_interrupt_after_write(vm: &AxVM, vcpu_id: X86VcpuId) -> AxVmResult {
+pub(crate) fn publish_pic_interrupt_after_write(
+    vm: &AxVM,
+    vcpu_id: X86VcpuId,
+    port: u16,
+    value: u64,
+) -> AxVmResult {
     let devices = vm.get_devices()?;
     let Ok(pic) = devices.services().require::<X86PicServiceKey>() else {
         return Ok(());
@@ -284,6 +367,17 @@ pub(crate) fn publish_pic_interrupt_after_write(vm: &AxVM, vcpu_id: X86VcpuId) -
     let Some(claim) = pic.claim_pending_interrupt() else {
         return Ok(());
     };
+    let dispatches = PIC_AFTER_WRITE_DISPATCH_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    if dispatches == 1 || dispatches.is_power_of_two() {
+        info!(
+            "[HV] PIC after-write dispatch: count={} VM[{}] VCpu[{}] port={:#x} value={value:#x} \
+             claim={claim:?}",
+            dispatches,
+            vm.id(),
+            vcpu_id,
+            port,
+        );
+    }
     dispatch_pic_claim(pic.as_ref(), claim, |vector| {
         dispatch_x86_interrupt(vm, vcpu_id, vector, InterruptTriggerMode::EdgeTriggered)
     })
@@ -402,10 +496,12 @@ impl X86VlapicHostOps for AxvmX86HostOps {
             if let Ok(pic) = devices.services().require::<X86PicServiceKey>()
                 && let Some(claim) = pic.claim_irq(0)
             {
-                return dispatch_pic_claim(pic.as_ref(), claim, |vector| {
+                let result = dispatch_pic_claim(pic.as_ref(), claim, |vector| {
                     manager::inject_interrupt(vm_id, vcpu_id, vector as usize)
                         .map_err(ax_error_to_vlapic)
                 });
+                record_pit_irq_attempt(PitIrqRoute::Pic, true, result.is_ok());
+                return result;
             }
 
             if let Some(interrupt) = devices
@@ -414,12 +510,18 @@ impl X86VlapicHostOps for AxvmX86HostOps {
                 .ok()
                 .and_then(|ioapic| ioapic.assert_gsi(0))
             {
-                return vm
+                let result = vm
                     .runtime_handle()
-                    .map_err(ax_error_to_vlapic)?
-                    .dispatch_vcpu_interrupt(vcpu_id, pit_ioapic_pending(interrupt))
-                    .map_err(ax_error_to_vlapic);
+                    .map_err(ax_error_to_vlapic)
+                    .and_then(|runtime| {
+                        runtime
+                            .dispatch_vcpu_interrupt(vcpu_id, pit_ioapic_pending(interrupt))
+                            .map_err(ax_error_to_vlapic)
+                    });
+                record_pit_irq_attempt(PitIrqRoute::IoApic, false, result.is_ok());
+                return result;
             }
+            record_pit_irq_attempt(PitIrqRoute::NoRoute, false, false);
             Ok(())
         })
         .unwrap_or(Err(X86VlapicError::BadState))

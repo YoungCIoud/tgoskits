@@ -5,7 +5,7 @@
 
 #[cfg(feature = "fs")]
 use core::sync::atomic::AtomicUsize;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 #[cfg(feature = "fs")]
 use std::collections::VecDeque;
 use std::{
@@ -30,6 +30,7 @@ use axvirtio_common::{
 };
 use axvm_types::GuestPhysAddr;
 use axvmconfig::VirtualDeviceRequest;
+use log::info;
 
 use super::virtio_pci::{VirtioPciFunction, virtio_capabilities};
 use crate::{ConfiguredDeviceError, ConfiguredModelRegistration, DeviceInstantiationContext};
@@ -674,6 +675,8 @@ impl BlockBackend for VirtioBlkBackend {
 struct RamDiskBackend {
     bytes: Mutex<Vec<u8>>,
     capacity_sectors: u64,
+    read_count: AtomicU64,
+    write_count: AtomicU64,
 }
 
 impl RamDiskBackend {
@@ -734,6 +737,8 @@ impl RamDiskBackend {
         Ok(Self {
             bytes: Mutex::new(image),
             capacity_sectors: capacity / SECTOR_SIZE as u64,
+            read_count: AtomicU64::new(0),
+            write_count: AtomicU64::new(0),
         })
     }
 
@@ -918,6 +923,15 @@ impl BlockBackend for FileBackend {
 
 impl BlockBackend for RamDiskBackend {
     fn read(&self, sector: u64, buffer: &mut [u8]) -> VirtioResult<usize> {
+        let count = self.read_count.fetch_add(1, Ordering::Relaxed) + 1;
+        if count.is_power_of_two() {
+            info!(
+                "[HV] VirtIO PCI ramdisk read sample: reads={} sector={} bytes={}",
+                count,
+                sector,
+                buffer.len()
+            );
+        }
         let range = self.range(sector, buffer.len())?;
         buffer.copy_from_slice(
             &self
@@ -929,6 +943,15 @@ impl BlockBackend for RamDiskBackend {
     }
 
     fn write(&self, sector: u64, buffer: &[u8]) -> VirtioResult<usize> {
+        let count = self.write_count.fetch_add(1, Ordering::Relaxed) + 1;
+        if count.is_power_of_two() {
+            info!(
+                "[HV] VirtIO PCI ramdisk write sample: writes={} sector={} bytes={}",
+                count,
+                sector,
+                buffer.len()
+            );
+        }
         let range = self.range(sector, buffer.len())?;
         self.bytes
             .lock()

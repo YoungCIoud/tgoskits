@@ -46,6 +46,12 @@ use crate::{
 const VMX_PREEMPTION_TIMER_SET_VALUE: u32 = 100_000;
 
 const QEMU_EXIT_PORT: u16 = 0x604;
+const X86_ACPI_PM_TIMER_PORT: u16 = 0x608;
+const X86_PCI_CONFIG_PORT_START: u16 = 0xcf8;
+const X86_PCI_CONFIG_PORT_END: u16 = 0xcff;
+const DIAGNOSTIC_NPF_TRACE_LIMIT: u64 = 128;
+const DIAGNOSTIC_PORT_8: u16 = 0x8;
+const DIAGNOSTIC_PORT_8_TRACE_LIMIT: u64 = 64;
 const X86_PIT_PORT_BASE: u16 = 0x40;
 const X86_PIT_PORT_COUNT: u32 = 4;
 const X86_PIT_SPEAKER_PORT: u16 = 0x61;
@@ -186,6 +192,26 @@ pub struct VmxVcpu<H: X86HostOps> {
     // Interrupt-related fields
     /// Pending events to be injected to the guest.
     pending_events: VecDeque<PendingEvent>,
+    /// Number of external events submitted to the VMCS.
+    event_injection_ready_count: u64,
+    /// Number of external events blocked by guest interrupt state.
+    event_injection_blocked_count: u64,
+    /// Number of exits returned to the VMM after built-in handling.
+    guest_exit_count: u64,
+    /// Number of CPUID exits handled for the guest.
+    cpuid_exit_count: u64,
+    /// Number of nested-page-fault exits, including faults handled as MMIO.
+    nested_page_fault_count: u64,
+    /// Number of unresolved port-I/O exits.
+    port_io_exit_count: u64,
+    /// Number of unresolved ACPI PM timer I/O exits.
+    pm_timer_io_exit_count: u64,
+    /// Number of unresolved PCI configuration I/O exits.
+    pci_config_io_exit_count: u64,
+    /// Number of unresolved I/O exits outside the tracked port ranges.
+    other_port_io_exit_count: u64,
+    /// Number of port-I/O events left in the trace after the diagnostic port appears.
+    diagnostic_port_8_trace_remaining: u64,
     /// Emulated Local APIC.
     vlapic: EmulatedLocalApic<H>,
     /// Guest CR2 is not saved or restored by VMX hardware.
@@ -222,6 +248,16 @@ impl<H: X86HostOps> VmxVcpu<H> {
             io_bitmap: IOBitmap::<H>::guest_owned()?,
             msr_bitmap: MsrBitmap::<H>::passthrough_all()?,
             pending_events: VecDeque::with_capacity(8),
+            event_injection_ready_count: 0,
+            event_injection_blocked_count: 0,
+            guest_exit_count: 0,
+            cpuid_exit_count: 0,
+            nested_page_fault_count: 0,
+            port_io_exit_count: 0,
+            pm_timer_io_exit_count: 0,
+            pci_config_io_exit_count: 0,
+            other_port_io_exit_count: 0,
+            diagnostic_port_8_trace_remaining: 0,
             vlapic: EmulatedLocalApic::<H>::new(vm_id, vcpu_id),
             guest_cr2: 0,
             guest_syscall_msrs: VmxSyscallMsrState::default(),
@@ -355,7 +391,20 @@ impl<H: X86HostOps> VmxVcpu<H> {
                     );
                 }
             },
-            None => Ok(Some(exit_info)),
+            None => {
+                self.guest_exit_count += 1;
+                if self.guest_exit_count.is_power_of_two() {
+                    info!(
+                        "[HV] VMX guest exit sample: exits={} reason={:?} rip={:#x} \
+                         pending_events={}",
+                        self.guest_exit_count,
+                        exit_info.exit_reason,
+                        exit_info.guest_rip,
+                        self.pending_events.len()
+                    );
+                }
+                Ok(Some(exit_info))
+            }
         }
     }
 
@@ -923,6 +972,21 @@ impl<H: X86HostOps> VmxVcpu<H> {
             //     self.allow_interrupt()
             // );
             if event.vector < 32 || self.allow_interrupt() {
+                if event.vector >= 32 {
+                    self.event_injection_ready_count =
+                        self.event_injection_ready_count.saturating_add(1);
+                    let ready_count = self.event_injection_ready_count;
+                    if ready_count == 1 || ready_count.is_power_of_two() {
+                        info!(
+                            "[HV] VMX external event ready: ready={} blocked={} vector={:#x} \
+                             pending_events={}",
+                            ready_count,
+                            self.event_injection_blocked_count,
+                            event.vector,
+                            self.pending_events.len(),
+                        );
+                    }
+                }
                 // if it's an exception, or an interrupt that is not blocked, inject it directly.
                 vmcs::inject_event(event.vector, event.err_code)?;
                 if event.vector >= 32 {
@@ -931,6 +995,19 @@ impl<H: X86HostOps> VmxVcpu<H> {
                 }
                 self.pending_events.pop_front();
             } else {
+                self.event_injection_blocked_count =
+                    self.event_injection_blocked_count.saturating_add(1);
+                let blocked_count = self.event_injection_blocked_count;
+                if blocked_count == 1 || blocked_count.is_power_of_two() {
+                    info!(
+                        "[HV] VMX external event blocked: ready={} blocked={} vector={:#x} \
+                         pending_events={}",
+                        self.event_injection_ready_count,
+                        blocked_count,
+                        event.vector,
+                        self.pending_events.len(),
+                    );
+                }
                 // interrupts are blocked, enable interrupt-window exiting.
                 self.set_interrupt_window(true)?;
             }
@@ -1261,6 +1338,16 @@ impl<H: X86HostOps> VmxVcpu<H> {
                 None
             }
         }
+    }
+
+    fn guest_instruction_bytes(&self, guest_rip: usize) -> Option<[u8; 16]> {
+        let mut bytes = [0; 16];
+        let mut address = self.gla2gva(X86GuestVirtAddr::from(guest_rip));
+        for byte in &mut bytes {
+            *byte = self.read_guest_u8(address).ok()?;
+            address += 1;
+        }
+        Some(bytes)
     }
 
     fn decode_ept_apic_mmio_access(
@@ -1720,6 +1807,21 @@ impl<H: X86HostOps> VmxVcpu<H> {
             _ => cpuid!(regs_clone.rax, regs_clone.rcx),
         };
 
+        self.cpuid_exit_count = self.cpuid_exit_count.saturating_add(1);
+        if self.cpuid_exit_count <= 64 {
+            info!(
+                "[HV] VMX CPUID sample: count={} input_eax={:#x} input_ecx={:#x} output_eax={:#x} \
+                 output_ebx={:#x} output_ecx={:#x} output_edx={:#x}",
+                self.cpuid_exit_count,
+                regs_clone.rax,
+                regs_clone.rcx,
+                res.eax,
+                res.ebx,
+                res.ecx,
+                res.edx,
+            );
+        }
+
         trace!(
             "VM exit: CPUID({:#x}, {:#x}): {:?}",
             regs_clone.rax, regs_clone.rcx, res
@@ -1879,16 +1981,84 @@ impl<H: X86HostOps> VmxVcpu<H> {
         let width = X86AccessWidth::try_from(io_info.access_size as usize)
             .map_err(|_| x86_err_type!(InvalidData, "invalid VMX I/O access width"))?;
         let port = X86Port::new(io_info.port);
+        self.port_io_exit_count = self.port_io_exit_count.saturating_add(1);
+        let category = if io_info.port == X86_ACPI_PM_TIMER_PORT {
+            self.pm_timer_io_exit_count = self.pm_timer_io_exit_count.saturating_add(1);
+            "pm_timer"
+        } else if (X86_PCI_CONFIG_PORT_START..=X86_PCI_CONFIG_PORT_END).contains(&io_info.port) {
+            self.pci_config_io_exit_count = self.pci_config_io_exit_count.saturating_add(1);
+            "pci_config"
+        } else {
+            self.other_port_io_exit_count = self.other_port_io_exit_count.saturating_add(1);
+            "other"
+        };
+        let count = self.port_io_exit_count;
+        let guest_rip = VmcsGuestNW::RIP.read()?;
+        if count == 1 || count.is_power_of_two() {
+            info!(
+                "[HV] VMX port I/O aggregate: total={} pm_timer={} pci_config={} other={} npf={} \
+                 category={} port={:#x} direction={} width={:?} string={} repeat={}",
+                count,
+                self.pm_timer_io_exit_count,
+                self.pci_config_io_exit_count,
+                self.other_port_io_exit_count,
+                self.nested_page_fault_count,
+                category,
+                io_info.port,
+                if io_info.is_in { "in" } else { "out" },
+                width,
+                io_info.is_string,
+                io_info.is_repeat,
+            );
+        }
+
+        if io_info.port == DIAGNOSTIC_PORT_8
+            && io_info.is_in
+            && self.diagnostic_port_8_trace_remaining == 0
+        {
+            self.diagnostic_port_8_trace_remaining = DIAGNOSTIC_PORT_8_TRACE_LIMIT;
+        }
+        if self.diagnostic_port_8_trace_remaining != 0 {
+            let regs = self.regs();
+            let guest_gpa = self
+                .translate_guest_linear(self.gla2gva(X86GuestVirtAddr::from(guest_rip)))
+                .ok();
+            info!(
+                "[HV] VMX diagnostic I/O trace: remaining={} port={:#x} direction={} width={:?} \
+                 rip={:#x} guest_gpa={:?} rax={:#x} rcx={:#x} rdx={:#x} rdi={:#x} r8={:#x} \
+                 r9={:#x} r10={:#x} r11={:#x}",
+                self.diagnostic_port_8_trace_remaining,
+                io_info.port,
+                if io_info.is_in { "in" } else { "out" },
+                width,
+                guest_rip,
+                guest_gpa,
+                regs.rax,
+                regs.rcx,
+                regs.rdx,
+                regs.rdi,
+                regs.r8,
+                regs.r9,
+                regs.r10,
+                regs.r11,
+            );
+            self.diagnostic_port_8_trace_remaining -= 1;
+        }
 
         if !io_info.is_string {
             self.advance_rip(instruction_len)?;
             return Ok(if io_info.is_in {
-                X86VmExit::PortIoRead { port, width }
+                X86VmExit::PortIoRead {
+                    port,
+                    width,
+                    guest_rip: guest_rip as u64,
+                }
             } else {
                 X86VmExit::PortIoWrite {
                     port,
                     width,
                     data: self.regs().rax.get_bits(width.bits_range()),
+                    guest_rip: guest_rip as u64,
                 }
             });
         }
@@ -2059,15 +2229,29 @@ impl<H: X86HostOps> VmxVcpu<H> {
                     VmxExitReason::APIC_ACCESS => self.handle_apic_access(&exit_info)?,
                     VmxExitReason::EPT_VIOLATION => {
                         let info = self.nested_page_fault_info()?;
+                        self.nested_page_fault_count =
+                            self.nested_page_fault_count.saturating_add(1);
+                        let npf_count = self.nested_page_fault_count;
                         let write = info.access_flags.contains(X86AccessFlags::WRITE);
                         let read = info.access_flags.contains(X86AccessFlags::READ);
-                        if (read || write)
-                            && let Some((mmio_exit, instruction_len)) = self.decode_ept_mmio_access(
-                                &exit_info,
+                        let decoded = if read || write {
+                            self.decode_ept_mmio_access(&exit_info, info.fault_guest_paddr, write)
+                        } else {
+                            None
+                        };
+                        if npf_count <= DIAGNOSTIC_NPF_TRACE_LIMIT || npf_count.is_power_of_two() {
+                            info!(
+                                "[HV] VMX EPT violation sample: faults={} gpa={:#x} access={:?} \
+                                 rip={:#x} decoded_mmio={} guest_bytes={:?}",
+                                npf_count,
                                 info.fault_guest_paddr,
-                                write,
-                            )
-                        {
+                                info.access_flags,
+                                exit_info.guest_rip,
+                                decoded.is_some(),
+                                self.guest_instruction_bytes(exit_info.guest_rip),
+                            );
+                        }
+                        if let Some((mmio_exit, instruction_len)) = decoded {
                             self.advance_rip(instruction_len)?;
                             mmio_exit
                         } else {

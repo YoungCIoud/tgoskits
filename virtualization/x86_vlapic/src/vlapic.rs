@@ -76,6 +76,10 @@ pub struct VirtualApicRegs<H: X86VlapicHostOps> {
     /// Copies of some registers in the virtual APIC page,
     /// to maintain a coherent snapshot of the register (e.g. lvt_last)
     lvt_last: LocalVectorTable,
+    /// Number of writes observed for the legacy PIC-to-LAPIC LINT0 input.
+    lint0_write_count: u64,
+    /// Number of external interrupts accepted by the vCPU backend.
+    accepted_interrupt_count: u64,
     apic_page: PhysFrame<H>,
 }
 
@@ -99,6 +103,8 @@ impl<H: X86VlapicHostOps> VirtualApicRegs<H> {
                     | if vcpu_id == 0 { APIC_BASE_BSP } else { 0 },
             ),
             virtual_timer: ApicTimer::<H>::new(vm_id, vcpu_id),
+            lint0_write_count: 0,
+            accepted_interrupt_count: 0,
         };
         regs.regs().ID.set((vcpu_id as u32) << 24);
         regs.regs()
@@ -381,6 +387,7 @@ impl<H: X86VlapicHostOps> VirtualApicRegs<H> {
 
     /// Record interrupt acceptance in the virtual APIC page.
     pub fn accept_interrupt(&mut self, vector: u8, level_triggered: bool) {
+        self.accepted_interrupt_count = self.accepted_interrupt_count.saturating_add(1);
         let vector = vector as u32;
         let (idx, bitpos) = extract_index_and_bitpos_u32(vector);
         let bit = 1 << bitpos;
@@ -393,6 +400,14 @@ impl<H: X86VlapicHostOps> VirtualApicRegs<H> {
         });
         self.isrv = self.find_isrv();
         self.update_ppr();
+
+        if self.accepted_interrupt_count == 1 || self.accepted_interrupt_count.is_power_of_two() {
+            info!(
+                "[HV] vLAPIC accepted interrupt: count={} vcpu={} vector={vector:#x} \
+                 level_triggered={} isrv={:#x}",
+                self.accepted_interrupt_count, self.vapic_id, level_triggered, self.isrv,
+            );
+        }
     }
 
     fn inject_nmi(&mut self, vcpu_id: u32) {
@@ -610,16 +625,41 @@ impl<H: X86VlapicHostOps> VirtualApicRegs<H> {
                 val &= mask;
 
                 // vlapic mask/unmask LINT0 for ExtINT?
+                let last = self.lvt_last.lvt_lint0.get();
+                self.lint0_write_count = self.lint0_write_count.saturating_add(1);
+                let write_count = self.lint0_write_count;
+                let last_masked = last & LVT_LINT0::Mask::SET.mask() != 0;
+                let new_masked = val & LVT_LINT0::Mask::SET.mask() != 0;
+                let last_delivery_mode = (last & LVT_LINT0::DeliveryMode::SET.mask()) >> 8;
+                let new_delivery_mode = (val & LVT_LINT0::DeliveryMode::SET.mask()) >> 8;
+                let mode_changed = last_delivery_mode != new_delivery_mode;
+                let mask_changed = last_masked != new_masked;
+                if write_count <= 16
+                    || write_count.is_power_of_two()
+                    || mode_changed
+                    || mask_changed
+                {
+                    info!(
+                        "[HV] vLAPIC LINT0 write: count={} vcpu={} old={:#x} new={:#x} \
+                         old_mode={:#x} new_mode={:#x} old_masked={} new_masked={} svr={:#x}",
+                        write_count,
+                        self.vapic_id,
+                        last,
+                        val,
+                        last_delivery_mode,
+                        new_delivery_mode,
+                        last_masked,
+                        new_masked,
+                        self.regs().SVR.get(),
+                    );
+                }
                 if (val & LVT_LINT0::DeliveryMode::SET.mask())
                     == LVT_LINT0::DeliveryMode::ExtINT.mask()
                 {
-                    let last = self.lvt_last.lvt_lint0;
-                    if last.is_set(LVT_LINT0::Mask) && val & LVT_LINT0::Mask::SET.mask() == 0 {
+                    if last_masked && !new_masked {
                         // mask -> unmask: may from every vlapic in the vm
                         warn!("vpic wire mode change to LAPIC, unimplemented");
-                    } else if !last.is_set(LVT_LINT0::Mask)
-                        && val & LVT_LINT0::Mask::SET.mask() != 0
-                    {
+                    } else if !last_masked && new_masked {
                         // unmask -> mask: only from the vlapic LINT0-ExtINT enabled
                         warn!("vpic wire mode change to NULL, unimplemented");
                     } else {

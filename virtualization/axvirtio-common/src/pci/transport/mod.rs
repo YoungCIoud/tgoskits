@@ -7,6 +7,7 @@
 //! programming queue registers does not dereference guest memory.
 
 use alloc::{format, sync::Arc};
+use core::sync::atomic::AtomicU64;
 
 use ax_sync::SpinLock;
 use axdevice_base::{AccessWidth, DeviceError, DeviceResult};
@@ -145,6 +146,11 @@ pub struct VirtioPciTransport<D: VirtioDeviceCore> {
     interrupts: Arc<VirtioPciInterruptCoordinator>,
     activity: Arc<QueueActivity>,
     device_config_size: u32,
+    bar_read_count: AtomicU64,
+    bar_write_count: AtomicU64,
+    queue_notify_count: AtomicU64,
+    queue_completed_count: AtomicU64,
+    queue_fault_count: AtomicU64,
     #[cfg(test)]
     notify_admission_hook: SpinLock<Option<Arc<dyn Fn() + Send + Sync>>>,
     #[cfg(test)]
@@ -188,6 +194,11 @@ impl<D: VirtioDeviceCore> VirtioPciTransport<D> {
             interrupts: Arc::new(VirtioPciInterruptCoordinator::new()),
             activity: Arc::new(QueueActivity::new()),
             core,
+            bar_read_count: AtomicU64::new(0),
+            bar_write_count: AtomicU64::new(0),
+            queue_notify_count: AtomicU64::new(0),
+            queue_completed_count: AtomicU64::new(0),
+            queue_fault_count: AtomicU64::new(0),
             #[cfg(test)]
             notify_admission_hook: SpinLock::new(None),
             #[cfg(test)]

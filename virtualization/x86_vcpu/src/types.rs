@@ -349,6 +349,8 @@ pub enum X86VmExit {
         port: X86Port,
         /// Access width.
         width: X86AccessWidth,
+        /// Guest RIP of the instruction that caused the exit.
+        guest_rip: u64,
     },
     /// The guest performed a port I/O write.
     PortIoWrite {
@@ -358,6 +360,8 @@ pub enum X86VmExit {
         width: X86AccessWidth,
         /// Value written by the guest.
         data: u64,
+        /// Guest RIP of the instruction that caused the exit.
+        guest_rip: u64,
     },
     /// The guest performed one element of a string port-I/O instruction.
     PortIoString(crate::X86PortIoStringExit),

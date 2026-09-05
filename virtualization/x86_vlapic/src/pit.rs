@@ -403,16 +403,23 @@ fn schedule_irq0<H: X86VlapicHostOps>(
     vcpu_id: X86VcpuId,
 ) -> X86VlapicResult {
     let mut next_deadline_ns = deadline_ns;
+    let mut callback_count = 0u64;
     registration.register(
         deadline_ns,
         alloc::boxed::Box::new(move |_| {
+            callback_count = callback_count.saturating_add(1);
+            let now_ns = host::current_time_nanos::<H>();
+            if callback_count == 1 || callback_count.is_power_of_two() {
+                info!(
+                    "[HV] PIT IRQ callback: callbacks={} VM[{}] VCpu[{}] deadline_ns={} now_ns={} \
+                     period_ns={period_ns:?}",
+                    callback_count, vm_id, vcpu_id, next_deadline_ns, now_ns,
+                );
+            }
             let _ = H::inject_pit_irq(vm_id, vcpu_id);
             if let Some(period_ns) = period_ns {
-                next_deadline_ns = restart_periodic_deadline_ns(
-                    next_deadline_ns,
-                    period_ns,
-                    host::current_time_nanos::<H>(),
-                );
+                next_deadline_ns =
+                    restart_periodic_deadline_ns(next_deadline_ns, period_ns, now_ns);
                 return X86TimerAction::Rearm(next_deadline_ns);
             }
             X86TimerAction::Complete
@@ -495,6 +502,17 @@ impl<H: X86VlapicHostOps> EmulatedPit<H> {
         };
         drop(state);
         if let Some((deadline_ns, period_ns)) = irq0_schedule {
+            let state = self.state.lock();
+            info!(
+                "[HV] PIT channel 0 program: reload={:#x} divisor={} mode={:?} period_ns={:?} \
+                 deadline_ns={}",
+                state.channel0.reload_value,
+                state.channel0.divisor(),
+                state.channel0.mode,
+                period_ns,
+                deadline_ns,
+            );
+            drop(state);
             self.irq0_timer.lock().schedule(deadline_ns, period_ns)?;
         }
         Ok(())

@@ -18,7 +18,7 @@ use super::{
 };
 use crate::boot::acpi::*;
 
-pub(super) const DIRECT_ACPI_BASE: u64 = 0x000e_0000;
+pub(crate) const DIRECT_ACPI_BASE: u64 = 0x000e_0000;
 const DIRECT_ACPI_LIMIT: u64 = 0x0010_0000;
 
 pub(crate) fn build_direct_image(plan: &X86FirmwarePlan) -> Result<AcpiImage, AcpiBuildError> {

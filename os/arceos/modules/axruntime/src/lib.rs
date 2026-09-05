@@ -334,6 +334,7 @@ pub fn rust_main(cpu_id: usize, arg: usize) -> ! {
     );
 
     fs::init(ax_hal::boot::bootargs());
+    info!("[HV] primary CPU {cpu_id}: filesystem init complete");
 
     #[cfg(feature = "display")]
     devices::init_display();
@@ -345,7 +346,11 @@ pub fn rust_main(cpu_id: usize, arg: usize) -> ! {
     devices::init_vsock();
 
     #[cfg(feature = "smp")]
+    info!("[HV] primary CPU {cpu_id}: starting secondary CPUs");
+    #[cfg(feature = "smp")]
     self::mp::start_secondary_cpus(cpu_id);
+    #[cfg(feature = "smp")]
+    info!("[HV] primary CPU {cpu_id}: secondary CPU startup complete");
 
     ax_ctor_bare::call_ctors();
 

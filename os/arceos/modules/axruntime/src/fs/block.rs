@@ -198,6 +198,7 @@ static IRQ_REGISTRAR: RuntimeBlockIrqRegistrar = RuntimeBlockIrqRegistrar;
 
 pub(super) fn init(bootargs: Option<&str>) {
     ONLINE_BLOCK_CPUS.store(1, Ordering::Release);
+    info!("[HV] filesystem init: installing block runtime");
     ax_fs_ng::os::install(
         &TIME_PROVIDER,
         &PAGE_PROVIDER,
@@ -206,11 +207,13 @@ pub(super) fn init(bootargs: Option<&str>) {
         irq_registrar(),
         None,
     );
+    info!("[HV] filesystem init: discovering root block device");
     ax_fs_ng::root::init_root_from_rdif_sources(
         take_rdif_block_devices(),
         take_rdif_block_groups(),
         bootargs,
     );
+    info!("[HV] filesystem init: root filesystem setup returned");
 }
 
 #[cfg(all(feature = "smp", feature = "ipi"))]

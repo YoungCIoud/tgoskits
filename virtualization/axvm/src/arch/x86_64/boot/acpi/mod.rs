@@ -10,4 +10,4 @@ mod tables;
 pub(super) use aml::build_dsdt;
 pub(crate) use config::{X86FirmwarePlan, X86PciIntxRoute};
 pub(super) use fw_cfg::build_fw_cfg_blobs;
-pub(super) use tables::build_direct_image;
+pub(crate) use tables::{DIRECT_ACPI_BASE, build_direct_image};

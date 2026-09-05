@@ -514,6 +514,13 @@ fn vcpu_run() {
 
         if let Some(action) = action {
             runtime.inc_guest_entry();
+            let entry_count = runtime.guest_entry_count();
+            if entry_count == 1 || entry_count.is_power_of_two() {
+                info!(
+                    "[HV] guest run progress: entries={} VM[{}] VCpu[{}]",
+                    entry_count, vm_id, vcpu_id
+                );
+            }
 
             match action {
                 VcpuRunAction {

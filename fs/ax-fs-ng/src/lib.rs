@@ -107,10 +107,18 @@ pub(crate) fn init_detected_filesystem(
 fn finish_filesystem_init(fs: axfs_ng_vfs::Filesystem, source: &str) -> Location {
     info!("  filesystem type: {:?}", fs.name());
 
+    info!("  creating root mountpoint");
     let mp = axfs_ng_vfs::Mountpoint::new_root_with_source(&fs, source);
+    info!("  root mountpoint created");
+    info!("  acquiring root location");
     let root = mp.root_location();
+    info!("  root location acquired");
+    info!("  registering root filesystem");
     register_mounted_filesystem(fs);
+    info!("  root filesystem registered");
+    info!("  initializing root filesystem context");
     highlevel::ROOT_FS_CONTEXT.call_once(|| highlevel::FsContext::new(root.clone()));
+    info!("  root filesystem context initialized");
     root
 }
 

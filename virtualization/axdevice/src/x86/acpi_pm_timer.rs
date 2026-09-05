@@ -1,7 +1,7 @@
 //! Q35-compatible ACPI power-management timer used by x86 guest firmware.
 
 use alloc::boxed::Box;
-use core::sync::atomic::{AtomicU16, Ordering};
+use core::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 
 use axdevice_base::*;
 
@@ -18,6 +18,13 @@ pub struct X86AcpiPmTimerDevice {
     status: AtomicU16,
     enable: AtomicU16,
     control: AtomicU16,
+    timer_read_count: AtomicU64,
+    timer_start_host_nanos: AtomicU64,
+    timer_elapsed_counter_ticks: AtomicU64,
+    timer_zero_delta_count: AtomicU64,
+    timer_host_backwards_count: AtomicU64,
+    last_timer_host_nanos: AtomicU64,
+    last_timer_counter: AtomicU64,
     stop: StopGrant,
     // Retaining the line keeps the planned SCI endpoint and its lease alive.
     _sci: IrqLine,
@@ -61,6 +68,13 @@ impl X86AcpiPmTimerDevice {
             status: AtomicU16::new(0),
             enable: AtomicU16::new(0),
             control: AtomicU16::new(0),
+            timer_read_count: AtomicU64::new(0),
+            timer_start_host_nanos: AtomicU64::new(0),
+            timer_elapsed_counter_ticks: AtomicU64::new(0),
+            timer_zero_delta_count: AtomicU64::new(0),
+            timer_host_backwards_count: AtomicU64::new(0),
+            last_timer_host_nanos: AtomicU64::new(0),
+            last_timer_counter: AtomicU64::new(0),
             stop,
             _sci: sci,
             resources: alloc::vec![
@@ -77,8 +91,61 @@ impl X86AcpiPmTimerDevice {
         })
     }
 
-    fn counter(&self) -> u32 {
-        pm_timer_counter((self.monotonic_nanos)())
+    fn counter(&self, offset: u64, width: u64) -> u32 {
+        let host_nanos = (self.monotonic_nanos)();
+        let counter = pm_timer_counter(host_nanos);
+        let read_count = self.timer_read_count.fetch_add(1, Ordering::Relaxed) + 1;
+        let previous_host_nanos = self
+            .last_timer_host_nanos
+            .swap(host_nanos, Ordering::Relaxed);
+        let previous_counter = self
+            .last_timer_counter
+            .swap(u64::from(counter), Ordering::Relaxed);
+
+        if read_count == 1 {
+            self.timer_start_host_nanos
+                .store(host_nanos, Ordering::Relaxed);
+        }
+
+        let (host_delta_nanos, counter_delta) = if read_count == 1 {
+            (0, 0)
+        } else {
+            if host_nanos < previous_host_nanos {
+                self.timer_host_backwards_count
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            let host_delta_nanos = host_nanos.saturating_sub(previous_host_nanos);
+            let counter_delta = (u64::from(counter).wrapping_sub(previous_counter)) & PM_TIMER_MASK;
+            if counter_delta == 0 {
+                self.timer_zero_delta_count.fetch_add(1, Ordering::Relaxed);
+            }
+            self.timer_elapsed_counter_ticks
+                .fetch_add(counter_delta, Ordering::Relaxed);
+            (host_delta_nanos, counter_delta)
+        };
+
+        if read_count == 1 || read_count.is_power_of_two() {
+            let elapsed_host_nanos =
+                host_nanos.saturating_sub(self.timer_start_host_nanos.load(Ordering::Relaxed));
+            let elapsed_counter_ticks = self.timer_elapsed_counter_ticks.load(Ordering::Relaxed);
+            let expected_counter_ticks =
+                elapsed_host_nanos.saturating_mul(PM_TIMER_FREQUENCY_HZ) / NANOSECONDS_PER_SECOND;
+            info!(
+                "[HV] ACPI PM timer sample: reads={} offset={offset:#x} width={width} \
+                 host_delta_ns={} counter_delta={} counter={counter:#08x} elapsed_host_ns={} \
+                 elapsed_counter_ticks={} expected_counter_ticks={} zero_deltas={} \
+                 host_backwards={}",
+                read_count,
+                host_delta_nanos,
+                counter_delta,
+                elapsed_host_nanos,
+                elapsed_counter_ticks,
+                expected_counter_ticks,
+                self.timer_zero_delta_count.load(Ordering::Relaxed),
+                self.timer_host_backwards_count.load(Ordering::Relaxed),
+            );
+        }
+        counter
     }
 
     fn access_size(access: &DeviceAccess) -> Result<u64, DeviceError> {
@@ -111,7 +178,13 @@ impl X86AcpiPmTimerDevice {
     fn read_registers(&self, access: &DeviceAccess) -> Result<u64, DeviceError> {
         let width = Self::access_size(access)?;
         let offset = self.offset(access, width)?;
-        let timer = self.counter().to_le_bytes();
+        let timer = if offset < Self::TIMER_OFFSET + u64::from(Self::TIMER_REGISTER_SIZE)
+            && offset + width > Self::TIMER_OFFSET
+        {
+            self.counter(offset, width).to_le_bytes()
+        } else {
+            [0; 4]
+        };
         let status = self.status.load(Ordering::Acquire).to_le_bytes();
         let enable = self.enable.load(Ordering::Acquire).to_le_bytes();
         let control = self.control.load(Ordering::Acquire).to_le_bytes();

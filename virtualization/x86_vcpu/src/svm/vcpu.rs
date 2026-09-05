@@ -30,9 +30,19 @@ use crate::{
 };
 
 const QEMU_EXIT_PORT: u16 = 0x604;
+const X86_ACPI_PM_TIMER_PORT: u16 = 0x608;
+const X86_PCI_CONFIG_PORT_START: u16 = 0xcf8;
+const X86_PCI_CONFIG_PORT_END: u16 = 0xcff;
+const X86_PCI_CONFIG_ADDRESS_PORT: u16 = 0xcf8;
+const DIAGNOSTIC_PCI_CONFIG_TRACE_LIMIT: u64 = 128;
+const DIAGNOSTIC_NPF_TRACE_LIMIT: u64 = 128;
 const X86_PIT_PORT_BASE: u16 = 0x40;
 const X86_PIT_PORT_COUNT: u32 = 4;
 const X86_PIT_SPEAKER_PORT: u16 = 0x61;
+const DIAGNOSTIC_PORT_8: u16 = 0x8;
+const DIAGNOSTIC_PORT_8_TRACE_LIMIT: u64 = 64;
+const DIAGNOSTIC_PIC_DATA_PORT: u16 = 0x21;
+const DIAGNOSTIC_PIC_TRACE_LIMIT: u64 = 16;
 const X86_IOAPIC_BASE: usize = 0xfec0_0000;
 const X86_IOAPIC_SIZE: usize = 0x1000;
 const X86_LOCAL_APIC_EOI_OFFSET: usize = 0xb0;
@@ -141,6 +151,60 @@ struct SvmIoExitInfo {
     address_size: Option<X86AddressSize>,
     segment: u8,
     port: X86Port,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct GuestPeMetadata {
+    base: u64,
+    pe_offset: u32,
+    machine: u16,
+    section_count: u16,
+    timestamp: u32,
+    characteristics: u16,
+    optional_header_size: u16,
+    optional_magic: u16,
+    entry_rva: u32,
+    image_base: u64,
+    section_alignment: u32,
+    file_alignment: u32,
+    size_of_image: u32,
+    size_of_headers: u32,
+    subsystem: u16,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct GuestPeDirectories {
+    export: Option<(u32, u32)>,
+    import: Option<(u32, u32)>,
+    debug: Option<(u32, u32)>,
+}
+
+#[derive(Debug)]
+struct GuestPeIdentity {
+    directory_count: Option<u32>,
+    directories: GuestPeDirectories,
+    export_name: Option<alloc::string::String>,
+    imports: alloc::vec::Vec<alloc::string::String>,
+    pdb_path: Option<alloc::string::String>,
+}
+
+impl GuestPeMetadata {
+    fn is_sane_x86_64_image(self) -> bool {
+        self.machine == 0x8664
+            && self.optional_magic == 0x20b
+            && (1..=96).contains(&self.section_count)
+            && (0x70..=0x1000).contains(&self.optional_header_size)
+            && self.section_alignment.is_power_of_two()
+            && (0x20..=0x10_0000).contains(&self.section_alignment)
+            && self.file_alignment.is_power_of_two()
+            && (0x20..=self.section_alignment).contains(&self.file_alignment)
+            && self.size_of_image != 0
+            && self.size_of_image <= 0x1000_0000
+            && self.size_of_image.is_multiple_of(self.section_alignment)
+            && self.size_of_headers >= self.file_alignment
+            && self.size_of_headers <= self.size_of_image
+            && self.entry_rva < self.size_of_image
+    }
 }
 
 /// Register memory shared with the SVM world-switch assembly.
@@ -272,6 +336,48 @@ pub struct SvmVcpu<H: X86HostOps> {
     pending_events: VecDeque<PendingEvent>,
     /// Event handed to EVENTINJ for the current VMRUN and awaiting completion.
     injecting_event: Option<PendingEvent>,
+    /// Number of external events submitted to EVENTINJ.
+    event_injection_ready_count: u64,
+    /// Number of external events blocked by guest interrupt state.
+    event_injection_blocked_count: u64,
+    /// Number of events requeued because a nested event interrupted injection.
+    event_injection_requeue_count: u64,
+    /// Number of unresolved exits returned to the VMM.
+    guest_exit_count: u64,
+    /// Number of nested-page-fault exits, including faults handled as MMIO.
+    nested_page_fault_count: u64,
+    /// Number of unresolved port-I/O exits.
+    port_io_exit_count: u64,
+    /// Number of unresolved ACPI PM timer I/O exits.
+    pm_timer_io_exit_count: u64,
+    /// Number of unresolved PCI configuration I/O exits.
+    pci_config_io_exit_count: u64,
+    /// Number of PCI configuration I/O events left in the startup trace.
+    diagnostic_pci_config_trace_remaining: u64,
+    /// Whether the bounded PCI configuration trace has already been started.
+    diagnostic_pci_config_trace_started: bool,
+    /// Last guest value written to the PCI configuration address port.
+    diagnostic_pci_config_address: u32,
+    /// Number of unresolved I/O exits outside the tracked port ranges.
+    other_port_io_exit_count: u64,
+    /// Number of PAUSE exits returned to the VMM.
+    pause_exit_count: u64,
+    /// Number of CPUID exits handled for the guest.
+    cpuid_exit_count: u64,
+    /// Number of RDTSC exits handled for the guest.
+    rdtsc_exit_count: u64,
+    /// Number of reads from the diagnostic port seen in the firmware wait loop.
+    diagnostic_port_8_read_count: u64,
+    /// Number of port-I/O events left in the trace after the diagnostic port appears.
+    diagnostic_port_8_trace_remaining: u64,
+    /// Whether a guest stack sample has been emitted for the diagnostic port.
+    diagnostic_port_8_stack_sampled: bool,
+    /// Number of port-I/O events left in the trace after PIC data reads appear.
+    diagnostic_pic_trace_remaining: u64,
+    /// Whether the bounded PIC I/O trace has already been started.
+    diagnostic_pic_trace_started: bool,
+    /// Number of reads from the PIC master data port used for loop samples.
+    diagnostic_pic_loop_read_count: u64,
     /// Emulated Local APIC for x2APIC MSR accesses.
     vlapic: EmulatedLocalApic<H>,
     /// The XState of the VCpu. Both host and guest.
@@ -293,6 +399,27 @@ impl<H: X86HostOps> SvmVcpu<H> {
             msrpm: MSRPm::<H>::passthrough_all()?,
             pending_events: VecDeque::with_capacity(8),
             injecting_event: None,
+            event_injection_ready_count: 0,
+            event_injection_blocked_count: 0,
+            event_injection_requeue_count: 0,
+            guest_exit_count: 0,
+            nested_page_fault_count: 0,
+            port_io_exit_count: 0,
+            pm_timer_io_exit_count: 0,
+            pci_config_io_exit_count: 0,
+            diagnostic_pci_config_trace_remaining: 0,
+            diagnostic_pci_config_trace_started: false,
+            diagnostic_pci_config_address: 0,
+            other_port_io_exit_count: 0,
+            pause_exit_count: 0,
+            cpuid_exit_count: 0,
+            rdtsc_exit_count: 0,
+            diagnostic_port_8_read_count: 0,
+            diagnostic_port_8_trace_remaining: 0,
+            diagnostic_port_8_stack_sampled: false,
+            diagnostic_pic_trace_remaining: 0,
+            diagnostic_pic_trace_started: false,
+            diagnostic_pic_loop_read_count: 0,
             vlapic: EmulatedLocalApic::<H>::new(vm_id, vcpu_id),
             xstate: XState::new(),
         };
@@ -620,6 +747,20 @@ impl<H: X86HostOps> SvmVcpu<H> {
                 continue;
             }
 
+            self.guest_exit_count += 1;
+            if self.guest_exit_count.is_power_of_two() {
+                info!(
+                    "[HV] SVM guest exit sample: exits={} code={:?} rip={:#x} info1={:#x} \
+                     info2={:#x} pending_events={}",
+                    self.guest_exit_count,
+                    exit_info.exit_code,
+                    exit_info.guest_rip,
+                    exit_info.exit_info_1,
+                    exit_info.exit_info_2,
+                    self.pending_events.len()
+                );
+            }
+
             return Ok(exit_info);
         }
     }
@@ -910,6 +1051,21 @@ impl<H: X86HostOps> SvmVcpu<H> {
             _ => cpuid!(regs_clone.rax, regs_clone.rcx),
         };
 
+        self.cpuid_exit_count = self.cpuid_exit_count.saturating_add(1);
+        if self.cpuid_exit_count <= 64 {
+            info!(
+                "[HV] SVM CPUID sample: count={} input_eax={:#x} input_ecx={:#x} output_eax={:#x} \
+                 output_ebx={:#x} output_ecx={:#x} output_edx={:#x}",
+                self.cpuid_exit_count,
+                regs_clone.rax,
+                regs_clone.rcx,
+                res.eax,
+                res.ebx,
+                res.ecx,
+                res.edx,
+            );
+        }
+
         let regs = self.regs_mut();
         regs.rax = res.eax as _;
         regs.rbx = res.ebx as _;
@@ -996,23 +1152,257 @@ impl<H: X86HostOps> SvmVcpu<H> {
         })
     }
 
+    fn record_port_io_exit(&mut self, io: &SvmIoExitInfo, exit_info: &super::vmcb::SvmExitInfo) {
+        self.port_io_exit_count = self.port_io_exit_count.saturating_add(1);
+        let category = if io.port.number() == X86_ACPI_PM_TIMER_PORT {
+            self.pm_timer_io_exit_count = self.pm_timer_io_exit_count.saturating_add(1);
+            "pm_timer"
+        } else if (X86_PCI_CONFIG_PORT_START..=X86_PCI_CONFIG_PORT_END).contains(&io.port.number())
+        {
+            self.pci_config_io_exit_count = self.pci_config_io_exit_count.saturating_add(1);
+            "pci_config"
+        } else {
+            self.other_port_io_exit_count = self.other_port_io_exit_count.saturating_add(1);
+            "other"
+        };
+
+        if (X86_PCI_CONFIG_PORT_START..=X86_PCI_CONFIG_PORT_END).contains(&io.port.number()) {
+            if !self.diagnostic_pci_config_trace_started {
+                self.diagnostic_pci_config_trace_started = true;
+                self.diagnostic_pci_config_trace_remaining = DIAGNOSTIC_PCI_CONFIG_TRACE_LIMIT;
+            }
+
+            let data = self.regs().rax.get_bits(io.width.bits_range());
+            if io.port.number() == X86_PCI_CONFIG_ADDRESS_PORT && !io.is_in {
+                self.diagnostic_pci_config_address = data as u32;
+            }
+
+            if self.diagnostic_pci_config_trace_remaining != 0 {
+                let image_signatures = self.guest_image_signatures(exit_info.guest_rip);
+                let pe_base = self
+                    .guest_pe_metadata(image_signatures.0)
+                    .map(|metadata| metadata.base);
+                info!(
+                    "[HV] SVM PCI config I/O trace: remaining={} port={:#x} direction={} \
+                     width={:?} selector={:#x} data={:#x} rip={:#x} pe_base={:?} guest_bytes={:?}",
+                    self.diagnostic_pci_config_trace_remaining,
+                    io.port.number(),
+                    if io.is_in { "in" } else { "out" },
+                    io.width,
+                    self.diagnostic_pci_config_address,
+                    data,
+                    exit_info.guest_rip,
+                    pe_base,
+                    self.guest_instruction_bytes(exit_info.guest_rip),
+                );
+                self.diagnostic_pci_config_trace_remaining -= 1;
+            }
+        }
+
+        let count = self.port_io_exit_count;
+        if count == 1 || count.is_power_of_two() {
+            info!(
+                "[HV] SVM port I/O aggregate: total={} pm_timer={} pci_config={} other={} \
+                 category={} port={:#x} direction={} width={:?} string={} repeat={} \
+                 guest_rip={:#x} pause_exits={}",
+                count,
+                self.pm_timer_io_exit_count,
+                self.pci_config_io_exit_count,
+                self.other_port_io_exit_count,
+                category,
+                io.port.number(),
+                if io.is_in { "in" } else { "out" },
+                io.width,
+                io.is_string,
+                io.is_repeat,
+                exit_info.guest_rip,
+                self.pause_exit_count,
+            );
+        }
+
+        if io.port.number() == DIAGNOSTIC_PORT_8 && io.is_in {
+            self.diagnostic_port_8_read_count = self.diagnostic_port_8_read_count.saturating_add(1);
+            let reads = self.diagnostic_port_8_read_count;
+            if reads == 1 {
+                self.diagnostic_port_8_trace_remaining = DIAGNOSTIC_PORT_8_TRACE_LIMIT;
+            }
+            if reads == 1 || reads.is_power_of_two() {
+                let vmcb = unsafe { self.vmcb.as_vmcb_ref() };
+                let instruction_bytes = self.guest_instruction_bytes(exit_info.guest_rip);
+                let instruction_gpa = self.guest_instruction_gpa(exit_info.guest_rip);
+                let rip_relative_dword =
+                    self.guest_rip_relative_dword(exit_info.guest_rip, instruction_bytes);
+                let image_signatures = self.guest_image_signatures(exit_info.guest_rip);
+                let pe_metadata = self.guest_pe_metadata(image_signatures.0);
+                let pe_section = self.guest_pe_section_for_rip(exit_info.guest_rip, pe_metadata);
+                let pe_identity = self.guest_pe_identity(pe_metadata);
+                let stack_words = if !self.diagnostic_port_8_stack_sampled || reads == 16 {
+                    self.diagnostic_port_8_stack_sampled = true;
+                    Some(self.guest_stack_words(vmcb.state.rsp.get()))
+                } else {
+                    None
+                };
+                if let Some(identity) = pe_identity.as_ref() {
+                    info!(
+                        "[HV] SVM PE identity: rip={:#x} base={:#x} directory_count={:?} \
+                         export={:?} import={:?} debug={:?} export_name={:?} imports={:?} \
+                         pdb_path={:?}",
+                        exit_info.guest_rip,
+                        pe_metadata.map_or(0, |metadata| metadata.base),
+                        identity.directory_count,
+                        identity.directories.export,
+                        identity.directories.import,
+                        identity.directories.debug,
+                        identity.export_name,
+                        identity.imports,
+                        identity.pdb_path,
+                    );
+                }
+                let rflags = vmcb.state.rflags.get();
+                info!(
+                    "[HV] SVM diagnostic port sample: reads={} rip={:#x} next_rip={:#x} \
+                     exit_info_2={:#x} insn_len={} insn_bytes={:?} guest_bytes={:?} rax={:#x} \
+                     rcx={:#x} rdx={:#x} rdi={:#x} guest_gpa={:?} rip_relative_dword={:?} \
+                     rsp={:#x} stack_words={:?} image_signatures={:?} pe_metadata={:?} \
+                     pe_section={:?} rflags={:#x} if={} cr0={:#x} cr3={:#x} efer={:#x} \
+                     cs_attr={:#x} cs_base={:#x} mode={:?}",
+                    reads,
+                    exit_info.guest_rip,
+                    exit_info.guest_next_rip,
+                    exit_info.exit_info_2,
+                    vmcb.control.insn_len.get(),
+                    vmcb.control
+                        .insn_bytes
+                        .iter()
+                        .take(vmcb.control.insn_len.get() as usize)
+                        .map(|byte| byte.get())
+                        .collect::<alloc::vec::Vec<_>>(),
+                    instruction_bytes,
+                    self.regs().rax,
+                    self.regs().rcx,
+                    self.regs().rdx,
+                    self.regs().rdi,
+                    instruction_gpa,
+                    rip_relative_dword,
+                    vmcb.state.rsp.get(),
+                    stack_words,
+                    image_signatures,
+                    pe_metadata,
+                    pe_section,
+                    rflags,
+                    rflags & RFlags::INTERRUPT_FLAG.bits() != 0,
+                    vmcb.state.cr0.get(),
+                    vmcb.state.cr3.get(),
+                    vmcb.state.efer.get(),
+                    vmcb.state.cs.attr.get(),
+                    vmcb.state.cs.base.get(),
+                    self.get_cpu_mode(),
+                );
+            }
+        }
+
+        if self.diagnostic_port_8_trace_remaining != 0 {
+            let regs = self.regs();
+            info!(
+                "[HV] SVM diagnostic I/O trace: remaining={} port={:#x} direction={} width={:?} \
+                 rip={:#x} rax={:#x} rcx={:#x} rdx={:#x} rdi={:#x} r8={:#x} r9={:#x} r10={:#x} \
+                 r11={:#x}",
+                self.diagnostic_port_8_trace_remaining,
+                io.port.number(),
+                if io.is_in { "in" } else { "out" },
+                io.width,
+                exit_info.guest_rip,
+                regs.rax,
+                regs.rcx,
+                regs.rdx,
+                regs.rdi,
+                regs.r8,
+                regs.r9,
+                regs.r10,
+                regs.r11,
+            );
+            self.diagnostic_port_8_trace_remaining -= 1;
+        }
+
+        if io.port.number() == DIAGNOSTIC_PIC_DATA_PORT
+            && io.is_in
+            && !self.diagnostic_pic_trace_started
+        {
+            self.diagnostic_pic_trace_started = true;
+            self.diagnostic_pic_trace_remaining = DIAGNOSTIC_PIC_TRACE_LIMIT;
+        }
+        if self.diagnostic_pic_trace_remaining != 0 {
+            let vmcb = unsafe { self.vmcb.as_vmcb_ref() };
+            let regs = self.regs();
+            let rflags = vmcb.state.rflags.get();
+            info!(
+                "[HV] SVM PIC I/O trace: remaining={} port={:#x} direction={} width={:?} \
+                 rip={:#x} next_rip={:#x} guest_bytes={:?} guest_gpa={:?} rax={:#x} rdx={:#x} \
+                 rflags={:#x} if={}",
+                self.diagnostic_pic_trace_remaining,
+                io.port.number(),
+                if io.is_in { "in" } else { "out" },
+                io.width,
+                exit_info.guest_rip,
+                exit_info.guest_next_rip,
+                self.guest_instruction_bytes(exit_info.guest_rip),
+                self.guest_instruction_gpa(exit_info.guest_rip),
+                regs.rax,
+                regs.rdx,
+                rflags,
+                rflags & RFlags::INTERRUPT_FLAG.bits() != 0,
+            );
+            self.diagnostic_pic_trace_remaining -= 1;
+        }
+
+        if io.port.number() == DIAGNOSTIC_PIC_DATA_PORT && io.is_in {
+            self.diagnostic_pic_loop_read_count =
+                self.diagnostic_pic_loop_read_count.saturating_add(1);
+            let reads = self.diagnostic_pic_loop_read_count;
+            if reads == 1 || reads.is_power_of_two() {
+                let vmcb = unsafe { self.vmcb.as_vmcb_ref() };
+                let rflags = vmcb.state.rflags.get();
+                info!(
+                    "[HV] SVM PIC loop sample: reads={} rip={:#x} next_rip={:#x} guest_bytes={:?} \
+                     guest_gpa={:?} insn_len={} rax={:#x} rdx={:#x} rflags={:#x} if={} \
+                     int_state={:#x} pending_events={}",
+                    reads,
+                    exit_info.guest_rip,
+                    exit_info.guest_next_rip,
+                    self.guest_instruction_bytes(exit_info.guest_rip),
+                    self.guest_instruction_gpa(exit_info.guest_rip),
+                    vmcb.control.insn_len.get(),
+                    self.regs().rax,
+                    self.regs().rdx,
+                    rflags,
+                    rflags & RFlags::INTERRUPT_FLAG.bits() != 0,
+                    vmcb.control.int_state.get(),
+                    self.pending_events.len(),
+                );
+            }
+        }
+    }
+
     fn handle_port_io_exit(
         &mut self,
         exit_info: &super::vmcb::SvmExitInfo,
     ) -> X86VcpuResult<X86VmExit> {
         let io = self.svm_io_exit_info(exit_info)?;
+        self.record_port_io_exit(&io, exit_info);
         if !io.is_string {
             self.set_rip(exit_info.exit_info_2);
             return Ok(if io.is_in {
                 X86VmExit::PortIoRead {
                     port: io.port,
                     width: io.width,
+                    guest_rip: exit_info.guest_rip,
                 }
             } else {
                 X86VmExit::PortIoWrite {
                     port: io.port,
                     width: io.width,
                     data: self.regs().rax.get_bits(io.width.bits_range()),
+                    guest_rip: exit_info.guest_rip,
                 }
             });
         }
@@ -1117,7 +1507,17 @@ impl<H: X86HostOps> SvmVcpu<H> {
 
         let tsc = unsafe { core::arch::x86_64::_rdtsc() };
         let tsc_offset = unsafe { self.vmcb.as_vmcb_ref().control.tsc_offset.get() };
-        self.write_edx_eax(tsc.wrapping_add(tsc_offset));
+        let guest_tsc = tsc.wrapping_add(tsc_offset);
+        self.rdtsc_exit_count = self.rdtsc_exit_count.saturating_add(1);
+        if self.rdtsc_exit_count <= 16 {
+            let rip = unsafe { self.vmcb.as_vmcb_ref().state.rip.get() };
+            info!(
+                "[HV] SVM RDTSC sample: count={} rip={:#x} host_tsc={:#x} offset={:#x} \
+                 guest_tsc={:#x}",
+                self.rdtsc_exit_count, rip, tsc, tsc_offset, guest_tsc,
+            );
+        }
+        self.write_edx_eax(guest_tsc);
         self.advance_rip(VM_EXIT_INSTR_LEN_RDTSC)
     }
 
@@ -1147,6 +1547,20 @@ impl<H: X86HostOps> SvmVcpu<H> {
 
         if event.vector >= 32 {
             if self.allow_external_interrupt() {
+                self.event_injection_ready_count =
+                    self.event_injection_ready_count.saturating_add(1);
+                let ready_count = self.event_injection_ready_count;
+                if ready_count == 1 || ready_count.is_power_of_two() {
+                    info!(
+                        "[HV] SVM external event ready: ready={} blocked={} requeued={} \
+                         vector={:#x} pending_events={}",
+                        ready_count,
+                        self.event_injection_blocked_count,
+                        self.event_injection_requeue_count,
+                        event.vector,
+                        self.pending_events.len(),
+                    );
+                }
                 self.set_interrupt_window(false);
                 inject_external_interrupt_control(
                     unsafe { &mut self.vmcb.as_vmcb().control },
@@ -1155,6 +1569,20 @@ impl<H: X86HostOps> SvmVcpu<H> {
                 self.injecting_event = Some(event);
                 self.pending_events.pop_front();
             } else {
+                self.event_injection_blocked_count =
+                    self.event_injection_blocked_count.saturating_add(1);
+                let blocked_count = self.event_injection_blocked_count;
+                if blocked_count == 1 || blocked_count.is_power_of_two() {
+                    info!(
+                        "[HV] SVM external event blocked: ready={} blocked={} requeued={} \
+                         vector={:#x} pending_events={}",
+                        self.event_injection_ready_count,
+                        blocked_count,
+                        self.event_injection_requeue_count,
+                        event.vector,
+                        self.pending_events.len(),
+                    );
+                }
                 self.set_interrupt_window(true);
             }
             return Ok(());
@@ -1178,6 +1606,17 @@ impl<H: X86HostOps> SvmVcpu<H> {
         if let Some(interrupted) =
             interrupted_injected_event(exit_int_info, exit_int_info_err, injected)
         {
+            self.event_injection_requeue_count =
+                self.event_injection_requeue_count.saturating_add(1);
+            let requeue_count = self.event_injection_requeue_count;
+            if requeue_count == 1 || requeue_count.is_power_of_two() {
+                info!(
+                    "[HV] SVM external event requeued: count={} vector={:#x} pending_events={}",
+                    requeue_count,
+                    interrupted.vector,
+                    self.pending_events.len(),
+                );
+            }
             self.pending_events.push_front(interrupted);
             vmcb.control.exit_int_info.set(0);
             vmcb.control.exit_int_info_err.set(0);
@@ -1223,6 +1662,351 @@ impl<H: X86HostOps> SvmVcpu<H> {
         } else {
             guest_rip + unsafe { self.vmcb.as_vmcb_ref().state.cs.base.get() as usize }
         }
+    }
+
+    fn guest_instruction_bytes(&self, guest_rip: u64) -> Option<[u8; 16]> {
+        let mut bytes = [0; 16];
+        let mut address = self.gla2gva(X86GuestVirtAddr::from(guest_rip as usize));
+        for byte in &mut bytes {
+            *byte = self.read_guest_u8(address).ok()?;
+            address += 1;
+        }
+        Some(bytes)
+    }
+
+    fn guest_instruction_gpa(&self, guest_rip: u64) -> Option<X86GuestPhysAddr> {
+        self.translate_guest_linear(self.gla2gva(X86GuestVirtAddr::from(guest_rip as usize)))
+            .ok()
+    }
+
+    fn guest_rip_relative_dword(
+        &self,
+        guest_rip: u64,
+        instruction_bytes: Option<[u8; 16]>,
+    ) -> Option<(u64, Option<X86GuestPhysAddr>, Option<u32>)> {
+        let bytes = instruction_bytes?;
+        let offset = bytes.windows(2).position(|window| window == [0x8b, 0x15])?;
+        let displacement = i32::from_le_bytes([
+            *bytes.get(offset + 2)?,
+            *bytes.get(offset + 3)?,
+            *bytes.get(offset + 4)?,
+            *bytes.get(offset + 5)?,
+        ]);
+        let next_rip = guest_rip.wrapping_add((offset + 6) as u64);
+        let target = next_rip.wrapping_add(displacement as i64 as u64);
+        let target_gva = X86GuestVirtAddr::from(target as usize);
+        let target_gpa = self.translate_guest_linear(target_gva).ok();
+        let value = (0..4).try_fold(0u32, |value, index| {
+            Some(value | (self.read_guest_u8(target_gva + index).ok()? as u32) << (index * 8))
+        });
+        Some((target, target_gpa, value))
+    }
+
+    fn guest_image_signatures(&self, guest_rip: u64) -> (Option<u64>, Option<u64>) {
+        let current_page = guest_rip & !0xfff;
+        let mut pe_base = None;
+        let mut elf_base = None;
+
+        for page_offset in (0..=0x4_00000u64).step_by(0x1000) {
+            let Some(base) = current_page.checked_sub(page_offset) else {
+                break;
+            };
+            let address = X86GuestVirtAddr::from(base as usize);
+            let is_elf = self.read_guest_u8(address).ok() == Some(0x7f)
+                && self.read_guest_u8(address + 1).ok() == Some(b'E')
+                && self.read_guest_u8(address + 2).ok() == Some(b'L')
+                && self.read_guest_u8(address + 3).ok() == Some(b'F');
+            if is_elf && elf_base.is_none() {
+                elf_base = Some(base);
+            }
+
+            let is_mz = self.read_guest_u8(address).ok() == Some(b'M')
+                && self.read_guest_u8(address + 1).ok() == Some(b'Z');
+            if is_mz && pe_base.is_none() {
+                let Some(pe_offset) = (0..4).try_fold(0u32, |value, index| {
+                    Some(
+                        value
+                            | (self.read_guest_u8(address + 0x3c + index).ok()? as u32)
+                                << (index * 8),
+                    )
+                }) else {
+                    continue;
+                };
+                let pe_signature = address + pe_offset as usize;
+                let is_pe = self.read_guest_u8(pe_signature).ok() == Some(b'P')
+                    && self.read_guest_u8(pe_signature + 1).ok() == Some(b'E')
+                    && self.read_guest_u8(pe_signature + 2).ok() == Some(0)
+                    && self.read_guest_u8(pe_signature + 3).ok() == Some(0);
+                if is_pe {
+                    pe_base = Some(base);
+                }
+            }
+
+            if pe_base.is_some() && elf_base.is_some() {
+                break;
+            }
+        }
+
+        (pe_base, elf_base)
+    }
+
+    fn guest_pe_metadata(&self, pe_base: Option<u64>) -> Option<GuestPeMetadata> {
+        let base_value = pe_base?;
+        let base = X86GuestVirtAddr::from(base_value as usize);
+        let read_u16 = |address: X86GuestVirtAddr| -> Option<u16> {
+            Some(
+                self.read_guest_u8(address).ok()? as u16
+                    | (self.read_guest_u8(address + 1).ok()? as u16) << 8,
+            )
+        };
+        let read_u32 = |address: X86GuestVirtAddr| -> Option<u32> {
+            Some(
+                self.read_guest_u8(address).ok()? as u32
+                    | (self.read_guest_u8(address + 1).ok()? as u32) << 8
+                    | (self.read_guest_u8(address + 2).ok()? as u32) << 16
+                    | (self.read_guest_u8(address + 3).ok()? as u32) << 24,
+            )
+        };
+        let read_u64 = |address: X86GuestVirtAddr| -> Option<u64> {
+            Some(
+                self.read_guest_u8(address).ok()? as u64
+                    | (self.read_guest_u8(address + 1).ok()? as u64) << 8
+                    | (self.read_guest_u8(address + 2).ok()? as u64) << 16
+                    | (self.read_guest_u8(address + 3).ok()? as u64) << 24
+                    | (self.read_guest_u8(address + 4).ok()? as u64) << 32
+                    | (self.read_guest_u8(address + 5).ok()? as u64) << 40
+                    | (self.read_guest_u8(address + 6).ok()? as u64) << 48
+                    | (self.read_guest_u8(address + 7).ok()? as u64) << 56,
+            )
+        };
+        let pe_offset = read_u32(base + 0x3c)?;
+        if pe_offset > 0x10_0000 {
+            return None;
+        }
+        let pe_header = base + pe_offset as usize;
+        if self.read_guest_u8(pe_header).ok()? != b'P'
+            || self.read_guest_u8(pe_header + 1).ok()? != b'E'
+            || self.read_guest_u8(pe_header + 2).ok()? != 0
+            || self.read_guest_u8(pe_header + 3).ok()? != 0
+        {
+            return None;
+        }
+        let optional_header_size = read_u16(pe_header + 20)?;
+        if !(0x40..=0x1000).contains(&optional_header_size) {
+            return None;
+        }
+        let optional_header = pe_header + 24;
+        let optional_magic = read_u16(optional_header)?;
+        let image_base = match optional_magic {
+            0x10b => read_u32(optional_header + 28)? as u64,
+            0x20b => read_u64(optional_header + 24)?,
+            _ => 0,
+        };
+        Some(GuestPeMetadata {
+            base: base_value,
+            pe_offset,
+            machine: read_u16(pe_header + 4)?,
+            section_count: read_u16(pe_header + 6)?,
+            timestamp: read_u32(pe_header + 8)?,
+            characteristics: read_u16(pe_header + 22)?,
+            optional_header_size,
+            optional_magic,
+            entry_rva: read_u32(optional_header + 16)?,
+            image_base,
+            section_alignment: read_u32(optional_header + 32)?,
+            file_alignment: read_u32(optional_header + 36)?,
+            size_of_image: read_u32(optional_header + 56)?,
+            size_of_headers: read_u32(optional_header + 60)?,
+            subsystem: read_u16(optional_header + 68)?,
+        })
+    }
+
+    fn guest_pe_identity(&self, pe_metadata: Option<GuestPeMetadata>) -> Option<GuestPeIdentity> {
+        let pe_metadata = pe_metadata?;
+        if !pe_metadata.is_sane_x86_64_image() {
+            return None;
+        }
+
+        let base = X86GuestVirtAddr::from(pe_metadata.base as usize);
+        let optional_header = base + pe_metadata.pe_offset as usize + 24;
+        let read_u32 = |address: X86GuestVirtAddr| -> Option<u32> {
+            Some(
+                self.read_guest_u8(address).ok()? as u32
+                    | (self.read_guest_u8(address + 1).ok()? as u32) << 8
+                    | (self.read_guest_u8(address + 2).ok()? as u32) << 16
+                    | (self.read_guest_u8(address + 3).ok()? as u32) << 24,
+            )
+        };
+        let directory_count = read_u32(optional_header + 108);
+        let directory_capacity = pe_metadata.optional_header_size.saturating_sub(112) as usize / 8;
+        let directory_count_for_scan = directory_count
+            .unwrap_or_default()
+            .min(directory_capacity as u32)
+            .min(16) as usize;
+        let directory_table = optional_header + 112;
+        let read_directory = |index: usize| -> Option<(u32, u32)> {
+            if index >= directory_count_for_scan {
+                return None;
+            }
+            let directory = directory_table + index * 8;
+            let rva = read_u32(directory)?;
+            let size = read_u32(directory + 4)?;
+            (rva != 0 && size != 0).then_some((rva, size))
+        };
+        let directories = GuestPeDirectories {
+            export: read_directory(0),
+            import: read_directory(1),
+            debug: read_directory(6),
+        };
+
+        let rva_address = |rva: u32| -> Option<X86GuestVirtAddr> {
+            if rva >= pe_metadata.size_of_image {
+                return None;
+            }
+            Some(base + rva as usize)
+        };
+        let read_ascii_string = |address: X86GuestVirtAddr, limit: usize| {
+            let mut bytes = alloc::vec::Vec::new();
+            for offset in 0..limit {
+                let byte = self.read_guest_u8(address + offset).ok()?;
+                if byte == 0 {
+                    break;
+                }
+                bytes.push(byte);
+            }
+            alloc::string::String::from_utf8(bytes).ok()
+        };
+
+        let export_name = directories.export.and_then(|(rva, _)| {
+            let name_rva = read_u32(rva_address(rva)? + 12)?;
+            read_ascii_string(rva_address(name_rva)?, 64)
+        });
+
+        let mut imports = alloc::vec::Vec::new();
+        if let Some((rva, _)) = directories.import {
+            for index in 0..8 {
+                let Some(descriptor_rva) = rva.checked_add(index * 20) else {
+                    break;
+                };
+                let Some(descriptor) = rva_address(descriptor_rva) else {
+                    break;
+                };
+                let Some(name_rva) = read_u32(descriptor + 12) else {
+                    break;
+                };
+                if name_rva == 0 {
+                    break;
+                }
+                let Some(name_address) = rva_address(name_rva) else {
+                    break;
+                };
+                if let Some(name) = read_ascii_string(name_address, 64) {
+                    imports.push(name);
+                }
+            }
+        }
+
+        let pdb_path = directories.debug.and_then(|(rva, size)| {
+            let entry_count = (size as usize / 28).min(8);
+            (0..entry_count).find_map(|index| {
+                let entry = rva_address(rva.checked_add(index as u32 * 28)?)?;
+                let debug_type = read_u32(entry + 12)?;
+                let data_size = read_u32(entry + 16)?;
+                let data_rva = read_u32(entry + 20)?;
+                if debug_type != 2 || data_size < 24 {
+                    return None;
+                }
+                let code_view = rva_address(data_rva)?;
+                if self.read_guest_u8(code_view).ok()? != b'R'
+                    || self.read_guest_u8(code_view + 1).ok()? != b'S'
+                    || self.read_guest_u8(code_view + 2).ok()? != b'D'
+                    || self.read_guest_u8(code_view + 3).ok()? != b'S'
+                {
+                    return None;
+                }
+                read_ascii_string(code_view + 24, (data_size as usize - 24).min(128))
+            })
+        });
+
+        Some(GuestPeIdentity {
+            directory_count,
+            directories,
+            export_name,
+            imports,
+            pdb_path,
+        })
+    }
+
+    fn guest_stack_words(&self, rsp: u64) -> [Option<u64>; 8] {
+        let mut words = [None; 8];
+        for (index, word) in words.iter_mut().enumerate() {
+            let Some(address) = rsp.checked_add((index * size_of::<u64>()) as u64) else {
+                continue;
+            };
+            let gva = self.gla2gva(X86GuestVirtAddr::from(address as usize));
+            let mut value = 0;
+            let mut readable = true;
+            for offset in 0..size_of::<u64>() {
+                let Some(byte) = self.read_guest_u8(gva + offset).ok() else {
+                    readable = false;
+                    break;
+                };
+                value |= (byte as u64) << (offset * 8);
+            }
+            if readable {
+                *word = Some(value);
+            }
+        }
+        words
+    }
+
+    fn guest_pe_section_for_rip(
+        &self,
+        guest_rip: u64,
+        pe_metadata: Option<GuestPeMetadata>,
+    ) -> Option<(u16, u32, [u8; 8], u32, u32, u32)> {
+        let pe_metadata = pe_metadata?;
+        if !pe_metadata.is_sane_x86_64_image() {
+            return None;
+        }
+        let base = X86GuestVirtAddr::from(pe_metadata.base as usize);
+        let read_u32 = |address: X86GuestVirtAddr| -> Option<u32> {
+            Some(
+                self.read_guest_u8(address).ok()? as u32
+                    | (self.read_guest_u8(address + 1).ok()? as u32) << 8
+                    | (self.read_guest_u8(address + 2).ok()? as u32) << 16
+                    | (self.read_guest_u8(address + 3).ok()? as u32) << 24,
+            )
+        };
+        let rva = u32::try_from(guest_rip.checked_sub(pe_metadata.base)?).ok()?;
+        let section_table =
+            base + pe_metadata.pe_offset as usize + 24 + pe_metadata.optional_header_size as usize;
+
+        for index in 0..pe_metadata.section_count {
+            let section = section_table + index as usize * 40;
+            let name = (0..8).try_fold([0u8; 8], |mut name, offset| {
+                name[offset] = self.read_guest_u8(section + offset).ok()?;
+                Some(name)
+            })?;
+            let virtual_size = read_u32(section + 8)?;
+            let virtual_address = read_u32(section + 12)?;
+            let raw_size = read_u32(section + 16)?;
+            let characteristics = read_u32(section + 36)?;
+            let section_size = virtual_size.max(raw_size);
+            let section_end = virtual_address.checked_add(section_size)?;
+            if virtual_address <= rva && rva < section_end {
+                return Some((
+                    index,
+                    rva,
+                    name,
+                    characteristics,
+                    virtual_address,
+                    section_size,
+                ));
+            }
+        }
+
+        None
     }
 
     fn decode_npt_mmio_access(
@@ -1914,12 +2698,28 @@ impl<H: X86HostOps> SvmVcpu<H> {
                 }
                 SvmExitCode::NPF => {
                     let info = self.nested_page_fault_info()?;
+                    self.nested_page_fault_count = self.nested_page_fault_count.saturating_add(1);
+                    let npf_count = self.nested_page_fault_count;
                     let write = info.access_flags.contains(X86AccessFlags::WRITE);
                     let read = info.access_flags.contains(X86AccessFlags::READ);
-                    if (read || write)
-                        && let Some((mmio_exit, instr_len)) =
-                            self.decode_npt_mmio_access(&exit_info, info.fault_guest_paddr, write)?
-                    {
+                    let decoded = if read || write {
+                        self.decode_npt_mmio_access(&exit_info, info.fault_guest_paddr, write)?
+                    } else {
+                        None
+                    };
+                    if npf_count <= DIAGNOSTIC_NPF_TRACE_LIMIT || npf_count.is_power_of_two() {
+                        info!(
+                            "[HV] SVM NPF sample: faults={} gpa={:#x} access={:?} rip={:#x} \
+                             decoded_mmio={} guest_bytes={:?}",
+                            npf_count,
+                            info.fault_guest_paddr,
+                            info.access_flags,
+                            exit_info.guest_rip,
+                            decoded.is_some(),
+                            self.guest_instruction_bytes(exit_info.guest_rip),
+                        );
+                    }
+                    if let Some((mmio_exit, instr_len)) = decoded {
                         self.advance_rip(instr_len)?;
                         mmio_exit
                     } else {
@@ -1942,6 +2742,53 @@ impl<H: X86HostOps> SvmVcpu<H> {
                     X86VmExit::PreemptionTimer
                 }
                 SvmExitCode::PAUSE => {
+                    self.pause_exit_count = self.pause_exit_count.saturating_add(1);
+                    if self.pause_exit_count == 1 || self.pause_exit_count.is_power_of_two() {
+                        let vmcb = unsafe { self.vmcb.as_vmcb_ref() };
+                        let rflags = vmcb.state.rflags.get();
+                        info!(
+                            "[HV] SVM PAUSE aggregate: pauses={} guest_exits={} port_io={} \
+                             pm_timer={} pci_config={} other={} npf={} guest_rip={:#x}",
+                            self.pause_exit_count,
+                            self.guest_exit_count,
+                            self.port_io_exit_count,
+                            self.pm_timer_io_exit_count,
+                            self.pci_config_io_exit_count,
+                            self.other_port_io_exit_count,
+                            self.nested_page_fault_count,
+                            exit_info.guest_rip,
+                        );
+                        info!(
+                            "[HV] SVM PAUSE state: pauses={} next_rip={:#x} exit_info_2={:#x} \
+                             insn_len={} insn_bytes={:?} guest_bytes={:?} rax={:#x} rcx={:#x} \
+                             rdx={:#x} rflags={:#x} if={} int_state={:#x} pending_events={} \
+                             cr0={:#x} cr3={:#x} efer={:#x} cs_attr={:#x} cs_base={:#x} mode={:?}",
+                            self.pause_exit_count,
+                            exit_info.guest_next_rip,
+                            exit_info.exit_info_2,
+                            vmcb.control.insn_len.get(),
+                            vmcb.control
+                                .insn_bytes
+                                .iter()
+                                .take(vmcb.control.insn_len.get() as usize)
+                                .map(|byte| byte.get())
+                                .collect::<alloc::vec::Vec<_>>(),
+                            self.guest_instruction_bytes(exit_info.guest_rip),
+                            self.regs().rax,
+                            self.regs().rcx,
+                            self.regs().rdx,
+                            rflags,
+                            rflags & RFlags::INTERRUPT_FLAG.bits() != 0,
+                            vmcb.control.int_state.get(),
+                            self.pending_events.len(),
+                            vmcb.state.cr0.get(),
+                            vmcb.state.cr3.get(),
+                            vmcb.state.efer.get(),
+                            vmcb.state.cs.attr.get(),
+                            vmcb.state.cs.base.get(),
+                            self.get_cpu_mode(),
+                        );
+                    }
                     self.advance_rip(2)?;
                     X86VmExit::PreemptionTimer
                 }

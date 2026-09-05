@@ -16,6 +16,7 @@ use crate::{
 };
 
 mod acpi;
+pub(crate) use acpi::DIRECT_ACPI_BASE;
 mod boot_params;
 mod linux;
 mod linux_boot;

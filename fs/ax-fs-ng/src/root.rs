@@ -192,7 +192,9 @@ pub fn init_root(
     let root_spec = RootSpec::parse_bootargs(bootargs);
     let mut disks = collect_disks(block_devs)
         .unwrap_or_else(|error| panic!("failed to initialize block cache: {error:?}"));
+    info!("  discovered {} block device candidate(s)", disks.len());
     let candidates = collect_root_candidates(&disks);
+    info!("  discovered {} root candidate(s)", candidates.len());
     let (selected_disk_index, selected_partition) = select_root_candidate(&candidates, &root_spec)
         .unwrap_or_else(|| panic!("failed to determine root device from available block devices"));
     let selected_disk_pos = disks
@@ -227,10 +229,12 @@ pub fn init_root(
     } else {
         init_filesystem(selected.handle.clone(), region, &description, source)
     };
+    info!("  selected root filesystem mounted from {}", description);
     mount_additional_partitions(&root, &selected, selected_partition);
     for disk in &disks {
         mount_additional_partitions(&root, disk, None);
     }
+    info!("  root filesystem initialization complete");
 }
 
 const SD_NAMES: [&str; 26] = [
@@ -293,6 +297,7 @@ pub fn init_root_from_rdif_sources(
     bootargs: Option<&str>,
 ) {
     let runtime = BlockRuntime::install_from_rdif_sources(block_devs, block_groups);
+    info!("  block runtime installed from RDIF sources");
     init_root(runtime.devices().iter().cloned(), bootargs);
 }
 

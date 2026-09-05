@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use axdevice::*;
 use axdevice_base::{ControllerInputId, InterruptControllerId, InterruptSharing, InterruptTrigger};
+use log::info;
 
 pub(super) const PCI_HOST_NODE: &str = "pci-host";
 pub(super) const PCI_MEMORY_BASE: u64 = 0xc000_0000;
@@ -96,6 +97,9 @@ impl DeviceModel for X86PciHostModel {
                 detail: "resolved graph did not attach PCI topology metadata".into(),
             })?
             .clone();
+        for function in topology.functions() {
+            info!("[HV] x86 PCI topology function: {function:?}");
+        }
         let root = Arc::new(PciRootState::new(topology));
         let binding = Arc::new(PciRootBinding::new(self.host_id.clone(), root.clone()));
         let mut bundle = DeviceBundle::new();

@@ -1,12 +1,19 @@
 //! Core vCPU and nested-paging contract implemented by every target architecture.
 
-use std::{format, vec::Vec};
+use std::{
+    format,
+    sync::atomic::{AtomicU64, Ordering},
+    vec::Vec,
+};
 
 use axaddrspace::NestedPageTableOps;
 use axvm_types::{VmArchPerCpuOps, VmArchVcpuOps, VmVcpuState};
 
 use super::{BoundVcpuExit, VcpuRunAction};
 use crate::{AxVmResult, ax_err, irq::model::PendingVcpuInterrupt};
+
+static DISPATCHED_VCPU_INTERRUPT_COUNT: AtomicU64 = AtomicU64::new(0);
+static LEGACY_PENDING_INTERRUPT_INJECTION_COUNT: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) trait ArchOps {
     type VCpu: VmArchVcpuOps;
@@ -61,6 +68,17 @@ pub(crate) trait ArchOps {
     ) {
         match interrupt {
             crate::vm::PendingInterrupt::Normal(vector) => {
+                let injection_count =
+                    LEGACY_PENDING_INTERRUPT_INJECTION_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+                if injection_count == 1 || injection_count.is_power_of_two() {
+                    info!(
+                        "[HV] legacy vCPU interrupt injection: count={} VM[{}] VCpu[{}] \
+                         vector={vector:#x}",
+                        injection_count,
+                        vcpu.vm_id(),
+                        vcpu.id(),
+                    );
+                }
                 trace!(
                     "Injecting queued interrupt {vector:#x} into VM[{}] VCpu[{}]",
                     vcpu.vm_id(),
@@ -205,7 +223,19 @@ fn inject_drained_interrupts<A: ArchOps>(
     vcpu: &crate::vcpu::AxVCpu<A::VCpu>,
 ) {
     for interrupt in dispatcher.drain(vcpu_id) {
-        if let Err(err) = A::inject_vcpu_interrupt(vcpu, interrupt) {
+        let delivery_count = DISPATCHED_VCPU_INTERRUPT_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+        let result = A::inject_vcpu_interrupt(vcpu, interrupt);
+        if delivery_count == 1 || delivery_count.is_power_of_two() {
+            info!(
+                "[HV] vCPU IRQ delivery sample: delivered={} VM[{}] VCpu[{}] \
+                 interrupt={interrupt:?} backend_queued={}",
+                delivery_count,
+                vm_id,
+                vcpu_id,
+                result.is_ok(),
+            );
+        }
+        if let Err(err) = result {
             warn!("VM[{vm_id}] VCpu[{vcpu_id}] failed to inject interrupt {interrupt:?}: {err:?}");
         }
     }

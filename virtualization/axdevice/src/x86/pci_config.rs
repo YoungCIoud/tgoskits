@@ -1,9 +1,11 @@
 //! x86 PCI configuration-mechanism #1 and memory-aperture adapters.
 
 use alloc::{boxed::Box, sync::Arc};
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use ax_sync::SpinLock;
 use axdevice_base::*;
+use log::info;
 
 use crate::{
     ConfigOffset, DeviceLifecycle, DeviceManagerResult, PciBdf, PciRootBinding, PciSegment,
@@ -27,6 +29,9 @@ pub struct X86PciConfigFrontend {
     address: SpinLock<u32>,
     binding: Arc<PciRootBinding>,
     resources: Box<[Resource]>,
+    address_write_count: AtomicU64,
+    data_read_count: AtomicU64,
+    data_write_count: AtomicU64,
 }
 
 impl X86PciConfigFrontend {
@@ -44,6 +49,9 @@ impl X86PciConfigFrontend {
                 size: Self::PORT_SIZE
             }]
             .into_boxed_slice(),
+            address_write_count: AtomicU64::new(0),
+            data_read_count: AtomicU64::new(0),
+            data_write_count: AtomicU64::new(0),
         }
     }
 
@@ -216,7 +224,9 @@ impl Device for X86PciConfigFrontend {
         if (CONFIG_DATA_PORT..CONFIG_DATA_PORT + 4).contains(&port) {
             let offset = usize::from(port - CONFIG_DATA_PORT);
             let size = access.width().size();
-            return match self.selection(offset, size)? {
+            let count = self.data_read_count.fetch_add(1, Ordering::Relaxed) + 1;
+            let selection = self.selection(offset, size)?;
+            let result = match selection {
                 None => Ok(all_ones(size)),
                 Some((bdf, register)) => self.read_data_window(
                     ConfigWindow {
@@ -229,6 +239,26 @@ impl Device for X86PciConfigFrontend {
                     context,
                 ),
             };
+            if count <= 128 || count.is_power_of_two() {
+                info!(
+                    "[HV] x86 PCI config read sample: reads={} port={:#x} width={} \
+                     selection={selection:?} result={result:?}",
+                    count, port, size,
+                );
+            }
+            if let Some((bdf, register)) = selection
+                && bdf.device() == 1
+                && bdf.function() == 0
+            {
+                info!(
+                    "[HV] x86 PCI endpoint config read: bdf={} offset={:#x} width={} \
+                     result={result:?}",
+                    bdf,
+                    register.value(),
+                    size,
+                );
+            }
+            return result;
         }
         Err(DeviceError::OutOfRange {
             addr: access.address(),
@@ -252,12 +282,34 @@ impl Device for X86PciConfigFrontend {
             let mut bytes = address.to_le_bytes();
             write_bytes(&mut bytes, offset, size, value);
             *address = u32::from_le_bytes(bytes);
+            let count = self.address_write_count.fetch_add(1, Ordering::Relaxed) + 1;
+            if count <= 128 || count.is_power_of_two() {
+                let enabled = *address & CONFIG_ADDRESS_ENABLE != 0;
+                let bus = (*address >> 16) & 0xff;
+                let device = (*address >> 11) & 0x1f;
+                let function = (*address >> 8) & 0x7;
+                let register = *address & 0xfc;
+                info!(
+                    "[HV] x86 PCI config address sample: writes={} value={:#x} enabled={} \
+                     bdf={:02x}:{:02x}.{} register={:#x}",
+                    count, *address, enabled, bus, device, function, register,
+                );
+            }
             return Ok(());
         }
         if (CONFIG_DATA_PORT..CONFIG_DATA_PORT + 4).contains(&port) {
             let offset = usize::from(port - CONFIG_DATA_PORT);
             let size = access.width().size();
-            return match self.selection(offset, size)? {
+            let count = self.data_write_count.fetch_add(1, Ordering::Relaxed) + 1;
+            let selection = self.selection(offset, size)?;
+            if count <= 128 || count.is_power_of_two() {
+                info!(
+                    "[HV] x86 PCI config write sample: writes={} port={:#x} width={} value={:#x} \
+                     selection={selection:?}",
+                    count, port, size, value,
+                );
+            }
+            let result = match selection {
                 None => Ok(()),
                 Some((bdf, register)) => self.write_data_window(
                     ConfigWindow {
@@ -271,6 +323,20 @@ impl Device for X86PciConfigFrontend {
                     context,
                 ),
             };
+            if let Some((bdf, register)) = selection
+                && bdf.device() == 1
+                && bdf.function() == 0
+            {
+                info!(
+                    "[HV] x86 PCI endpoint config write: bdf={} offset={:#x} width={} value={:#x} \
+                     result={result:?}",
+                    bdf,
+                    register.value(),
+                    size,
+                    value,
+                );
+            }
+            return result;
         }
         Err(DeviceError::OutOfRange {
             addr: access.address(),
@@ -282,6 +348,8 @@ impl Device for X86PciConfigFrontend {
 pub struct PciMemoryApertureDevice {
     binding: Arc<PciRootBinding>,
     resources: Box<[Resource]>,
+    read_count: AtomicU64,
+    write_count: AtomicU64,
 }
 impl PciMemoryApertureDevice {
     /// Creates the aperture adapter from the graph-resolved range.
@@ -289,6 +357,8 @@ impl PciMemoryApertureDevice {
         Self {
             binding,
             resources: alloc::vec![Resource::MmioRange { base, size }].into_boxed_slice(),
+            read_count: AtomicU64::new(0),
+            write_count: AtomicU64::new(0),
         }
     }
 }
@@ -305,13 +375,27 @@ impl Device for PciMemoryApertureDevice {
                 addr: access.address(),
             });
         }
-        match self
+        let count = self.read_count.fetch_add(1, Ordering::Relaxed) + 1;
+        let result = self
             .binding
             .read_bar_with_context(access.address(), access.width(), context)
-        {
-            Err(DeviceError::NotFound) => Ok(all_ones(access.width().size())),
-            result => result,
+            .map_or_else(
+                |error| match error {
+                    DeviceError::NotFound => Ok(all_ones(access.width().size())),
+                    error => Err(error),
+                },
+                Ok,
+            );
+        if count <= 128 || count.is_power_of_two() {
+            info!(
+                "[HV] x86 PCI MMIO aperture read sample: reads={} addr={:#x} width={} \
+                 result={result:?}",
+                count,
+                access.address(),
+                access.width().size(),
+            );
         }
+        result
     }
     fn write(
         &self,
@@ -324,13 +408,28 @@ impl Device for PciMemoryApertureDevice {
                 addr: access.address(),
             });
         }
-        match self
+        let count = self.write_count.fetch_add(1, Ordering::Relaxed) + 1;
+        let result = self
             .binding
             .write_bar_with_context(access.address(), access.width(), value, context)
-        {
-            Err(DeviceError::NotFound) => Ok(()),
-            result => result,
+            .map_or_else(
+                |error| match error {
+                    DeviceError::NotFound => Ok(()),
+                    error => Err(error),
+                },
+                Ok,
+            );
+        if count <= 128 || count.is_power_of_two() {
+            info!(
+                "[HV] x86 PCI MMIO aperture write sample: writes={} addr={:#x} width={} \
+                 value={:#x} result={result:?}",
+                count,
+                access.address(),
+                access.width().size(),
+                value,
+            );
         }
+        result
     }
 }
 

@@ -1,7 +1,9 @@
 use alloc::sync::Arc;
+use core::sync::atomic::Ordering;
 
 use axdevice_base::{AccessWidth, DeviceError, DeviceResult};
 use axvm_types::GuestPhysAddr;
+use log::info;
 
 use super::{
     COMMON_CONFIG_SIZE, CONFIG_GENERATION, DEVICE_CONFIG_OFFSET, DEVICE_FEATURE,
@@ -54,6 +56,15 @@ impl<D: super::VirtioDeviceCore> VirtioPciTransport<D> {
         offset: u64,
         width: AccessWidth,
     ) -> DeviceResult<(u64, InterruptTransitionRequest)> {
+        let count = self.bar_read_count.fetch_add(1, Ordering::Relaxed) + 1;
+        if count.is_power_of_two() {
+            info!(
+                "[HV] VirtIO PCI BAR read sample: reads={} offset={:#x} width={}",
+                count,
+                offset,
+                width.size()
+            );
+        }
         if offset == ISR_CONFIG_OFFSET {
             require_width(width, AccessWidth::Byte)?;
             let activity = self.acquire_control_activity()?;
@@ -86,6 +97,18 @@ impl<D: super::VirtioDeviceCore> VirtioPciTransport<D> {
         dma_enabled: bool,
         memory: &mut dyn GuestMemory,
     ) -> DeviceResult<VirtioPciWriteOutcome> {
+        let count = self.bar_write_count.fetch_add(1, Ordering::Relaxed) + 1;
+        if count.is_power_of_two() {
+            info!(
+                "[HV] VirtIO PCI BAR write sample: writes={} offset={:#x} width={} value={:#x} \
+                 dma_enabled={}",
+                count,
+                offset,
+                width.size(),
+                value,
+                dma_enabled
+            );
+        }
         self.write_mmio_with_dma(offset, width, value, dma_enabled, memory)
     }
 

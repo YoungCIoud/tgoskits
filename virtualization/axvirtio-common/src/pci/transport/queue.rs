@@ -1,6 +1,8 @@
 use alloc::sync::Arc;
+use core::sync::atomic::Ordering;
 
 use axdevice_base::{DeviceError, DeviceResult};
+use log::info;
 
 use super::{
     ActivityPermit, InterruptPublicationKind, InterruptPublicationRequest, QueueNotification,
@@ -22,28 +24,33 @@ impl<D: VirtioDeviceCore> VirtioPciTransport<D> {
         dma_enabled: bool,
         memory: &mut dyn GuestMemory,
     ) -> DeviceResult<VirtioPciWriteOutcome> {
-        let selected = {
+        let notify_count = self.queue_notify_count.fetch_add(1, Ordering::Relaxed) + 1;
+        let (status, queue_enabled, processing, generation) = {
             let state = self.state.lock();
             if queue_index as usize >= state.queues.len() {
                 return Err(invalid_queue(queue_index));
             }
-            if !queue_processing_enabled(state.status) {
-                return Ok(self.idle_notification());
-            }
-            if !state.queues[queue_index as usize].enabled {
-                return Ok(self.idle_notification());
-            }
-            if state.queues[queue_index as usize].processing {
-                return Ok(self.idle_notification());
-            }
-            if !dma_enabled {
-                return Ok(self.idle_notification());
-            }
+            let queue = &state.queues[queue_index as usize];
             (
-                queue_index as usize,
-                VirtioQueueGeneration(state.queue_generation),
+                state.status,
+                queue.enabled,
+                queue.processing,
+                state.queue_generation,
             )
         };
+
+        if notify_count.is_power_of_two() {
+            info!(
+                "[HV] VirtIO PCI queue notify sample: calls={} queue={} status={:#x} enabled={} \
+                 processing={} dma_enabled={}",
+                notify_count, queue_index, status, queue_enabled, processing, dma_enabled
+            );
+        }
+        if !queue_processing_enabled(status) || !queue_enabled || processing || !dma_enabled {
+            return Ok(self.idle_notification());
+        }
+
+        let selected = (queue_index as usize, VirtioQueueGeneration(generation));
 
         let (selected, generation) = selected;
         #[cfg(test)]
@@ -104,6 +111,14 @@ impl<D: VirtioDeviceCore> VirtioPciTransport<D> {
                 return Ok(fault);
             }
         };
+        let completed_count = self.queue_completed_count.fetch_add(1, Ordering::Relaxed) + 1;
+        if completed_count.is_power_of_two() {
+            info!(
+                "[HV] VirtIO PCI queue core outcome sample: completed={} notify_call={} \
+                 outcome={outcome:?}",
+                completed_count, notify_count
+            );
+        }
         if matches!(outcome, QueueNotifyOutcome::Deferred { .. }) {
             let fault = self.queue_fault(
                 DeviceError::Unsupported {
@@ -140,6 +155,13 @@ impl<D: VirtioDeviceCore> VirtioPciTransport<D> {
     }
 
     fn queue_fault(&self, error: DeviceError, activity: ActivityPermit) -> VirtioPciWriteOutcome {
+        let fault_count = self.queue_fault_count.fetch_add(1, Ordering::Relaxed) + 1;
+        if fault_count.is_power_of_two() {
+            log::warn!(
+                "[HV] VirtIO PCI queue fault sample: faults={} error={error:?}",
+                fault_count
+            );
+        }
         let report_interrupt = {
             let mut state = self.state.lock();
             state.device_needs_reset = true;

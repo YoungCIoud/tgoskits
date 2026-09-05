@@ -1,3 +1,5 @@
+use core::sync::atomic::{AtomicU64, Ordering};
+
 use crate::{lock::SpinMutex as Mutex, *};
 
 const MASTER_COMMAND: u16 = 0x20;
@@ -5,6 +7,10 @@ const MASTER_DATA: u16 = 0x21;
 const SLAVE_COMMAND: u16 = 0xa0;
 const SLAVE_DATA: u16 = 0xa1;
 const CASCADE_IRQ: u8 = 2;
+
+static PIC_READ_COUNT: AtomicU64 = AtomicU64::new(0);
+static PIC_WRITE_COUNT: AtomicU64 = AtomicU64::new(0);
+static PIC_EOI_COUNT: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, Debug)]
 struct PicChip {
@@ -216,6 +222,8 @@ impl PicInterruptClaim {
 /// Guest-owned pair of legacy 8259-compatible interrupt controllers.
 pub struct EmulatedPic {
     state: Mutex<PicState>,
+    claim_attempt_count: AtomicU64,
+    claim_no_result_count: AtomicU64,
 }
 
 impl EmulatedPic {
@@ -223,6 +231,8 @@ impl EmulatedPic {
     pub const fn new() -> Self {
         Self {
             state: Mutex::new(PicState::new()),
+            claim_attempt_count: AtomicU64::new(0),
+            claim_no_result_count: AtomicU64::new(0),
         }
     }
 
@@ -249,7 +259,29 @@ impl EmulatedPic {
 
     /// Latches one legacy IRQ edge and claims an immediately deliverable interrupt.
     pub fn claim_irq(&self, irq: u8) -> Option<PicInterruptClaim> {
-        self.state.lock().claim_irq(irq)
+        let mut state = self.state.lock();
+        let claim = state.claim_irq(irq);
+        let attempts = self.claim_attempt_count.fetch_add(1, Ordering::Relaxed) + 1;
+        if attempts == 1 || attempts.is_power_of_two() {
+            info!(
+                "[HV] PIC claim sample: attempts={} irq={} result={:?} master={:?} slave={:?}",
+                attempts,
+                irq,
+                claim.as_ref().map(PicInterruptClaim::vector),
+                state.master,
+                state.slave,
+            );
+        }
+        if claim.is_none() {
+            let no_result = self.claim_no_result_count.fetch_add(1, Ordering::Relaxed) + 1;
+            if no_result == 1 || no_result.is_power_of_two() {
+                info!(
+                    "[HV] PIC claim unavailable: no_result={} irq={} master={:?} slave={:?}",
+                    no_result, irq, state.master, state.slave,
+                );
+            }
+        }
+        claim
     }
 
     /// Claims a request that became deliverable after a guest PIC state change.
@@ -267,14 +299,28 @@ impl EmulatedPic {
         if width != X86AccessWidth::Byte {
             return Err(X86VlapicError::Unsupported);
         }
-        let state = self.state.lock();
-        let value = match port.number() {
-            MASTER_COMMAND => state.master.read_command(),
-            MASTER_DATA => state.master.mask,
-            SLAVE_COMMAND => state.slave.read_command(),
-            SLAVE_DATA => state.slave.mask,
-            _ => return Err(X86VlapicError::Unsupported),
+        let (value, master, slave) = {
+            let state = self.state.lock();
+            let value = match port.number() {
+                MASTER_COMMAND => state.master.read_command(),
+                MASTER_DATA => state.master.mask,
+                SLAVE_COMMAND => state.slave.read_command(),
+                SLAVE_DATA => state.slave.mask,
+                _ => return Err(X86VlapicError::Unsupported),
+            };
+            (value, state.master, state.slave)
         };
+        let reads = PIC_READ_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+        if reads <= 16 || reads.is_power_of_two() {
+            info!(
+                "[HV] PIC read: count={} port={:#x} value={:#x} master={:?} slave={:?}",
+                reads,
+                port.number(),
+                value,
+                master,
+                slave,
+            );
+        }
         Ok(value as usize)
     }
 
@@ -288,13 +334,40 @@ impl EmulatedPic {
         if width != X86AccessWidth::Byte {
             return Err(X86VlapicError::Unsupported);
         }
-        let mut state = self.state.lock();
-        match port.number() {
-            MASTER_COMMAND => state.master.command(value as u8),
-            MASTER_DATA => state.master.data(value as u8),
-            SLAVE_COMMAND => state.slave.command(value as u8),
-            SLAVE_DATA => state.slave.data(value as u8),
-            _ => return Err(X86VlapicError::Unsupported),
+        let value = value as u8;
+        let (before_master, before_slave, after_master, after_slave) = {
+            let mut state = self.state.lock();
+            let before_master = state.master;
+            let before_slave = state.slave;
+            match port.number() {
+                MASTER_COMMAND => state.master.command(value),
+                MASTER_DATA => state.master.data(value),
+                SLAVE_COMMAND => state.slave.command(value),
+                SLAVE_DATA => state.slave.data(value),
+                _ => return Err(X86VlapicError::Unsupported),
+            }
+            (before_master, before_slave, state.master, state.slave)
+        };
+        let writes = PIC_WRITE_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+        if writes <= 16 || writes.is_power_of_two() {
+            info!(
+                "[HV] PIC write: count={} port={:#x} value={value:#x} \
+                 before_master={before_master:?} before_slave={before_slave:?} \
+                 after_master={after_master:?} after_slave={after_slave:?}",
+                writes,
+                port.number(),
+            );
+        }
+        if matches!(port.number(), MASTER_COMMAND | SLAVE_COMMAND) && value & 0x20 != 0 {
+            let eois = PIC_EOI_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+            if eois <= 8 || eois.is_power_of_two() {
+                info!(
+                    "[HV] PIC EOI: count={} port={:#x} value={value:#x} master={after_master:?} \
+                     slave={after_slave:?}",
+                    eois,
+                    port.number(),
+                );
+            }
         }
         Ok(())
     }
