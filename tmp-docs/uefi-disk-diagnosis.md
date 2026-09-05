@@ -1035,6 +1035,27 @@ base 与 `tracing` 两个检查均通过。当前工作环境的 `/dev/kvm` 不�
 
 配置入口为 `test-suit/axvisor/experimental/qemu-uefi-disk/uefi-disk/qemu-x86_64-vmx.toml` 和 `qemu-x86_64-svm.toml`。这项保护的判定是：若仍发生外层复位，CI 应在一次启动后结束并保留 reset 证据；若能够进入 guest，则应继续观察 `Creating VM[1]`、`VM[1] boot success`、PCI/EPT 或 NPF 样本以及最终 guest marker。`cargo xtask axvisor test qemu --list --arch x86_64 --test-group experimental` 已确认两个实验 case 仍能被发现。
 
+### 3.42 为 secondary 初始化增加阶段状态
+
+本轮日志仍只显示 `SMP secondary 1: entered rust_main_secondary`，而没有显示其后的边界日志。为区分“日志没有刷出”和“secondary 在某个初始化调用中复位”，在 `os/arceos/modules/axruntime/src/mp.rs` 增加了每个 CPU 的原子阶段状态。状态在关键调用前后更新，主 CPU 等待 secondary 发布入口时以幂次间隔输出 `spins`、`entered` 和 `stage`，不会在正常启动中持续刷屏。
+
+阶段编号按以下顺序解释：
+
+```text
+1  entered rust_main_secondary
+2/3   ax_hal::percpu::init_secondary 开始/完成
+4/5   ax_alloc::init_percpu_slab 开始/完成
+6/7   ax_hal::init_early_secondary 开始/完成
+8  ENTERED_CPUS 已发布
+9/10  ax_mm::init_memory_management_secondary 开始/完成（paging）
+11/12 ax_hal::init_later_secondary 开始/完成
+13/14 scheduler 初始化开始/完成
+15/16 本地 IRQ 初始化开始/完成
+17 INITED_CPUS 已发布
+```
+
+因此，如果下一轮看到主 CPU 的 `waiting for secondary` 日志，`stage` 就能把故障边界定位到具体调用前后；如果仍然只有 secondary 入口而没有主 CPU等待摘要，则说明复位发生得很早，或当前运行使用的提交没有包含这项诊断代码。阶段状态本身不改变启动顺序和设备模型，且在发布 `ENTERED_CPUS`/`INITED_CPUS` 前先写入，避免主 CPU 观察到计数已更新而阶段仍停留在旧值。
+
 ## 4. 当前结论
 
 ### 4.1 已证实内容
