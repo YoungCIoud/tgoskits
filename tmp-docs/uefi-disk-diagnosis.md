@@ -1056,6 +1056,28 @@ base 与 `tracing` 两个检查均通过。当前工作环境的 `/dev/kvm` 不�
 
 因此，如果下一轮看到主 CPU 的 `waiting for secondary` 日志，`stage` 就能把故障边界定位到具体调用前后；如果仍然只有 secondary 入口而没有主 CPU等待摘要，则说明复位发生得很早，或当前运行使用的提交没有包含这项诊断代码。阶段状态本身不改变启动顺序和设备模型，且在发布 `ENTERED_CPUS`/`INITED_CPUS` 前先写入，避免主 CPU 观察到计数已更新而阶段仍停留在旧值。
 
+### 3.43 最新远端日志仍重复启动：尚未使用单次复位保护
+
+用户提供的最新远端日志从 `Jumping to main entry point` 开始，随后完整经过一次 ArceOS/Axvisor 启动和 secondary CPU 入口，最后再次出现 `Jumping to main entry point` 与第二轮 ArceOS 启动画面。两轮都只看到 `SMP secondary 1: entered rust_main_secondary`，没有看到 `per-CPU state initialized`、`early platform init complete`、`Starting virtualization`、`Creating VM[1]` 或 guest 级日志。因此这轮仍然只证明发生了外层启动重入，不能把原因归结为 PM timer、vPIC wire mode、PCI 或 VirtIO。
+
+本地提交关系为：
+
+```text
+3c68558bb (HEAD) debug(axruntime): trace secondary init stages
+2a909d183        test(axvisor): stop UEFI case after first reset
+9bce2cfc4 (origin/exp/uefi) debug(axruntime): avoid pre-init percpu probe
+```
+
+也就是说，本地远端跟踪引用仍落后两个诊断提交；这只能说明本地没有记录这两个提交已经推送，不能单独证明服务器上的分支一定没有更新，但需要在 CI 日志中显式核对 `git rev-parse HEAD`。此前本地带有 `-no-reboot` 的运行生成了如下实际 QEMU 命令：
+
+```text
+qemu-system-x86_64 ... -no-reboot -d cpu_reset,guest_errors ...
+```
+
+该运行在第一次 reset 后约 10 秒退出，Axvisor 测试报告为 `QEMU stopped without matching a configured success regex`；对应的 QEMU debug 输出包含 `CPU Reset (CPU 0)` 和 `CPU Reset (CPU 1)`。这证明 `-no-reboot` 能阻止相同类型的重复启动。因而当前远端循环的首要未决项是确认实际 checkout 是否至少包含 `2a909d183`，而不是继续修改 guest 设备模型。
+
+下一轮使用 `3c68558bb` 或其后继提交时，判读顺序为：若仍出现第二个启动画面，先检查 QEMU 命令是否含 `-no-reboot`；若只启动一次并出现 `waiting for secondary`，使用 `stage` 映射定位 secondary 初始化边界；只有出现 `secondary startup complete` 和 `Starting virtualization` 后，才继续使用 guest PCI、NPF/EPT、vPIC 和 PM timer 统计。
+
 ## 4. 当前结论
 
 ### 4.1 已证实内容
