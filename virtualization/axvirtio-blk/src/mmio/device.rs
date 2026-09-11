@@ -156,6 +156,7 @@ impl<B: BlockBackend, T: GuestMemoryAccessor + Clone> VirtioMmioBlockDevice<B, T
                 // A transport reset invalidates every in-flight descriptor,
                 // including a deferred request that was removed from avail.
                 self.clear_pending_head();
+                self.core.reset();
                 Ok(BlockDeviceEvent::Reset)
             }
             MmioWriteAction::InterruptPending => Ok(BlockDeviceEvent::InterruptPending),
@@ -277,7 +278,7 @@ impl<B: BlockBackend, T: GuestMemoryAccessor + Clone> VirtioMmioBlockDevice<B, T
 #[cfg(test)]
 mod tests {
     use alloc::{sync::Arc, vec, vec::Vec};
-    use core::sync::atomic::{AtomicUsize, Ordering};
+    use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use axvirtio_common::{
         GuestMemory, NoGuestMemoryAccessor, VirtioError,
@@ -294,8 +295,6 @@ mod tests {
     const STATUS: usize = 0x800;
     const VIRTQ_DESC_F_WRITE: u16 = 2;
     const IOERR: u8 = 1;
-
-    static WRITE_CALLS: AtomicUsize = AtomicUsize::new(0);
 
     struct TestMemory(Vec<u8>);
 
@@ -340,9 +339,26 @@ mod tests {
         }
     }
 
-    struct TestBackend;
+    #[derive(Default)]
+    struct TestBackend {
+        reset: Arc<AtomicBool>,
+        writes: Arc<AtomicUsize>,
+        ready: Arc<AtomicBool>,
+        cancellations: Arc<AtomicUsize>,
+    }
 
     impl BlockBackend for TestBackend {
+        fn pending_request_ready(&self) -> bool {
+            self.ready.load(Ordering::Relaxed)
+        }
+
+        fn cancel_pending_request(&self) {
+            self.cancellations.fetch_add(1, Ordering::Relaxed);
+        }
+
+        fn reset(&self) {
+            self.reset.store(true, Ordering::Relaxed);
+        }
         fn read(&self, sector: u64, buffer: &mut [u8]) -> VirtioResult<usize> {
             if sector >= 8 {
                 return Err(VirtioError::InvalidSector);
@@ -352,7 +368,10 @@ mod tests {
         }
 
         fn write(&self, sector: u64, buffer: &[u8]) -> VirtioResult<usize> {
-            WRITE_CALLS.fetch_add(1, Ordering::Relaxed);
+            self.writes.fetch_add(1, Ordering::Relaxed);
+            if sector == 1 {
+                return Err(VirtioError::WouldBlock);
+            }
             if sector >= 8 {
                 return Err(VirtioError::InvalidSector);
             }
@@ -372,8 +391,21 @@ mod tests {
         VirtioQueue<NoGuestMemoryAccessor>,
         TestMemory,
     ) {
+        fixture_with_backend(data_len, sector, TestBackend::default(), false)
+    }
+
+    fn fixture_with_backend(
+        data_len: u32,
+        sector: u64,
+        backend: TestBackend,
+        read_only: bool,
+    ) -> (
+        VirtioMmioBlockDevice<TestBackend, NoGuestMemoryAccessor>,
+        VirtioQueue<NoGuestMemoryAccessor>,
+        TestMemory,
+    ) {
         let config = VirtioBlockConfig {
-            read_only: true,
+            read_only,
             capacity: 8,
             size_max: 512,
             seg_max: 1,
@@ -382,7 +414,7 @@ mod tests {
         let device = VirtioMmioBlockDevice::new(
             GuestPhysAddr::from(0x0a00_0000),
             0x200,
-            TestBackend,
+            backend,
             config,
             NoGuestMemoryAccessor,
         )
@@ -431,20 +463,23 @@ mod tests {
 
     #[test]
     fn read_only_policy_rejects_out_without_calling_backend() {
-        WRITE_CALLS.store(0, Ordering::Relaxed);
-        let (device, queue, mut memory) = fixture(512, 0);
+        let backend = TestBackend::default();
+        let writes = backend.writes.clone();
+        let (device, queue, mut memory) = fixture_with_backend(512, 0, backend, true);
 
         assert_eq!(
             device.core.process_request(&queue, 0, &mut memory),
             Ok(Some(1))
         );
         assert_eq!(memory.0[STATUS], IOERR);
-        assert_eq!(WRITE_CALLS.load(Ordering::Relaxed), 0);
+        assert_eq!(writes.load(Ordering::Relaxed), 0);
     }
 
     #[test]
     fn reset_discards_deferred_request_head() {
-        let (device, _queue, mut memory) = fixture(64, 0);
+        let backend = TestBackend::default();
+        let reset_observed = backend.reset.clone();
+        let (device, _queue, mut memory) = fixture_with_backend(64, 0, backend, false);
         device.store_pending_head(3);
 
         let event = device.mmio_write_with_memory(
@@ -455,7 +490,85 @@ mod tests {
         );
 
         assert_eq!(event, Ok(BlockDeviceEvent::Reset));
+        assert_eq!(*device.pending_head.lock(), None);
+        assert!(reset_observed.load(core::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[test]
+    fn completed_request_interrupt_survives_a_later_blocked_request() {
+        let backend = TestBackend::default();
+        let ready = backend.ready.clone();
+        let writes = backend.writes.clone();
+        let cancellations = backend.cancellations.clone();
+        let (device, _queue, mut memory) = fixture_with_backend(512, 0, backend, false);
+        device.set_status(crate::constants::VIRTIO_STATUS_DRIVER_OK);
+        {
+            let mut queues = device.state.queues_lock();
+            let queue = &mut queues[0];
+            queue.set_size(8).unwrap();
+            queue
+                .set_desc_table_addr(GuestPhysAddr::from(DESC_TABLE))
+                .unwrap();
+            queue
+                .set_avail_ring_addr(GuestPhysAddr::from(AVAIL_RING))
+                .unwrap();
+            queue
+                .set_used_ring_addr(GuestPhysAddr::from(USED_RING))
+                .unwrap();
+            queue.set_ready(true);
+            queue.event_idx_enabled = true;
+        }
+        memory.set_descriptor(
+            3,
+            HEADER + 32,
+            crate::block::VIRTIO_BLK_REQUEST_HEADER_SIZE,
+            VIRTQ_DESC_F_NEXT,
+            4,
+        );
+        memory.set_descriptor(4, DATA + 512, 512, VIRTQ_DESC_F_NEXT, 5);
+        memory.set_descriptor(5, STATUS + 1, 1, VIRTQ_DESC_F_WRITE, 0);
+        memory.0[HEADER + 32..HEADER + 36].copy_from_slice(&VIRTIO_BLK_T_OUT.to_le_bytes());
+        memory.0[HEADER + 40..HEADER + 48].copy_from_slice(&1_u64.to_le_bytes());
+        memory.0[AVAIL_RING + 2..AVAIL_RING + 4].copy_from_slice(&2_u16.to_le_bytes());
+        memory.0[AVAIL_RING + 6..AVAIL_RING + 8].copy_from_slice(&3_u16.to_le_bytes());
+        assert_eq!(
+            device.handle_queue_notify(0, &mut memory),
+            Ok(BlockDeviceEvent::QueuePending(0))
+        );
+        assert_eq!(*device.pending_head.lock(), Some(3));
+        assert_eq!(
+            u16::from_le_bytes(memory.0[USED_RING + 2..USED_RING + 4].try_into().unwrap()),
+            1
+        );
+        assert_ne!(
+            device.interrupt_status(),
+            0,
+            "the completed head still requires its EVENT_IDX interrupt"
+        );
+        assert_eq!(cancellations.load(Ordering::Relaxed), 1);
+        let calls = writes.load(Ordering::Relaxed);
+        assert_eq!(
+            device.process_pending_queue(0, &mut memory),
+            Ok(BlockDeviceEvent::QueuePending(0))
+        );
+        assert_eq!(
+            writes.load(Ordering::Relaxed),
+            calls,
+            "an unready backend must not be retried"
+        );
+        assert_eq!(cancellations.load(Ordering::Relaxed), 1);
+
+        // A retained head may become malformed before retry. Retire its old
+        // backend operation even when descriptor validation fails before I/O.
+        ready.store(true, Ordering::Relaxed);
+        memory.set_descriptor(3, HEADER + 32, 0, VIRTQ_DESC_F_NEXT, 4);
+        device.process_pending_queue(0, &mut memory).unwrap();
         assert_eq!(device.take_pending_head(), None);
+        assert_eq!(cancellations.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            u16::from_le_bytes(memory.0[USED_RING + 2..USED_RING + 4].try_into().unwrap()),
+            2
+        );
     }
 
     #[test]

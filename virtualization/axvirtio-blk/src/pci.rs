@@ -94,6 +94,11 @@ impl<B: BlockBackend> VirtioDeviceCore for VirtioBlockPciAdapter<B> {
             .map_err(|error| map_virtio_error(error, "process VirtIO PCI block queue"))
     }
 
+    fn reset(&self) -> DeviceResult {
+        self.core.reset();
+        Ok(())
+    }
+
     fn requires_deferred_processing(&self) -> bool {
         self.core.requires_deferred_processing()
     }

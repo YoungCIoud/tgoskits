@@ -71,6 +71,11 @@ impl<B: BlockBackend> VirtioBlockRequestCore<B> {
         self.backend.requires_deferred_processing()
     }
 
+    /// Invalidates backend work when the owning transport resets its queues.
+    pub fn reset(&self) {
+        self.backend.reset();
+    }
+
     /// Services every request currently available on `queue`.
     ///
     /// A request that returns [`VirtioError::WouldBlock`] is returned to the
@@ -91,6 +96,14 @@ impl<B: BlockBackend> VirtioBlockRequestCore<B> {
         let mut completed = false;
         let mut notify = false;
         let mut pending_head = pending_head;
+        if let Some(head) = pending_head
+            && !self.backend.pending_request_ready()
+        {
+            return Ok(BlockQueueOutcome::Deferred {
+                pending_head: head,
+                notify: false,
+            });
+        }
 
         loop {
             let head = if let Some(head) = pending_head.take() {
@@ -130,6 +143,21 @@ impl<B: BlockBackend> VirtioBlockRequestCore<B> {
     }
 
     pub(crate) fn process_request<T: GuestMemoryAccessor + Clone>(
+        &self,
+        queue: &VirtioQueue<T>,
+        head: u16,
+        memory: &mut dyn GuestMemory,
+    ) -> VirtioResult<Option<u32>> {
+        let result = self.process_request_inner(queue, head, memory);
+        // Descriptor or memory validation can fail before reaching the backend.
+        // Retire its old operation before returning this head to the guest.
+        if !matches!(result, Ok(None)) {
+            self.backend.cancel_pending_request();
+        }
+        result
+    }
+
+    fn process_request_inner<T: GuestMemoryAccessor + Clone>(
         &self,
         queue: &VirtioQueue<T>,
         head: u16,
