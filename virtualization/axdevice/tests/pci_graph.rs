@@ -1,3 +1,5 @@
+extern crate ax_runtime as _;
+
 use std::sync::Arc;
 
 use axdevice::*;

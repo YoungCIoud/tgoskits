@@ -1375,6 +1375,7 @@ dependencies = [
 name = "axdevice"
 version = "0.7.0"
 dependencies = [
+ "ax-runtime",
  "ax-sync",
  "axdevice_base",
  "axvm-types",
@@ -1598,6 +1599,7 @@ name = "axvirtio-common"
 version = "0.2.1"
 dependencies = [
  "ax-memory-addr",
+ "ax-runtime",
  "ax-sync",
  "axaddrspace",
  "axdevice_base",

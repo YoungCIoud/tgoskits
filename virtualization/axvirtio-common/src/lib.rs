@@ -8,6 +8,8 @@
 
 extern crate alloc;
 #[cfg(test)]
+extern crate ax_runtime as _;
+#[cfg(test)]
 extern crate std;
 
 /// Re-export commonly used modules
