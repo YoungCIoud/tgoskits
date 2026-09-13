@@ -134,7 +134,14 @@ impl<H: host::X86VlapicHostOps> EmulatedLocalApic<H> {
 
     /// Returns whether a fixed interrupt passes the local APIC priority.
     pub fn can_accept_interrupt(&self, vector: u8) -> bool {
-        self.get_vlapic_regs().can_accept_interrupt(vector)
+        let ppr = self.processor_priority();
+        self.get_vlapic_regs()
+            .can_accept_interrupt_with_priority(vector, ppr)
+    }
+
+    /// Returns the current local APIC processor-priority register value.
+    pub fn processor_priority(&self) -> u8 {
+        self.get_vlapic_regs().processor_priority()
     }
 
     /// Returns whether the local APIC timer has an edge awaiting vCPU entry.

@@ -577,6 +577,10 @@ pub fn inject_pending_ioapic_irq_after_eoi(vm: &VMRef, vcpu: &VCpuRef, vector: u
     else {
         return;
     };
+    info!(
+        "[x86-ioapic-diag] guest EOI vector={vector:#x} gsi={} pending={:?}",
+        eoi.gsi, eoi.pending
+    );
     let pending = eoi.pending;
     if vm.uses_passthrough_address_space()
         && should_rearm_forwarded_host_gsi_after_eoi(pending)
@@ -589,9 +593,9 @@ pub fn inject_pending_ioapic_irq_after_eoi(vm: &VMRef, vcpu: &VCpuRef, vector: u
         return;
     };
 
-    trace!(
-        "Injecting pending x86 IOAPIC level IRQ vector {:#x} after EOI {vector:#x}",
-        irq.vector
+    info!(
+        "[x86-ioapic-diag] requeue pending vector={:#x} level={} after EOI {vector:#x}",
+        irq.vector, irq.level_triggered,
     );
     vcpu.get_arch_vcpu()
         .inject_interrupt_with_trigger(

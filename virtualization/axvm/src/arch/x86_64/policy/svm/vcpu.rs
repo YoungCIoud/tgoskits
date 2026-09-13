@@ -134,6 +134,11 @@ pub struct SvmVcpu<H: X86HostOps, M: ControlMemory> {
     reinjection_event: Option<PendingEvent>,
     /// Guest Global Interrupt Flag when hardware virtual GIF is not enabled.
     guest_gif: bool,
+    /// Last external event blocked by CPU interruptibility or APIC PPR.
+    ///
+    /// This is diagnostic state only. It suppresses repeated log lines while
+    /// a guest remains blocked on the same event and gate state.
+    last_blocked_external_event: Option<(u8, bool, bool, bool, u8)>,
     /// Emulated Local APIC for x2APIC MSR accesses.
     vlapic: EmulatedLocalApic<H>,
 }
@@ -160,6 +165,7 @@ impl<H: X86HostOps, M: ControlMemory> SvmVcpu<H, M> {
             injecting_event: None,
             reinjection_event: None,
             guest_gif: true,
+            last_blocked_external_event: None,
             vlapic: EmulatedLocalApic::<H>::new(vm_id, vcpu_id),
         };
         info!(
@@ -505,7 +511,65 @@ impl<H: X86HostOps, M: ControlMemory> SvmVcpu<H, M> {
     }
 
     fn handle_local_apic_eoi(&mut self) -> Option<u8> {
-        self.vlapic.handle_eoi()
+        let ppr_before = self.vlapic.processor_priority();
+        let vector = self.vlapic.handle_eoi();
+        info!(
+            "[x86-svm-diag] guest EOI next_vector={:?} ppr_before={ppr_before:#x} ppr_after={:#x}",
+            vector,
+            self.vlapic.processor_priority()
+        );
+        vector
+    }
+
+    fn record_blocked_external_event(
+        &mut self,
+        event: PendingEvent,
+        cpu_interrupt_allowed: bool,
+        apic_priority_allowed: bool,
+    ) {
+        let state = (
+            event.vector,
+            event.legacy_pic,
+            event.level_triggered,
+            cpu_interrupt_allowed,
+            self.vlapic.processor_priority(),
+        );
+        if self.last_blocked_external_event != Some(state) {
+            info!(
+                "[x86-svm-diag] blocked vector={:#x} source={} level={} cpu_allowed={} \
+                 apic_allowed={} ppr={:#x} pending={}",
+                event.vector,
+                if event.legacy_pic { "pic" } else { "fixed" },
+                event.level_triggered,
+                cpu_interrupt_allowed,
+                apic_priority_allowed,
+                self.vlapic.processor_priority(),
+                self.pending_events.len()
+            );
+            self.last_blocked_external_event = Some(state);
+        }
+    }
+
+    fn record_injected_external_event(
+        &mut self,
+        event: PendingEvent,
+        reinjected: bool,
+        cpu_interrupt_allowed: bool,
+        apic_priority_allowed: bool,
+    ) {
+        info!(
+            "[x86-svm-diag] inject vector={:#x} source={} level={} reinjected={} cpu_allowed={} \
+             apic_allowed={} ppr={:#x} pending={}",
+            event.vector,
+            if event.legacy_pic { "pic" } else { "fixed" },
+            event.level_triggered,
+            reinjected,
+            cpu_interrupt_allowed,
+            apic_priority_allowed,
+            self.vlapic.processor_priority(),
+            self.pending_events.len()
+        );
+        self.last_blocked_external_event = None;
     }
 
     /// Add a virtual interrupt or exception to the pending events list.
@@ -1140,23 +1204,30 @@ impl<H: X86HostOps, M: ControlMemory> SvmVcpu<H, M> {
 
         let pending_event_index = if self.reinjection_event.is_some() {
             None
-        } else {
-            self.pending_events.front().copied().map(|event| {
-                let cpu_interrupt_allowed = event.vector < 32 || self.allow_external_interrupt();
-                let apic_priority_allowed = event.vector < 32
-                    || event.legacy_pic
-                    || self.vlapic.can_accept_interrupt(event.vector);
-                if !cpu_interrupt_allowed || apic_priority_allowed {
-                    0
-                } else {
-                    // A fixed event blocked by APIC PPR must not hide a later
-                    // legacy PIC event, which follows a separate delivery path.
-                    self.pending_events
-                        .iter()
-                        .position(|pending| pending.legacy_pic)
-                        .unwrap_or(0)
-                }
+        } else if let Some(event) = self.pending_events.front().copied() {
+            let cpu_interrupt_allowed = event.vector < 32 || self.allow_external_interrupt();
+            let apic_priority_allowed = event.vector < 32
+                || event.legacy_pic
+                || self.vlapic.can_accept_interrupt(event.vector);
+            if event.vector >= 32 && (!cpu_interrupt_allowed || !apic_priority_allowed) {
+                self.record_blocked_external_event(
+                    event,
+                    cpu_interrupt_allowed,
+                    apic_priority_allowed,
+                );
+            }
+            Some(if cpu_interrupt_allowed && apic_priority_allowed {
+                0
+            } else {
+                // A fixed event blocked by APIC PPR must not hide a later
+                // legacy PIC event, which follows a separate delivery path.
+                self.pending_events
+                    .iter()
+                    .position(|pending| pending.legacy_pic)
+                    .unwrap_or(0)
             })
+        } else {
+            None
         };
         let pending = pending_event_index.and_then(|index| self.pending_events.get(index).copied());
         let Some(injection) = select_svm_injection(self.reinjection_event, pending) else {
@@ -1170,6 +1241,12 @@ impl<H: X86HostOps, M: ControlMemory> SvmVcpu<H, M> {
                 || event.legacy_pic
                 || self.vlapic.can_accept_interrupt(event.vector);
             if cpu_interrupt_allowed && apic_priority_allowed {
+                self.record_injected_external_event(
+                    event,
+                    injection.reinjected,
+                    cpu_interrupt_allowed,
+                    apic_priority_allowed,
+                );
                 self.set_interrupt_window(false);
                 if injection.needs_apic_accept() {
                     let vlapic = &self.vlapic;
@@ -1239,6 +1316,18 @@ impl<H: X86HostOps, M: ControlMemory> SvmVcpu<H, M> {
         if let Some(interrupted) =
             interrupted_injected_event(exit_int_info, exit_int_info_err, injected.event)
         {
+            if injected.event.vector >= 32 {
+                info!(
+                    "[x86-svm-diag] injection interrupted vector={:#x} source={} \
+                     exit_int_info={exit_int_info:#x} exit_int_info_err={exit_int_info_err:#x}",
+                    injected.event.vector,
+                    if injected.event.legacy_pic {
+                        "pic"
+                    } else {
+                        "fixed"
+                    },
+                );
+            }
             self.reinjection_event = Some(interrupted);
             vmcb.control.exit_int_info.set(0);
             vmcb.control.exit_int_info_err.set(0);
@@ -1246,7 +1335,22 @@ impl<H: X86HostOps, M: ControlMemory> SvmVcpu<H, M> {
             return;
         }
 
-        if should_accept_vlapic_on_svm_event_completion(injected) {
+        let accept_on_completion = should_accept_vlapic_on_svm_event_completion(injected);
+        if injected.event.vector >= 32 {
+            info!(
+                "[x86-svm-diag] injection completed vector={:#x} source={} \
+                 accept_on_completion={} ppr={:#x}",
+                injected.event.vector,
+                if injected.event.legacy_pic {
+                    "pic"
+                } else {
+                    "fixed"
+                },
+                accept_on_completion,
+                self.vlapic.processor_priority(),
+            );
+        }
+        if accept_on_completion {
             self.vlapic
                 .accept_interrupt(injected.event.vector, injected.event.level_triggered);
         }

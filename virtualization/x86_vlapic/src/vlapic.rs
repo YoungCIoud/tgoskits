@@ -395,14 +395,13 @@ impl<H: X86VlapicHostOps> VirtualApicRegs<H> {
         self.update_ppr();
     }
 
-    /// Returns whether a fixed interrupt passes the current processor priority.
-    ///
-    /// The processor-priority register blocks an interrupt whose priority class
-    /// is less than or equal to PPR. The vCPU backends perform the IF,
-    /// interrupt-shadow, and GIF checks separately, so this method only
-    /// answers the local-APIC part of external interrupt delivery.
-    pub fn can_accept_interrupt(&self, vector: u8) -> bool {
-        prio(vector as u32) > prio(self.regs().PPR.get())
+    pub(crate) fn can_accept_interrupt_with_priority(&self, vector: u8, ppr: u8) -> bool {
+        prio(vector as u32) > prio(ppr as u32)
+    }
+
+    /// Returns the current processor-priority register value.
+    pub fn processor_priority(&self) -> u8 {
+        self.regs().PPR.get() as u8
     }
 
     pub fn has_pending_timer_interrupt(&self) -> bool {

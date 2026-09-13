@@ -79,20 +79,40 @@ impl<D: VirtioDeviceCore> VirtioPciFunction<D> {
     ) -> DeviceResult {
         let mut transition = transition;
         loop {
+            if transition != InterruptTransition::None {
+                info!(
+                    "[virtio-pci-diag] INTx transition={transition:?} pending_before={}",
+                    self.transport.interrupt_pending()
+                );
+            }
             match self.execute_transition(context, transition) {
                 TransitionResult::Published => {
                     transition = self
                         .transport
                         .complete_interrupt_transition(transition, true);
+                    info!(
+                        "[virtio-pci-diag] INTx transition published pending_after={} \
+                         next={transition:?}",
+                        self.transport.interrupt_pending()
+                    );
                 }
                 TransitionResult::Suppressed => {
                     self.transport
                         .suppress_stale_interrupt_transition(transition);
+                    info!(
+                        "[virtio-pci-diag] INTx transition suppressed pending_after={}",
+                        self.transport.interrupt_pending()
+                    );
                     transition = InterruptTransition::None;
                 }
                 TransitionResult::Failed(error) => {
                     self.transport
                         .complete_interrupt_transition(transition, false);
+                    warn!(
+                        "[virtio-pci-diag] INTx transition failed transition={transition:?} \
+                         error={error:?} pending_after={}",
+                        self.transport.interrupt_pending()
+                    );
                     return Err(error);
                 }
             }
@@ -161,6 +181,12 @@ impl<D: VirtioDeviceCore> VirtioPciFunction<D> {
         notification: axvirtio_common::pci::QueueNotification,
         context: &mut dyn PciEndpointContext,
     ) -> DeviceResult {
+        info!(
+            "[virtio-pci-diag] queue notification outcome={:?} generation={:?} publish_irq={}",
+            notification.outcome(),
+            notification.generation(),
+            notification.requires_interrupt_publication()
+        );
         self.publish_interrupt_request(notification.into_interrupt_publication(), context)
     }
 
