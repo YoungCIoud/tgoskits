@@ -1,6 +1,9 @@
 //! Thin VirtIO PCI adapter for the shared block request core.
 
-use core::mem::size_of;
+use core::{
+    mem::size_of,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use ax_sync::SpinLock;
 use axdevice_base::{AccessWidth, DeviceError, DeviceResult};
@@ -27,6 +30,7 @@ const DEVICE_CONFIG_SIZE: usize = 16;
 pub struct VirtioBlockPciAdapter<B: BlockBackend> {
     core: VirtioBlockRequestCore<B>,
     pending_head: SpinLock<Option<u16>>,
+    negotiated_features: AtomicU64,
 }
 
 impl<B: BlockBackend> VirtioBlockPciAdapter<B> {
@@ -35,6 +39,7 @@ impl<B: BlockBackend> VirtioBlockPciAdapter<B> {
         Self {
             core: VirtioBlockRequestCore::new(backend, config),
             pending_head: SpinLock::new(None),
+            negotiated_features: AtomicU64::new(0),
         }
     }
 
@@ -45,7 +50,12 @@ impl<B: BlockBackend> VirtioBlockPciAdapter<B> {
     ) -> DeviceResult<QueueNotifyOutcome> {
         let pending_head = self.pending_head.lock().take();
         self.core
-            .process_queue(queue, memory, pending_head)
+            .process_queue_with_features(
+                queue,
+                memory,
+                pending_head,
+                self.negotiated_features.load(Ordering::Acquire),
+            )
             .map(|outcome| match outcome {
                 BlockQueueOutcome::Idle => QueueNotifyOutcome::Idle,
                 BlockQueueOutcome::Completed { notify } => QueueNotifyOutcome::Completed { notify },
@@ -118,9 +128,14 @@ impl<B: BlockBackend> VirtioDeviceCore for VirtioBlockPciAdapter<B> {
         self.process_queue(queue, memory)
     }
 
+    fn set_driver_features(&self, features: u64) {
+        self.negotiated_features.store(features, Ordering::Release);
+    }
+
     fn reset(&self) -> DeviceResult {
         self.pending_head.lock().take();
         self.core.reset();
+        self.negotiated_features.store(0, Ordering::Release);
         Ok(())
     }
 
@@ -395,6 +410,16 @@ mod tests {
         Arc<VirtioPciTransport<VirtioBlockPciAdapter<B>>>,
         TestMemory,
     ) {
+        configure_transport_with_features(backend, 0)
+    }
+
+    fn configure_transport_with_features<B: BlockBackend>(
+        backend: B,
+        negotiated_features: u64,
+    ) -> (
+        Arc<VirtioPciTransport<VirtioBlockPciAdapter<B>>>,
+        TestMemory,
+    ) {
         let transport = Arc::new(
             VirtioPciTransport::try_new(VirtioBlockPciAdapter::new(
                 backend,
@@ -411,7 +436,13 @@ mod tests {
         for (offset, width, value) in [
             (0x00, AccessWidth::Dword, 0),
             (0x08, AccessWidth::Dword, 0),
-            (0x0c, AccessWidth::Dword, 0),
+            (
+                0x0c,
+                AccessWidth::Dword,
+                negotiated_features & u64::from(u32::MAX),
+            ),
+            (0x08, AccessWidth::Dword, 1),
+            (0x0c, AccessWidth::Dword, negotiated_features >> u32::BITS),
             (0x14, AccessWidth::Byte, 0x0f),
             (0x16, AccessWidth::Word, 0),
             (0x18, AccessWidth::Word, 4),
@@ -565,9 +596,26 @@ mod tests {
         data_len: u32,
         setup: impl FnOnce(&mut TestMemory),
     ) -> (TestMemory, Arc<AtomicUsize>) {
+        run_write_request_with_features(
+            config,
+            sector,
+            data_len,
+            VIRTIO_BLK_F_SIZE_MAX | VIRTIO_BLK_F_SEG_MAX,
+            setup,
+        )
+    }
+
+    fn run_write_request_with_features(
+        config: VirtioBlockConfig,
+        sector: u64,
+        data_len: u32,
+        negotiated_features: u64,
+        setup: impl FnOnce(&mut TestMemory),
+    ) -> (TestMemory, Arc<AtomicUsize>) {
         let backend = TestBackend::new(8);
         let write_count = Arc::clone(&backend.write_count);
         let adapter = VirtioBlockPciAdapter::new(backend, config);
+        adapter.set_driver_features(negotiated_features);
         let mut queue = configured_queue();
         let mut memory = TestMemory::new();
         memory.set_descriptor(
@@ -680,6 +728,51 @@ mod tests {
         assert_eq!(memory.bytes[STATUS as usize], VIRTIO_BLK_S_OK);
         assert_eq!(memory.bytes[DATA as usize], 0x5a);
         assert_eq!(memory.bytes[DATA as usize + 511], 0x5a);
+    }
+
+    #[test]
+    fn accepts_request_larger_than_size_max_when_feature_is_not_negotiated() {
+        let config = VirtioBlockConfig {
+            capacity: 8,
+            size_max: 512,
+            seg_max: 1,
+            ..VirtioBlockConfig::default()
+        };
+        let (memory, write_count) = run_write_request_with_features(config, 0, 1024, 0, |memory| {
+            memory.set_descriptor(1, READ_DATA, 1024, VIRTQ_DESC_F_NEXT, 2);
+        });
+
+        assert_eq!(memory.bytes[STATUS as usize], VIRTIO_BLK_S_OK);
+        assert_eq!(write_count.load(Ordering::Relaxed), 1);
+        assert_eq!(memory.used_element(0), (0, 1));
+    }
+
+    #[test]
+    fn pci_feature_negotiation_reaches_block_request_core() {
+        let backend = TestBackend::new(8);
+        let (transport, mut memory) = configure_transport_with_features(
+            backend,
+            VIRTIO_F_VERSION_1 | VIRTIO_BLK_F_SIZE_MAX | VIRTIO_BLK_F_SEG_MAX,
+        );
+        memory.set_descriptor(
+            0,
+            HEADER,
+            VIRTIO_BLK_REQUEST_HEADER_SIZE,
+            VIRTQ_DESC_F_NEXT,
+            1,
+        );
+        memory.set_descriptor(1, READ_DATA, 1024, VIRTQ_DESC_F_NEXT, 2);
+        memory.set_descriptor(2, STATUS, 1, VIRTQ_DESC_F_WRITE, 0);
+        memory.set_header(VIRTIO_BLK_T_OUT, 0);
+        memory.bytes[READ_DATA as usize..READ_DATA as usize + 1024].fill(0x5a);
+        memory.set_available_head(0);
+
+        let outcome = transport
+            .write_bar_with_dma(0x100, AccessWidth::Word, 0, true, &mut memory)
+            .unwrap();
+
+        assert!(matches!(outcome, VirtioPciWriteOutcome::QueueNotified(_)));
+        assert_eq!(memory.bytes[STATUS as usize], VIRTIO_BLK_S_IOERR);
     }
 
     #[test]
