@@ -73,14 +73,17 @@ fn interrupted_vmx_event(
         return None;
     }
 
-    let level_triggered = injected
+    let (level_triggered, legacy_pic) = injected
         .filter(|event| event.event.vector == info.vector && event.int_type == info.int_type)
-        .is_some_and(|event| event.event.level_triggered);
+        .map_or((false, false), |event| {
+            (event.event.level_triggered, event.event.legacy_pic)
+        });
     Some(VmxInjectionEvent {
         event: PendingEvent {
             vector: info.vector,
             err_code: info.err_code,
             level_triggered,
+            legacy_pic,
         },
         int_type: info.int_type,
         instruction_len: info.int_type.is_soft().then_some(exit_instruction_len),
@@ -336,14 +339,39 @@ impl<H: X86HostOps, M: ControlMemory> VmxVcpu<H, M> {
         err_code: Option<u32>,
         level_triggered: bool,
     ) {
+        self.queue_event_with_source(vector, err_code, level_triggered, false);
+    }
+
+    fn queue_event_with_source(
+        &mut self,
+        vector: u8,
+        err_code: Option<u32>,
+        level_triggered: bool,
+        legacy_pic: bool,
+    ) {
         queue_pending_event(
             &mut self.pending_events,
             PendingEvent {
                 vector,
                 err_code,
                 level_triggered,
+                legacy_pic,
             },
         );
+    }
+
+    /// Queue a legacy PIC interrupt without applying fixed-vector APIC PPR gating.
+    pub fn inject_legacy_pic_interrupt(
+        &mut self,
+        vector: usize,
+        level_triggered: bool,
+    ) -> X86VcpuResult {
+        if vector == 0 {
+            warn!("interrupt queued in inject_legacy_pic_interrupt: vector 0");
+            panic!()
+        }
+        self.queue_event_with_source(vector as u8, None, level_triggered, true);
+        Ok(())
     }
 
     /// If enable, a VM exit occurs at the beginning of any instruction if
@@ -998,13 +1026,35 @@ impl<H: X86HostOps, M: ControlMemory> VmxVcpu<H, M> {
             return Ok(());
         }
 
-        if let Some(event) = self.pending_events.front().copied() {
+        let pending_event_index = self.pending_events.front().copied().map(|event| {
+            let cpu_interrupt_allowed = event.vector < 32 || self.allow_interrupt();
+            let apic_priority_allowed = event.vector < 32
+                || event.legacy_pic
+                || self.vlapic.can_accept_interrupt(event.vector);
+            if !cpu_interrupt_allowed || apic_priority_allowed {
+                0
+            } else {
+                // A fixed event blocked by APIC PPR must not hide a later
+                // legacy PIC event, which follows a separate delivery path.
+                self.pending_events
+                    .iter()
+                    .position(|pending| pending.legacy_pic)
+                    .unwrap_or(0)
+            }
+        });
+
+        if let Some(pending_event_index) = pending_event_index {
+            let event = self.pending_events[pending_event_index];
             // trace!(
             //     "pending event vector {:#x} allow_int {}",
             //     event.vector,
             //     self.allow_interrupt()
             // );
-            if event.vector < 32 || self.allow_interrupt() {
+            let cpu_interrupt_allowed = event.vector < 32 || self.allow_interrupt();
+            let apic_priority_allowed = event.vector < 32
+                || event.legacy_pic
+                || self.vlapic.can_accept_interrupt(event.vector);
+            if cpu_interrupt_allowed && apic_priority_allowed {
                 // if it's an exception, or an interrupt that is not blocked, inject it directly.
                 vmcs::inject_event(
                     self.cpu.vmx_controls_mut().expect("VMX policy CPU"),
@@ -1016,10 +1066,12 @@ impl<H: X86HostOps, M: ControlMemory> VmxVcpu<H, M> {
                         .accept_interrupt(event.vector, event.level_triggered);
                 }
                 self.injecting_event = Some(VmxInjectionEvent::pending(event));
-                self.pending_events.pop_front();
+                let _ = self.pending_events.remove(pending_event_index);
             } else {
-                // interrupts are blocked, enable interrupt-window exiting.
-                self.set_interrupt_window(true)?;
+                // Only CPU interruptibility can be relieved by interrupt-window exiting.
+                if !cpu_interrupt_allowed {
+                    self.set_interrupt_window(true)?;
+                }
             }
         }
         Ok(())
@@ -2383,6 +2435,7 @@ mod tests {
             vector: 0x51,
             err_code: None,
             level_triggered: true,
+            legacy_pic: false,
         };
         let injected = VmxInjectionEvent::pending(pending);
         let vectoring = VmxInterruptInfo {

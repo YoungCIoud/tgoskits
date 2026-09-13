@@ -520,14 +520,39 @@ impl<H: X86HostOps, M: ControlMemory> SvmVcpu<H, M> {
         err_code: Option<u32>,
         level_triggered: bool,
     ) {
+        self.queue_event_with_source(vector, err_code, level_triggered, false);
+    }
+
+    fn queue_event_with_source(
+        &mut self,
+        vector: u8,
+        err_code: Option<u32>,
+        level_triggered: bool,
+        legacy_pic: bool,
+    ) {
         queue_pending_event(
             &mut self.pending_events,
             PendingEvent {
                 vector,
                 err_code,
                 level_triggered,
+                legacy_pic,
             },
         );
+    }
+
+    /// Queue a legacy PIC interrupt without applying fixed-vector APIC PPR gating.
+    pub fn inject_legacy_pic_interrupt(
+        &mut self,
+        vector: usize,
+        level_triggered: bool,
+    ) -> X86VcpuResult {
+        if vector == 0 {
+            warn!("interrupt queued in inject_legacy_pic_interrupt: vector 0");
+            panic!()
+        }
+        self.queue_event_with_source(vector as u8, None, level_triggered, true);
+        Ok(())
     }
 
     fn flush_guest_tlb(&mut self) {
@@ -1113,15 +1138,38 @@ impl<H: X86HostOps, M: ControlMemory> SvmVcpu<H, M> {
             return Ok(());
         }
 
-        let Some(injection) =
-            select_svm_injection(self.reinjection_event, self.pending_events.front().copied())
-        else {
+        let pending_event_index = if self.reinjection_event.is_some() {
+            None
+        } else {
+            self.pending_events.front().copied().map(|event| {
+                let cpu_interrupt_allowed = event.vector < 32 || self.allow_external_interrupt();
+                let apic_priority_allowed = event.vector < 32
+                    || event.legacy_pic
+                    || self.vlapic.can_accept_interrupt(event.vector);
+                if !cpu_interrupt_allowed || apic_priority_allowed {
+                    0
+                } else {
+                    // A fixed event blocked by APIC PPR must not hide a later
+                    // legacy PIC event, which follows a separate delivery path.
+                    self.pending_events
+                        .iter()
+                        .position(|pending| pending.legacy_pic)
+                        .unwrap_or(0)
+                }
+            })
+        };
+        let pending = pending_event_index.and_then(|index| self.pending_events.get(index).copied());
+        let Some(injection) = select_svm_injection(self.reinjection_event, pending) else {
             return Ok(());
         };
         let event = injection.event;
 
         if event.vector >= 32 {
-            if injection.reinjected || self.allow_external_interrupt() {
+            let cpu_interrupt_allowed = injection.reinjected || self.allow_external_interrupt();
+            let apic_priority_allowed = injection.reinjected
+                || event.legacy_pic
+                || self.vlapic.can_accept_interrupt(event.vector);
+            if cpu_interrupt_allowed && apic_priority_allowed {
                 self.set_interrupt_window(false);
                 if injection.needs_apic_accept() {
                     let vlapic = &self.vlapic;
@@ -1148,24 +1196,30 @@ impl<H: X86HostOps, M: ControlMemory> SvmVcpu<H, M> {
                         event,
                     );
                 }
-                self.commit_svm_injection(injection);
+                self.commit_svm_injection(injection, pending_event_index);
             } else {
-                self.set_interrupt_window(true);
+                if !cpu_interrupt_allowed {
+                    self.set_interrupt_window(true);
+                }
             }
             return Ok(());
         }
 
         self.inject_event(event.vector, event.err_code)?;
-        self.commit_svm_injection(injection);
+        self.commit_svm_injection(injection, pending_event_index);
         Ok(())
     }
 
-    fn commit_svm_injection(&mut self, injection: SvmInjectionEvent) {
+    fn commit_svm_injection(
+        &mut self,
+        injection: SvmInjectionEvent,
+        pending_event_index: Option<usize>,
+    ) {
         self.injecting_event = Some(injection);
         if injection.reinjected {
             self.reinjection_event = None;
-        } else {
-            self.pending_events.pop_front();
+        } else if let Some(index) = pending_event_index {
+            let _ = self.pending_events.remove(index);
         }
     }
 
@@ -1800,6 +1854,7 @@ fn interrupted_injected_event(info: u32, err: u32, injected: PendingEvent) -> Op
         vector,
         err_code,
         level_triggered: injected.level_triggered,
+        legacy_pic: injected.legacy_pic,
     })
 }
 
@@ -2136,6 +2191,7 @@ mod tests {
                 vector: 0x51,
                 err_code: None,
                 level_triggered: true,
+                legacy_pic: false,
             },
         );
 
@@ -2154,6 +2210,7 @@ mod tests {
             vector: 0x51,
             err_code: None,
             level_triggered: true,
+            legacy_pic: false,
         };
 
         prepare_external_interrupt_injection(&mut control, event, |accepted_event| {
@@ -2266,6 +2323,7 @@ mod tests {
             vector: 0x51,
             err_code: None,
             level_triggered: true,
+            legacy_pic: false,
         };
         let info = VmcbIntInfo::from(InterruptType::External, injected.vector).bits();
 
@@ -2281,6 +2339,7 @@ mod tests {
             vector: 0x51,
             err_code: None,
             level_triggered: true,
+            legacy_pic: false,
         };
 
         let selected = select_svm_injection(Some(interrupted), None).unwrap();
@@ -2297,6 +2356,7 @@ mod tests {
                 vector: 0x51,
                 err_code: None,
                 level_triggered: true,
+                legacy_pic: false,
             }),
         )
         .unwrap();
@@ -2312,6 +2372,7 @@ mod tests {
                 vector: 0x51,
                 err_code: None,
                 level_triggered: true,
+                legacy_pic: false,
             }),
             None,
         )
@@ -2327,6 +2388,7 @@ mod tests {
             vector: 0x51,
             err_code: None,
             level_triggered: true,
+            legacy_pic: false,
         };
         let unrelated = VmcbIntInfo::from(InterruptType::External, 0x52).bits();
 
