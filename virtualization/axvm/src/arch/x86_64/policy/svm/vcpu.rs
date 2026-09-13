@@ -1189,6 +1189,12 @@ impl<H: X86HostOps, M: ControlMemory> SvmVcpu<H, M> {
             vmcb.control.exit_int_info.set(0);
             vmcb.control.exit_int_info_err.set(0);
             vmcb.control.clean_bits.set(0);
+            return;
+        }
+
+        if should_accept_vlapic_on_svm_event_completion(injected) {
+            self.vlapic
+                .accept_interrupt(injected.event.vector, injected.event.level_triggered);
         }
     }
 
@@ -1805,6 +1811,12 @@ fn pending_event_interrupt_type(event: PendingEvent) -> u32 {
     }
 }
 
+fn should_accept_vlapic_on_svm_event_completion(injection: SvmInjectionEvent) -> bool {
+    // Initial external events are accepted before EVENTINJ; only reinjected
+    // events were interrupted before that APIC state transition.
+    injection.event.vector >= 32 && injection.reinjected
+}
+
 fn svm_intr_exit_reason(_vector: Option<u8>) -> X86VmExit {
     // SVM_EXIT_INTR is a host IRQ exit point. Unlike VMX external-interrupt
     // exits, VMCB exit_int_info is not a reliable dispatch key for the host
@@ -2102,9 +2114,10 @@ mod tests {
         SVM_INT_CTL_V_IRQ_INJECTION_BITS, SVM_INT_STATE_INTERRUPT_SHADOW, SvmExitCode,
         enable_virtual_interrupt_masking_control, inject_external_interrupt_control,
         interrupted_injected_event, prepare_external_interrupt_injection, select_svm_injection,
-        set_interrupt_window_control, svm_external_interrupt_allowed,
-        svm_external_interrupt_exit_vector, svm_guest_gif_after_exit, svm_hlt_exit_reason,
-        svm_intr_exit_reason, svm_mmio_register_write_opcode,
+        set_interrupt_window_control, should_accept_vlapic_on_svm_event_completion,
+        svm_external_interrupt_allowed, svm_external_interrupt_exit_vector,
+        svm_guest_gif_after_exit, svm_hlt_exit_reason, svm_intr_exit_reason,
+        svm_mmio_register_write_opcode,
     };
     use crate::arch::x86_64::policy::{
         X86VmExit,
@@ -2274,6 +2287,38 @@ mod tests {
 
         assert_eq!(selected.event, interrupted);
         assert!(!selected.needs_apic_accept());
+    }
+
+    #[test]
+    fn svm_initial_external_irq_is_not_accepted_again_at_completion() {
+        let initial = select_svm_injection(
+            None,
+            Some(PendingEvent {
+                vector: 0x51,
+                err_code: None,
+                level_triggered: true,
+            }),
+        )
+        .unwrap();
+
+        assert!(initial.needs_apic_accept());
+        assert!(!should_accept_vlapic_on_svm_event_completion(initial));
+    }
+
+    #[test]
+    fn svm_reinjected_external_irq_is_accepted_at_completion() {
+        let reinjected = select_svm_injection(
+            Some(PendingEvent {
+                vector: 0x51,
+                err_code: None,
+                level_triggered: true,
+            }),
+            None,
+        )
+        .unwrap();
+
+        assert!(!reinjected.needs_apic_accept());
+        assert!(should_accept_vlapic_on_svm_event_completion(reinjected));
     }
 
     #[test]
