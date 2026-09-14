@@ -143,6 +143,8 @@ pub struct VmxVcpu<H: X86HostOps, M: ControlMemory> {
     /// This is diagnostic state only. It suppresses repeated log lines while
     /// a guest remains blocked on the same event and gate state.
     last_blocked_external_event: Option<(u8, bool, bool, bool, u8)>,
+    /// Samples high-frequency external-event diagnostics for this vCPU.
+    external_event_diagnostic_sampler: X86EventDiagnosticSampler,
     /// Guest RAM regions used to read guest instructions and page tables.
     guest_memory_regions: Vec<X86GuestMemoryRegion>,
 }
@@ -174,6 +176,7 @@ impl<H: X86HostOps, M: ControlMemory> VmxVcpu<H, M> {
             reinjection_event: None,
             vlapic: EmulatedLocalApic::<H>::new(vm_id, vcpu_id),
             last_blocked_external_event: None,
+            external_event_diagnostic_sampler: X86EventDiagnosticSampler::default(),
             guest_memory_regions: Vec::new(),
         };
         info!(
@@ -1005,11 +1008,14 @@ impl<H: X86HostOps, M: ControlMemory> VmxVcpu<H, M> {
     fn handle_local_apic_eoi(&mut self) -> Option<u8> {
         let ppr_before = self.vlapic.processor_priority();
         let vector = self.vlapic.handle_eoi();
-        info!(
-            "[x86-vmx-diag] guest EOI next_vector={:?} ppr_before={ppr_before:#x} ppr_after={:#x}",
-            vector,
-            self.vlapic.processor_priority()
-        );
+        if let Some(count) = self.external_event_diagnostic_sampler.next_sample() {
+            info!(
+                "[x86-vmx-diag] guest EOI count={count} next_vector={:?} \
+                 ppr_before={ppr_before:#x} ppr_after={:#x}",
+                vector,
+                self.vlapic.processor_priority()
+            );
+        }
         vector
     }
 
@@ -1027,17 +1033,19 @@ impl<H: X86HostOps, M: ControlMemory> VmxVcpu<H, M> {
             self.vlapic.processor_priority(),
         );
         if self.last_blocked_external_event != Some(state) {
-            info!(
-                "[x86-vmx-diag] blocked vector={:#x} source={} level={} cpu_allowed={} \
-                 apic_allowed={} ppr={:#x} pending={}",
-                event.vector,
-                if event.legacy_pic { "pic" } else { "fixed" },
-                event.level_triggered,
-                cpu_interrupt_allowed,
-                apic_priority_allowed,
-                self.vlapic.processor_priority(),
-                self.pending_events.len()
-            );
+            if let Some(count) = self.external_event_diagnostic_sampler.next_sample() {
+                info!(
+                    "[x86-vmx-diag] blocked count={count} vector={:#x} source={} level={} \
+                     cpu_allowed={} apic_allowed={} ppr={:#x} pending={}",
+                    event.vector,
+                    if event.legacy_pic { "pic" } else { "fixed" },
+                    event.level_triggered,
+                    cpu_interrupt_allowed,
+                    apic_priority_allowed,
+                    self.vlapic.processor_priority(),
+                    self.pending_events.len()
+                );
+            }
             self.last_blocked_external_event = Some(state);
         }
     }
@@ -1049,18 +1057,20 @@ impl<H: X86HostOps, M: ControlMemory> VmxVcpu<H, M> {
         cpu_interrupt_allowed: bool,
         apic_priority_allowed: bool,
     ) {
-        info!(
-            "[x86-vmx-diag] inject vector={:#x} source={} level={} reinjected={} cpu_allowed={} \
-             apic_allowed={} ppr={:#x} pending={}",
-            event.vector,
-            if event.legacy_pic { "pic" } else { "fixed" },
-            event.level_triggered,
-            reinjected,
-            cpu_interrupt_allowed,
-            apic_priority_allowed,
-            self.vlapic.processor_priority(),
-            self.pending_events.len()
-        );
+        if let Some(count) = self.external_event_diagnostic_sampler.next_sample() {
+            info!(
+                "[x86-vmx-diag] inject count={count} vector={:#x} source={} level={} \
+                 reinjected={} cpu_allowed={} apic_allowed={} ppr={:#x} pending={}",
+                event.vector,
+                if event.legacy_pic { "pic" } else { "fixed" },
+                event.level_triggered,
+                reinjected,
+                cpu_interrupt_allowed,
+                apic_priority_allowed,
+                self.vlapic.processor_priority(),
+                self.pending_events.len()
+            );
+        }
         self.last_blocked_external_event = None;
     }
 
@@ -1173,10 +1183,12 @@ impl<H: X86HostOps, M: ControlMemory> VmxVcpu<H, M> {
         let injected = self.injecting_event;
         self.reinjection_event =
             interrupted_vmx_event(vectoring, exit_info.exit_instruction_length, injected);
-        if let Some(injected) = injected.filter(|event| event.event.vector >= 32) {
+        if let Some(injected) = injected.filter(|event| event.event.vector >= 32)
+            && let Some(count) = self.external_event_diagnostic_sampler.next_sample()
+        {
             info!(
-                "[x86-vmx-diag] injection completed vector={:#x} source={} vectoring_valid={} \
-                 vectoring_vector={:#x} reinject={}",
+                "[x86-vmx-diag] injection completed count={count} vector={:#x} source={} \
+                 vectoring_valid={} vectoring_vector={:#x} reinject={}",
                 injected.event.vector,
                 if injected.event.legacy_pic {
                     "pic"

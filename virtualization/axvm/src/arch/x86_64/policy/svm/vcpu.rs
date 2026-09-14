@@ -139,6 +139,8 @@ pub struct SvmVcpu<H: X86HostOps, M: ControlMemory> {
     /// This is diagnostic state only. It suppresses repeated log lines while
     /// a guest remains blocked on the same event and gate state.
     last_blocked_external_event: Option<(u8, bool, bool, bool, u8)>,
+    /// Samples high-frequency external-event diagnostics for this vCPU.
+    external_event_diagnostic_sampler: X86EventDiagnosticSampler,
     /// Emulated Local APIC for x2APIC MSR accesses.
     vlapic: EmulatedLocalApic<H>,
 }
@@ -166,6 +168,7 @@ impl<H: X86HostOps, M: ControlMemory> SvmVcpu<H, M> {
             reinjection_event: None,
             guest_gif: true,
             last_blocked_external_event: None,
+            external_event_diagnostic_sampler: X86EventDiagnosticSampler::default(),
             vlapic: EmulatedLocalApic::<H>::new(vm_id, vcpu_id),
         };
         info!(
@@ -513,11 +516,14 @@ impl<H: X86HostOps, M: ControlMemory> SvmVcpu<H, M> {
     fn handle_local_apic_eoi(&mut self) -> Option<u8> {
         let ppr_before = self.vlapic.processor_priority();
         let vector = self.vlapic.handle_eoi();
-        info!(
-            "[x86-svm-diag] guest EOI next_vector={:?} ppr_before={ppr_before:#x} ppr_after={:#x}",
-            vector,
-            self.vlapic.processor_priority()
-        );
+        if let Some(count) = self.external_event_diagnostic_sampler.next_sample() {
+            info!(
+                "[x86-svm-diag] guest EOI count={count} next_vector={:?} \
+                 ppr_before={ppr_before:#x} ppr_after={:#x}",
+                vector,
+                self.vlapic.processor_priority()
+            );
+        }
         vector
     }
 
@@ -535,17 +541,19 @@ impl<H: X86HostOps, M: ControlMemory> SvmVcpu<H, M> {
             self.vlapic.processor_priority(),
         );
         if self.last_blocked_external_event != Some(state) {
-            info!(
-                "[x86-svm-diag] blocked vector={:#x} source={} level={} cpu_allowed={} \
-                 apic_allowed={} ppr={:#x} pending={}",
-                event.vector,
-                if event.legacy_pic { "pic" } else { "fixed" },
-                event.level_triggered,
-                cpu_interrupt_allowed,
-                apic_priority_allowed,
-                self.vlapic.processor_priority(),
-                self.pending_events.len()
-            );
+            if let Some(count) = self.external_event_diagnostic_sampler.next_sample() {
+                info!(
+                    "[x86-svm-diag] blocked count={count} vector={:#x} source={} level={} \
+                     cpu_allowed={} apic_allowed={} ppr={:#x} pending={}",
+                    event.vector,
+                    if event.legacy_pic { "pic" } else { "fixed" },
+                    event.level_triggered,
+                    cpu_interrupt_allowed,
+                    apic_priority_allowed,
+                    self.vlapic.processor_priority(),
+                    self.pending_events.len()
+                );
+            }
             self.last_blocked_external_event = Some(state);
         }
     }
@@ -557,18 +565,20 @@ impl<H: X86HostOps, M: ControlMemory> SvmVcpu<H, M> {
         cpu_interrupt_allowed: bool,
         apic_priority_allowed: bool,
     ) {
-        info!(
-            "[x86-svm-diag] inject vector={:#x} source={} level={} reinjected={} cpu_allowed={} \
-             apic_allowed={} ppr={:#x} pending={}",
-            event.vector,
-            if event.legacy_pic { "pic" } else { "fixed" },
-            event.level_triggered,
-            reinjected,
-            cpu_interrupt_allowed,
-            apic_priority_allowed,
-            self.vlapic.processor_priority(),
-            self.pending_events.len()
-        );
+        if let Some(count) = self.external_event_diagnostic_sampler.next_sample() {
+            info!(
+                "[x86-svm-diag] inject count={count} vector={:#x} source={} level={} \
+                 reinjected={} cpu_allowed={} apic_allowed={} ppr={:#x} pending={}",
+                event.vector,
+                if event.legacy_pic { "pic" } else { "fixed" },
+                event.level_triggered,
+                reinjected,
+                cpu_interrupt_allowed,
+                apic_priority_allowed,
+                self.vlapic.processor_priority(),
+                self.pending_events.len()
+            );
+        }
         self.last_blocked_external_event = None;
     }
 
@@ -1316,9 +1326,11 @@ impl<H: X86HostOps, M: ControlMemory> SvmVcpu<H, M> {
         if let Some(interrupted) =
             interrupted_injected_event(exit_int_info, exit_int_info_err, injected.event)
         {
-            if injected.event.vector >= 32 {
+            if injected.event.vector >= 32
+                && let Some(count) = self.external_event_diagnostic_sampler.next_sample()
+            {
                 info!(
-                    "[x86-svm-diag] injection interrupted vector={:#x} source={} \
+                    "[x86-svm-diag] injection interrupted count={count} vector={:#x} source={} \
                      exit_int_info={exit_int_info:#x} exit_int_info_err={exit_int_info_err:#x}",
                     injected.event.vector,
                     if injected.event.legacy_pic {
@@ -1336,9 +1348,11 @@ impl<H: X86HostOps, M: ControlMemory> SvmVcpu<H, M> {
         }
 
         let accept_on_completion = should_accept_vlapic_on_svm_event_completion(injected);
-        if injected.event.vector >= 32 {
+        if injected.event.vector >= 32
+            && let Some(count) = self.external_event_diagnostic_sampler.next_sample()
+        {
             info!(
-                "[x86-svm-diag] injection completed vector={:#x} source={} \
+                "[x86-svm-diag] injection completed count={count} vector={:#x} source={} \
                  accept_on_completion={} ppr={:#x}",
                 injected.event.vector,
                 if injected.event.legacy_pic {
