@@ -13,7 +13,7 @@ use axvirtio_common::{
     map_virtio_error,
     pci::{QueueNotifyOutcome, VirtioDeviceCore},
 };
-use log::{info, warn};
+use log::warn;
 
 use crate::{
     BlockBackend, BlockQueueOutcome, VirtioBlockConfig, VirtioBlockRequestCore,
@@ -66,15 +66,11 @@ impl<B: BlockBackend> VirtioBlockPciAdapter<B> {
                 }
             })
             .map_err(|error| map_virtio_error(error, "process VirtIO PCI block queue"));
-        match &result {
-            Ok(outcome) => info!(
-                "[virtio-block-diag] queue processed negotiated_features={negotiated_features:#x} \
-                 outcome={outcome:?}"
-            ),
-            Err(error) => warn!(
-                "[virtio-block-diag] queue processing failed \
+        if let Err(error) = &result {
+            warn!(
+                "VirtIO Block queue processing failed \
                  negotiated_features={negotiated_features:#x} error={error:?}"
-            ),
+            );
         }
         result
     }
@@ -138,10 +134,6 @@ impl<B: BlockBackend> VirtioDeviceCore for VirtioBlockPciAdapter<B> {
     }
 
     fn set_driver_features(&self, features: u64) {
-        info!(
-            "[virtio-block-diag] negotiated_features={features:#x} device_features={:#x}",
-            self.device_features()
-        );
         self.negotiated_features.store(features, Ordering::Release);
     }
 
