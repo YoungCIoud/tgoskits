@@ -515,6 +515,7 @@ impl X86VlapicHostOps for AxvmX86HostOps {
                         .restore_interrupt(claim)
                 },
                 ioapic_interrupts,
+                PIT_AB_ROUTING,
                 |route, vector, trigger| match route {
                     PitInterruptRoute::Pic => dispatch_pic_interrupt(vm, vcpu_id, vector, trigger)
                         .map_err(ax_error_to_vlapic),
@@ -556,6 +557,7 @@ fn route_pit_claim<C>(
         pic_vector,
         restore_pic,
         [assert_ioapic()],
+        true,
         move |_route, vector, trigger| inject(vector, trigger),
     )
 }
@@ -565,16 +567,16 @@ fn route_pit_claims<C>(
     pic_vector: impl FnOnce(&C) -> u8,
     restore_pic: impl FnOnce(C),
     ioapic_interrupts: impl IntoIterator<Item = Option<IoApicInterrupt>>,
+    route_pic: bool,
     mut inject: impl FnMut(PitInterruptRoute, u8, InterruptTriggerMode) -> X86VlapicResult,
 ) -> X86VlapicResult {
     // KVM fans GSI 0 out to both in-kernel irqchips. Each controller owns its
     // mask/in-service state and independently decides whether this edge is
     // currently deliverable. The second IOAPIC input preserves the standard
     // MPS IRQ0 -> INTIN2 route while the first preserves the ACPI GSI0 route.
-    let pic_claim = claim_pic();
     let mut first_error = None;
 
-    if let Some(claim) = pic_claim {
+    if route_pic && let Some(claim) = claim_pic() {
         let vector = pic_vector(&claim);
         if let Err(error) = inject(
             PitInterruptRoute::Pic,
@@ -606,6 +608,11 @@ enum PitInterruptRoute {
     Pic,
     IoApic,
 }
+
+// Temporary A/B switch for the PIT routing diagnosis. Keep the dual-route
+// implementation above intact so the result can be compared without losing
+// the original PIC claim and restore behavior.
+const PIT_AB_ROUTING: bool = false;
 
 fn dispatch_pit_interrupt(
     vm: &AxVM,
@@ -1461,6 +1468,7 @@ mod tests {
                 vector: 0x30,
                 level_triggered: false,
             })],
+            true,
             |route, vector, trigger| {
                 injected.borrow_mut().push((route, vector, trigger));
                 Ok(())
@@ -1482,6 +1490,41 @@ mod tests {
                     InterruptTriggerMode::EdgeTriggered,
                 ),
             ]
+        );
+    }
+
+    #[test]
+    fn pit_ab_routing_uses_only_ioapic() {
+        let pic_claims = Cell::new(0);
+        let injected = std::cell::RefCell::new(std::vec::Vec::new());
+
+        route_pit_claims(
+            || {
+                pic_claims.set(pic_claims.get() + 1);
+                Some(0x68)
+            },
+            |vector| *vector,
+            |_claim| {},
+            [Some(IoApicInterrupt {
+                vector: 0x30,
+                level_triggered: false,
+            })],
+            PIT_AB_ROUTING,
+            |route, vector, trigger| {
+                injected.borrow_mut().push((route, vector, trigger));
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(pic_claims.get(), 0);
+        assert_eq!(
+            injected.into_inner(),
+            [(
+                PitInterruptRoute::IoApic,
+                0x30,
+                InterruptTriggerMode::EdgeTriggered,
+            )]
         );
     }
 

@@ -53,12 +53,7 @@ impl<B: BlockBackend> VirtioBlockPciAdapter<B> {
         let pending_head = self.pending_head.lock().take();
         let result = self
             .core
-            .process_queue_with_features(
-                queue,
-                memory,
-                pending_head,
-                negotiated_features,
-            )
+            .process_queue_with_features(queue, memory, pending_head, negotiated_features)
             .map(|outcome| match outcome {
                 BlockQueueOutcome::Idle => QueueNotifyOutcome::Idle,
                 BlockQueueOutcome::Completed { notify } => QueueNotifyOutcome::Completed { notify },
