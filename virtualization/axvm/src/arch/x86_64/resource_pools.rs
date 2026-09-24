@@ -11,6 +11,15 @@ const AUTO_PIO: core::ops::Range<u16> = 0x1000..0x5000;
 const AUTO_GSI: core::ops::Range<ControllerInputId> =
     ControllerInputId::new(5)..ControllerInputId::new(16);
 
+const _: () = {
+    assert!(AUTO_MMIO.start < AUTO_MMIO.end);
+    assert!(AUTO_MMIO.end == super::pci_config::PCI_ECAM_BASE);
+    assert!(
+        super::pci_config::PCI_ECAM_BASE + super::pci_config::PCI_ECAM_SIZE
+            <= super::pci_config::PCI_MEMORY_BASE
+    );
+};
+
 pub(super) fn create(config: &AxVMConfig) -> AxVmResult<ResourcePools> {
     let controller = InterruptControllerId::new(0);
     let mut pools = ResourcePools::new();
@@ -42,19 +51,4 @@ pub(super) fn create(config: &AxVMConfig) -> AxVmResult<ResourcePools> {
         )?;
     }
     Ok(pools)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn automatic_mmio_excludes_fixed_pci_windows() {
-        assert!(AUTO_MMIO.start < AUTO_MMIO.end);
-        assert_eq!(AUTO_MMIO.end, super::super::pci_config::PCI_ECAM_BASE);
-        assert!(
-            super::super::pci_config::PCI_ECAM_BASE + super::super::pci_config::PCI_ECAM_SIZE
-                <= super::super::pci_config::PCI_MEMORY_BASE
-        );
-    }
 }

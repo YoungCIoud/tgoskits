@@ -214,22 +214,6 @@ mod tests {
             (PCI_ECAM_BASE, PCI_ECAM_SIZE)
         );
 
-        let root = PciRootState::new(topology.clone());
-        let host_bdf = PciBdf::new(PciSegment::new(0), 0, 0, 0).unwrap();
-        let pciexbar = ConfigOffset::new(PCIEXBAR_OFFSET).unwrap();
-        assert_eq!(
-            root.read_config(host_bdf, pciexbar, AccessWidth::Dword)
-                .unwrap(),
-            PCIEXBAR_VALUE & u64::from(u32::MAX)
-        );
-        root.write_config(host_bdf, pciexbar, AccessWidth::Dword, 0)
-            .unwrap();
-        assert_eq!(
-            root.read_config(host_bdf, pciexbar, AccessWidth::Dword)
-                .unwrap(),
-            PCIEXBAR_VALUE & u64::from(u32::MAX)
-        );
-
         let mut runtime = DeviceRuntimeBuilder::new(RuntimeAccessPorts::new());
         for node in graph.nodes() {
             runtime

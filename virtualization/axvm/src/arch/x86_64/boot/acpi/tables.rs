@@ -208,8 +208,10 @@ mod tests {
                 .unwrap(),
         ) as usize;
         let xsdt_entries = image.bytes()[xsdt_offset + 36..xsdt_offset + xsdt_length]
-            .chunks_exact(8)
-            .map(|entry| u64::from_le_bytes(entry.try_into().unwrap()))
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|entry| u64::from_le_bytes(*entry))
             .collect::<Vec<_>>();
         assert!(xsdt_entries.contains(&mcfg.address()));
         assert_eq!(mcfg.length(), 60);
