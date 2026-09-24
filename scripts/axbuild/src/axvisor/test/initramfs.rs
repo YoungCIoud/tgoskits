@@ -26,6 +26,9 @@ const BUSYBOX_PATH: &str = "/bin/busybox";
 // Keep them synchronized with `virtualization/axvm/src/arch/x86_64/pci_config.rs`.
 const X86_PCI_MEMORY_APERTURE_START: &str = "0xc0000000";
 const X86_PCI_MEMORY_APERTURE_END: &str = "0xd0000000";
+// Keep the ECAM resource assertion synchronized with the fixed Q35 window in
+// virtualization/axvm/src/arch/x86_64/pci_config.rs.
+const X86_PCI_ECAM_IOMEM_ENTRY: &str = "b0000000-bfffffff : PCI MMCONFIG 0000 [bus 00-ff]";
 const INIT_SCRIPT_TEMPLATE: &str = r#"#!/bin/busybox sh
 /bin/busybox mount -t devtmpfs devtmpfs /dev 2>/dev/null || true
 /bin/busybox mount -t proc proc /proc 2>/dev/null || true
@@ -39,6 +42,18 @@ export TERM=vt100
 export PS1='~ # '
 cd /root
 
+check_x86_mmconfig() {
+  if [ ! -r /sys/firmware/acpi/tables/MCFG ]; then
+    echo "missing readable ACPI table: MCFG"
+    return 1
+  fi
+  if ! /bin/busybox grep -F -i -q '__AXVISOR_PCI_ECAM_IOMEM_ENTRY__' /proc/iomem; then
+    echo "Linux did not reserve the Q35 PCI MMCONFIG range"
+    return 1
+  fi
+  return 0
+}
+
 run_x86_acpi_check() {
   success_marker=$1
   failed=0
@@ -50,6 +65,9 @@ run_x86_acpi_check() {
       failed=1
     fi
   done
+  if ! check_x86_mmconfig; then
+    failed=1
+  fi
   online=$(/bin/busybox cat /sys/devices/system/cpu/online 2>/dev/null)
   if [ "$online" != "0" ]; then
     echo "unexpected online CPU set: $online"
@@ -77,6 +95,9 @@ __AXVISOR_PCI_CAPABILITY_VALIDATOR__
 run_pci_enumeration_check() {
   success_marker=$1
   failed=0
+  if ! check_x86_mmconfig; then
+    failed=1
+  fi
   # The managed rootfs images ship no pciutils, so this check consumes the
   # kernel-published sysfs PCI state directly (the same source `lspci` reads).
   bdf=""
@@ -607,6 +628,7 @@ fn init_script() -> Vec<u8> {
             "__AXVISOR_PCI_MEMORY_APERTURE_END__",
             X86_PCI_MEMORY_APERTURE_END,
         )
+        .replace("__AXVISOR_PCI_ECAM_IOMEM_ENTRY__", X86_PCI_ECAM_IOMEM_ENTRY)
         .into_bytes()
 }
 
