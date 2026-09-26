@@ -4,13 +4,13 @@
 
 基线3531e72e734ada002ee20520f7467e58e5ea69e9。Axvisor x86 Q35 当前只提供 CF8/CFC 配置机制 #1，客户机固件无法通过标准 PCI Express 配置空间访问扩展配置寄存器。该设计为现有 Q35 PCI 根增加固定 256 MiB ECAM，并让运行时设备图、PCIEXBAR、ACPI MCFG、根资源保留和 Linux 直接启动内存图描述同一地址范围。
 
-成功标准是 Linux 能通过 MCFG 发现 Q35 的 segment 0、bus 00–ff，`/proc/iomem` 中出现对应的 PCI MMCONFIG 资源，且既有 ECAM PCI 枚举用例仍能发现完整 endpoint。此改动不增加 PCI host 公共接口、不改变设备 BDF/BAR/INTx 分配、不实现动态 ECAM 重定位。
+成功标准是 Linux 能通过 MCFG 发现 Q35 的 segment 0、bus 00–ff，`/proc/iomem` 中出现对应的 PCI MMCONFIG 资源，且既有 ECAM PCI 枚举用例仍能发现完整 endpoint，并能从 Q35 host bridge 的 sysfs 配置文件读取 offset `0x100`。`PciEcamConfigFrontend` 将 function-relative offset `0x000` 到 `0xfff` 映射到共享配置镜像；未建模的扩展寄存器默认读零且只读，平台可显式声明字节值和写掩码。传统 capability 布局仍限于前 256 B，CF8/CFC configuration mechanism #1 仍只访问传统配置空间。此改动不增加 PCI host 公共接口、不改变设备 BDF/BAR/INTx 分配、不实现动态 ECAM 重定位或 PCIe extended capability 语义。
 
 ## 2. 资源所有权与数据流
 
 `X86PciHostModel` 是 x86 Q35 ECAM 基址、大小和资源 slot 的唯一所有者。解析后的 `ResolvedDeviceGraph` 先分配并固定 MMIO 资源，再由 PCI host build 使用同一个 `PciRootBinding` 装配 ECAM、CF8/CFC 和 PCI BAR aperture。ACPI 只消费同一图产生的 resolved contribution 与 PCI topology，不维护第二套 endpoint 或内存窗口清单。
 
-`PciEcamConfigFrontend` 仍负责把 MMIO offset 解码为 BDF 与 config offset；x86 host 只提供该通用前端，不按 BDF 在架构 exit 路径中分派。 `X86PciEcamPlan` 保存从 ACPI graph contribution 解析出的 base、size、segment 与 bus 范围，供 PCI0、MCFG、ECAM reservation 和 E820 共同消费。
+`PciEcamConfigFrontend::selection()` 从 ECAM MMIO offset 解码 BDF 和 12-bit function-relative config offset，再经 `PciRootBinding` 分派到 `PciRootState`。`ConfigOffset` 接受 `[0, 0x1000)`；`FunctionState` 与 `PowerOnConfig` 为每个 function 保留完整 4 KiB 镜像及写掩码，未配置的扩展空间由零初始化。`CONVENTIONAL_CONFIG_SPACE_SIZE` 单独约束 capability placement，因此扩展空间可被访问但不会被误当作传统 capability 列表。x86 host 只提供该通用前端，不按 BDF 在架构 exit 路径中分派。`X86PciEcamPlan` 保存从 ACPI graph contribution 解析出的 base、size、segment 与 bus 范围，供 PCI0、MCFG、ECAM reservation 和 E820 共同消费。
 
 ```mermaid
 flowchart LR
@@ -48,11 +48,11 @@ DSDT 的 `PCI0._CRS` 描述 bus range、CF8/CFC 和 PCI forwarding windows，但
 
 继续只用 CF8/CFC 无法为需要 extended config space 的 PCIe 客户机提供完整发现能力；只映射 ECAM 而不发布 MCFG 又没有标准的静态发现入口。仅增加 MCFG 也不足以保留区域，因为旧操作系统可能忽略该表。把 ECAM 加进 PCI0 `_CRS` 会让 x86 PCI root 把它当成可转发窗口，且不能替代通用 motherboard resource 声明；因此本设计选择 MCFG 加根级 PNP0C02，并对直接启动额外保留 E820。
 
-地址对 Linux 客户机可见，添加 ECAM 不改变现有 CF8/CFC 行为或 PCI ABI。回滚只需撤销 host resource/runtime、PCIEXBAR、ACPI MCFG/PNP0C02 与 E820 变更；无磁盘或持久状态迁移。ECAM 热路径新增的工作仅为一次运行时设备区间查找和已有 PCI config dispatch，不增加 endpoint 枚举状态。
+地址对 Linux 客户机可见，添加完整 4 KiB ECAM 镜像不改变现有 CF8/CFC 行为或 endpoint 的传统 PCI ABI；CF8/CFC 仍由 8-bit configuration mechanism #1 offset 解码，不会别名到扩展空间。当前平台未声明的扩展寄存器按零值只读处理，不代表已实现 PCIe capability 或其副作用。回滚只需撤销 host resource/runtime、PCIEXBAR、ACPI MCFG/PNP0C02 与 E820 变更；无磁盘或持久状态迁移。ECAM 热路径新增的工作仅为一次运行时设备区间查找和已有 PCI config dispatch，不增加 endpoint 枚举状态。
 
 ## 6. 验证与审查门槛
 
-`pci_config` provider 单元测试验证 fixed resource、PCIEXBAR 只读语义以及 runtime 实际 ECAM 读写；ACPI 单元测试验证直接镜像 XSDT/MCFG 指针、geometry 与 checksum，fw_cfg 测试验证 loader pointer/checksum 命令和 MCFG 内容。Axbuild BusyBox 检查要求 MCFG 可读并匹配 Linux `/proc/iomem` 的 `b0000000-bfffffff : PCI MMCONFIG 0000 [bus 00-ff]`。既有 `pci-enumeration-vmx` CI 继续证明客户机枚举。
+`axdevice` 的 root 与 frontend 单元测试覆盖 offset `0x100`、可写的扩展配置字节 `0x104`、镜像末尾 `0xffc` 和 function 边界 `0x1000`，并确认写掩码与 absent BDF 语义保持一致；capability 测试继续验证传统 capability 不越过 `0xff`。`pci_config` provider 单元测试验证 fixed resource、PCIEXBAR 只读语义以及 runtime 实际 ECAM 读写；ACPI 单元测试验证直接镜像 XSDT/MCFG 指针、geometry 与 checksum，fw_cfg 测试验证 loader pointer/checksum 命令和 MCFG 内容。Axbuild BusyBox 的 PCI 枚举检查要求 MCFG 可读、`/proc/iomem` 包含 `b0000000-bfffffff : PCI MMCONFIG 0000 [bus 00-ff]`，并通过 `/sys/bus/pci/devices/0000:00:00.0/config` 读取 offset `0x100` 的零值，以证明来宾访问没有在传统空间边界被截断。既有 `pci-enumeration-vmx` CI 继续证明客户机端到端枚举和扩展空间读取。
 
 合入前必须确认 PCIEXBAR 的固定启用/只读策略与 QEMU reset 差异、PNP0C02 resource descriptor 的 Linux/OVMF 解释，以及 direct/OVMF 两条启动路径。必要证据由 VMX 与 SVM PCI 枚举 CI 及 OVMF ACPI CI 提供。
 

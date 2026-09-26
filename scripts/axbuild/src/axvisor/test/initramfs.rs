@@ -54,6 +54,23 @@ check_x86_mmconfig() {
   return 0
 }
 
+check_q35_extended_config() {
+  host_bridge=/sys/bus/pci/devices/0000:00:00.0/config
+  if [ ! -r "$host_bridge" ]; then
+    echo "missing readable Q35 host bridge config space"
+    return 1
+  fi
+  value=$(read_config_le32 "$host_bridge" 256) || {
+    echo "Q35 host bridge extended config dword at 0x100 is unreadable"
+    return 1
+  }
+  if [ "$value" != "0x00000000" ]; then
+    echo "unexpected Q35 host bridge extended config value at 0x100: $value"
+    return 1
+  fi
+  echo "Q35 host bridge extended config dword at 0x100 is readable"
+}
+
 run_x86_acpi_check() {
   success_marker=$1
   failed=0
@@ -96,6 +113,9 @@ run_pci_enumeration_check() {
   success_marker=$1
   failed=0
   if ! check_x86_mmconfig; then
+    failed=1
+  fi
+  if ! check_q35_extended_config; then
     failed=1
   fi
   # The managed rootfs images ship no pciutils, so this check consumes the
